@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","cwd":"/private/tmp","session_id":"36f3e368-27ef-47b3-82ee-3c05149069a3","tools":["Task","Bash"],"model":"claude-fable-5","permissionMode":"auto"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning"},"session_id":"36f3e368-27ef-47b3-82ee-3c05149069a3"}
+{"type":"assistant","message":{"model":"claude-fable-5","id":"msg_011","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"","signature":"abc"}]},"session_id":"36f3e368-27ef-47b3-82ee-3c05149069a3"}
+{"type":"assistant","message":{"model":"claude-fable-5","id":"msg_011","type":"message","role":"assistant","content":[{"type":"text","text":"PONG"}]},"session_id":"36f3e368-27ef-47b3-82ee-3c05149069a3"}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":1404,"num_turns":1,"result":"PONG","session_id":"36f3e368-27ef-47b3-82ee-3c05149069a3","total_cost_usd":0.144257}

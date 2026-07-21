@@ -1,0 +1,21 @@
+# agentd example config. Copy to config.toml and edit.
+# config.toml (with real secrets) is gitignored; only this example is committed.
+
+[server]
+bind       = "127.0.0.1:8787"   # local-only by default (design 3.9)
+api_bearer = "change-me-bearer"  # gates the local HTTP/WS API
+state_dir  = "state"             # run-log + durable state live here
+
+# One harness entry. Only "claude-code" is implemented in this scaffold.
+# A second adapter (e.g. codex) is a drop-in later; the interface is ready.
+[[harness]]
+kind  = "claude-code"
+model = ""                       # optional model override; empty = harness default
+cwd   = ""                       # optional default working dir for sessions
+
+# One channel entry. Token is read from the environment (never inlined).
+[[channel]]
+kind   = "telegram"
+token  = "env:TG_BOT_TOKEN"      # export TG_BOT_TOKEN before starting
+allow  = ["7597951120"]          # chat-id allowlist, server-enforced
+policy = "dm-only"
