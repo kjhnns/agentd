@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/kjhnns/agentd/internal/channel"
+	"github.com/kjhnns/agentd/internal/notify"
 )
 
 // Adapter is the Telegram channel adapter.
@@ -212,3 +213,23 @@ func (a *Adapter) Send(ctx context.Context, m channel.OutboundMsg) (channel.Send
 
 // Ack is a no-op for now (read/typing/react to be added).
 func (a *Adapter) Ack(msgID, reaction string) error { return nil }
+
+// Notify implements the notify.Sink capability so the generic notification hub
+// treats Telegram uniformly with the web channel: a dispatched notification is
+// sent as a message to every allowlisted chat id. Telegram is not live without a
+// token, but the method exists so registration + fan-out are uniform across
+// channels (the hub never special-cases a channel kind). Sends are best-effort;
+// the first send error is returned (and logged by the hub).
+func (a *Adapter) Notify(n notify.Notification) error {
+	if a.token == "" {
+		return fmt.Errorf("telegram: notify skipped, empty token")
+	}
+	text := "[" + string(n.Level) + "] " + n.Source + ": " + n.Text
+	var firstErr error
+	for chatID := range a.allow {
+		if _, err := a.Send(context.Background(), channel.OutboundMsg{ChatID: chatID, Text: text}); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}

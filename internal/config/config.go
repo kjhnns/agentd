@@ -56,10 +56,13 @@ type Session struct {
 
 // Channel is one [[channel]] entry.
 type Channel struct {
-	Kind   string   // "telegram", ...
-	Token  string   // literal, or "env:VAR" (resolve with ResolveToken)
-	Allow  []string // chat-id allowlist, server-enforced
-	Policy string   // e.g. "dm-only"
+	Kind    string   // "telegram", "web", ...
+	Token   string   // literal, or "env:VAR" (resolve with ResolveToken)
+	Allow   []string // chat-id allowlist, server-enforced
+	Policy  string   // e.g. "dm-only"
+	Enabled bool     // default true; enabled=false parks the channel
+	Path    string   // web channel: UI route (default "/ui")
+	Title   string   // web channel: UI title
 }
 
 // Job is one [[job]] entry: a declaratively configured proactive job for the
@@ -153,7 +156,7 @@ func Parse(data []byte) (*Config, error) {
 				curJob = nil
 				section = "harness"
 			case "channel":
-				cfg.Channel = append(cfg.Channel, Channel{})
+				cfg.Channel = append(cfg.Channel, Channel{Enabled: true}) // enabled defaults true
 				curChannel = &cfg.Channel[len(cfg.Channel)-1]
 				curHarness = nil
 				curJob = nil
@@ -306,30 +309,36 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 		}
 	case "channel":
 		switch key {
-		case "kind":
-			s, err := asString(raw)
+		case "enabled":
+			b, err := asBool(raw)
 			if err != nil {
-				return err
+				return fmt.Errorf("enabled: %w", err)
 			}
-			ch.Kind = s
-		case "token":
-			s, err := asString(raw)
-			if err != nil {
-				return err
-			}
-			ch.Token = s
-		case "policy":
-			s, err := asString(raw)
-			if err != nil {
-				return err
-			}
-			ch.Policy = s
+			ch.Enabled = b
+			return nil
 		case "allow":
 			arr, err := asStringArray(raw)
 			if err != nil {
 				return err
 			}
 			ch.Allow = arr
+			return nil
+		}
+		s, err := asString(raw)
+		if err != nil {
+			return err
+		}
+		switch key {
+		case "kind":
+			ch.Kind = s
+		case "token":
+			ch.Token = s
+		case "policy":
+			ch.Policy = s
+		case "path":
+			ch.Path = s
+		case "title":
+			ch.Title = s
 		default:
 			return fmt.Errorf("unknown [[channel]] key %q", key)
 		}

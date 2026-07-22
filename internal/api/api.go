@@ -56,16 +56,40 @@ func (s *Server) routes() {
 // routes answer 503. All routes share the API bearer gate.
 func (s *Server) AttachScheduler(sched *scheduler.Scheduler) { s.sched = sched }
 
+// Mount registers an extra handler on the shared mux so a channel (e.g. the web
+// UI) is served by the ONE HTTP server behind the SAME bearer gate, on no second
+// port. Patterns follow http.ServeMux rules (a trailing slash matches a subtree).
+func (s *Server) Mount(pattern string, h http.Handler) { s.mux.Handle(pattern, h) }
+
+// authed reports whether a request carries the API bearer. The header form
+// (Authorization: Bearer ...) is the canonical machine path. For BROWSERS, which
+// cannot set a header on navigation or a WebSocket handshake, the SAME bearer is
+// also accepted as a ?token= query param (used on first UI load) or an
+// agentd_token cookie (which the /ui handler sets from that query param). This is
+// still the single bearer secret; it is bound to 127.0.0.1 by default.
+func (s *Server) authed(r *http.Request) bool {
+	if s.bearer == "" {
+		return true
+	}
+	if strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") == s.bearer {
+		return true
+	}
+	if r.URL.Query().Get("token") == s.bearer {
+		return true
+	}
+	if c, err := r.Cookie("agentd_token"); err == nil && c.Value == s.bearer {
+		return true
+	}
+	return false
+}
+
 // auth enforces the API bearer token (design 3.9). /health is also gated; a bare
 // liveness probe can be added unauthenticated later if needed.
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.bearer != "" {
-			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if got != s.bearer {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
+		if !s.authed(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
 		}
 		next.ServeHTTP(w, r)
 	})

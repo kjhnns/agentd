@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>agentd</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#ffffff; --ink:#1c2024; --muted:#6b7280; --line:#e4e7eb;
+    --accent:#3b6ef5; --accent-ink:#fff; --ok:#1a9c5b; --warn:#c9781a; --err:#d1453b;
+    --chip:#eef1f6; --code:#f0f2f5;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0f1216; --panel:#171b21; --ink:#e6e9ee; --muted:#93a0af; --line:#252b33;
+      --accent:#5b86ff; --accent-ink:#0b0e12; --ok:#3ec77e; --warn:#e6a53a;
+      --err:#ff6b60; --chip:#20262e; --code:#1c2128;
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#f6f7f9; --panel:#ffffff; --ink:#1c2024; --muted:#6b7280; --line:#e4e7eb;
+    --accent:#3b6ef5; --accent-ink:#fff; --chip:#eef1f6; --code:#f0f2f5;
+  }
+  :root[data-theme="dark"]{
+    --bg:#0f1216; --panel:#171b21; --ink:#e6e9ee; --muted:#93a0af; --line:#252b33;
+    --accent:#5b86ff; --accent-ink:#0b0e12; --chip:#20262e; --code:#1c2128;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg); color:var(--ink);
+    font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  header{
+    display:flex;align-items:center;gap:.6rem;padding:.6rem .9rem;
+    border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5;
+  }
+  header .dot{width:10px;height:10px;border-radius:50%;background:var(--muted);flex:none}
+  header .dot.up{background:var(--ok)} header .dot.down{background:var(--err)}
+  header h1{font-size:15px;margin:0;font-weight:640;letter-spacing:.2px}
+  header .sp{flex:1}
+  button{
+    font:inherit;border:1px solid var(--line);background:var(--panel);color:var(--ink);
+    padding:.34rem .6rem;border-radius:8px;cursor:pointer
+  }
+  button.primary{background:var(--accent);color:var(--accent-ink);border-color:transparent}
+  button:active{transform:translateY(1px)}
+  .wrap{display:grid;grid-template-columns:270px 1fr 300px;gap:0;height:calc(100% - 49px)}
+  .col{min-height:0;display:flex;flex-direction:column;overflow:hidden}
+  .col.sessions{border-right:1px solid var(--line);background:var(--panel)}
+  .col.notifs{border-left:1px solid var(--line);background:var(--panel)}
+  .col h2{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);
+    margin:0;padding:.7rem .8rem .4rem}
+  .scroll{overflow:auto;flex:1;padding:0 .5rem .6rem}
+  .sess{padding:.5rem .55rem;border-radius:10px;cursor:pointer;margin:.15rem .05rem;border:1px solid transparent}
+  .sess:hover{background:var(--chip)}
+  .sess.active{background:var(--chip);border-color:var(--line)}
+  .sess .t{font-weight:600;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sess .m{font-size:11.5px;color:var(--muted);display:flex;gap:.4rem;align-items:center;margin-top:.15rem}
+  .pill{font-size:10.5px;padding:.05rem .4rem;border-radius:999px;background:var(--chip);border:1px solid var(--line)}
+  .pill.idle{color:var(--muted)} .pill.thinking{color:var(--accent)} .pill.error{color:var(--err)}
+  .bar{height:5px;border-radius:3px;background:var(--line);overflow:hidden;margin-top:.35rem}
+  .bar>i{display:block;height:100%;background:var(--accent)}
+  .conv{flex:1;overflow:auto;padding:1rem;display:flex;flex-direction:column;gap:.55rem}
+  .ev{max-width:80ch;padding:.45rem .65rem;border-radius:12px;border:1px solid var(--line);background:var(--panel)}
+  .ev.me{align-self:flex-end;background:var(--accent);color:var(--accent-ink);border-color:transparent}
+  .ev.result{border-color:var(--ok)}
+  .ev.error{border-color:var(--err)}
+  .ev .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;opacity:.7;margin-bottom:.15rem}
+  .ev .tool{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;background:var(--code);
+    padding:.1rem .3rem;border-radius:5px}
+  .ev pre{margin:0;white-space:pre-wrap;word-break:break-word;font:inherit}
+  .confirm{align-self:center;display:flex;gap:.5rem;align-items:center;background:var(--panel);
+    border:1px dashed var(--warn);padding:.5rem .7rem;border-radius:12px}
+  .composer{display:flex;gap:.5rem;padding:.6rem;border-top:1px solid var(--line);background:var(--panel)}
+  .composer textarea{flex:1;resize:none;height:2.4rem;max-height:9rem;padding:.5rem .6rem;border-radius:10px;
+    border:1px solid var(--line);background:var(--bg);color:var(--ink);font:inherit}
+  .notif{padding:.5rem .55rem;border-radius:10px;margin:.2rem .05rem;border:1px solid var(--line);background:var(--bg)}
+  .notif.issue{border-color:var(--err)} .notif.result{border-color:var(--ok)}
+  .notif .s{font-size:11px;color:var(--muted);display:flex;justify-content:space-between}
+  .notif .x{margin-top:.2rem;font-size:13px}
+  .empty{color:var(--muted);font-size:13px;padding:1rem;text-align:center}
+  .login{max-width:340px;margin:12vh auto;background:var(--panel);border:1px solid var(--line);
+    border-radius:14px;padding:1.3rem}
+  .login h1{font-size:17px;margin:0 0 .3rem} .login p{color:var(--muted);font-size:13px;margin:.2rem 0 1rem}
+  .login input{width:100%;padding:.55rem .6rem;border-radius:9px;border:1px solid var(--line);
+    background:var(--bg);color:var(--ink);font:inherit;margin-bottom:.7rem}
+  @media (max-width:860px){
+    .wrap{grid-template-columns:1fr;grid-template-rows:auto 1fr;height:calc(100% - 49px)}
+    .col.sessions{max-height:34vh;border-right:none;border-bottom:1px solid var(--line)}
+    .col.notifs{position:fixed;inset:auto 0 0 0;max-height:45vh;border-top:1px solid var(--line);
+      transform:translateY(100%);transition:transform .18s;z-index:8}
+    .col.notifs.open{transform:none}
+    .notiftoggle{display:inline-flex}
+  }
+  @media (min-width:861px){ .notiftoggle{display:none} }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+"use strict";
+(function(){
+  const $ = (s,el=document)=>el.querySelector(s);
+  const h = (tag,attrs={},...kids)=>{
+    const e=document.createElement(tag);
+    for(const k in attrs){ if(k==="class")e.className=attrs[k]; else if(k.startsWith("on"))e[k]=attrs[k]; else e.setAttribute(k,attrs[k]); }
+    for(const c of kids){ if(c==null)continue; e.append(c.nodeType?c:document.createTextNode(c)); }
+    return e;
+  };
+  const esc = s => (s==null?"":String(s));
+
+  // ---- auth: token comes in ?token= on first load; server set an httponly
+  // cookie from it, so subsequent fetch/WS are authenticated by the cookie.
+  // We strip it from the URL for cleanliness. A 401 shows the login field.
+  const url = new URL(location.href);
+  const urlToken = url.searchParams.get("token");
+  if(urlToken){ url.searchParams.delete("token"); history.replaceState({}, "", url.toString()); }
+
+  const state = { sessions:[], active:null, transportOK:false, notifs:[], ws:null };
+
+  async function api(path, opts={}){
+    const r = await fetch(path, Object.assign({credentials:"same-origin",headers:{"Content-Type":"application/json"}}, opts));
+    if(r.status===401){ throw {unauth:true}; }
+    return r;
+  }
+
+  function renderLogin(){
+    $("#app").replaceChildren(h("div",{class:"login"},
+      h("h1",{},"agentd"),
+      h("p",{},"Paste the API bearer to connect. It is stored as a same-origin httponly cookie."),
+      h("input",{id:"tok",type:"password",placeholder:"bearer token",onkeydown:e=>{if(e.key==="Enter")go();}}),
+      h("button",{class:"primary",onclick:go},"Connect")
+    ));
+    function go(){ const t=$("#tok").value.trim(); if(t) location.href = "/ui?token="+encodeURIComponent(t); }
+  }
+
+  function fmtPct(p){ return Math.round((p||0)*100)+"%"; }
+
+  function renderShell(){
+    const app = $("#app");
+    app.replaceChildren(
+      h("header",{},
+        h("span",{class:"dot",id:"tdot"}),
+        h("h1",{},"agentd"),
+        h("span",{class:"sp"}),
+        h("button",{class:"notiftoggle",onclick:()=>$(".col.notifs").classList.toggle("open")},"Alerts"),
+        h("button",{onclick:newSession},"New session"),
+        h("button",{onclick:resetActive},"Reset"),
+        h("button",{onclick:toggleTheme},"Theme")
+      ),
+      h("div",{class:"wrap"},
+        h("div",{class:"col sessions"}, h("h2",{},"Sessions"), h("div",{class:"scroll",id:"sesslist"})),
+        h("div",{class:"col conv-col"},
+          h("div",{class:"conv",id:"conv"}, h("div",{class:"empty"},"Pick or start a session, then type below.")),
+          h("div",{class:"composer"},
+            h("textarea",{id:"input",placeholder:"Message the agent…  (Enter to send)",
+              onkeydown:e=>{ if(e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); send(); } }}),
+            h("button",{class:"primary",onclick:send},"Send")
+          )
+        ),
+        h("div",{class:"col notifs"}, h("h2",{},"Notifications"), h("div",{class:"scroll",id:"notiflist"},
+          h("div",{class:"empty"},"Scheduler and system notifications appear here.")))
+      )
+    );
+    renderSessions(); renderNotifs();
+  }
+
+  function toggleTheme(){
+    const cur = document.documentElement.getAttribute("data-theme");
+    const next = cur==="dark" ? "light" : cur==="light" ? "dark" : (matchMedia("(prefers-color-scheme: dark)").matches?"light":"dark");
+    document.documentElement.setAttribute("data-theme", next);
+  }
+
+  function renderSessions(){
+    const list = $("#sesslist"); if(!list) return;
+    $("#tdot").className = "dot "+(state.transportOK?"up":"down");
+    if(!state.sessions.length){ list.replaceChildren(h("div",{class:"empty"},"No sessions yet.")); return; }
+    list.replaceChildren(...state.sessions.map(s=>{
+      const st = s.status||"idle";
+      return h("div",{class:"sess"+(s.id===state.active?" active":""),onclick:()=>{state.active=s.id;renderSessions();renderConv();}},
+        h("div",{class:"t"}, esc(s.title||s.id)),
+        h("div",{class:"m"},
+          h("span",{class:"pill "+st}, st),
+          h("span",{}, "turns "+(s.turns||0)),
+          h("span",{}, fmtPct(s.pressure)+" ctx")
+        ),
+        h("div",{class:"bar"}, h("i",{style:"width:"+fmtPct(s.pressure)}))
+      );
+    }));
+  }
+
+  // Per-session event log kept client-side, keyed by session id.
+  const logs = {};
+  function pushEv(ev){
+    const sid = ev.session_id||"";
+    (logs[sid] = logs[sid]||[]).push(ev);
+    if(logs[sid].length>400) logs[sid].shift();
+    if(sid===state.active) renderConv();
+  }
+  function pushLocal(sid, ev){ (logs[sid]=logs[sid]||[]).push(ev); if(sid===state.active) renderConv(); }
+
+  function renderConv(){
+    const conv = $("#conv"); if(!conv) return;
+    const evs = logs[state.active]||[];
+    if(!evs.length){ conv.replaceChildren(h("div",{class:"empty"}, state.active?"No messages yet.":"Pick or start a session.")); return; }
+    conv.replaceChildren(...evs.map(renderEv));
+    conv.scrollTop = conv.scrollHeight;
+  }
+
+  function renderEv(ev){
+    if(ev._me) return h("div",{class:"ev me"}, h("pre",{}, esc(ev.text)));
+    const kind = ev.kind||"output";
+    if(kind==="tool_call") return h("div",{class:"ev"}, h("div",{class:"k"},"tool"), h("span",{class:"tool"}, esc(ev.tool||ev.text||"")));
+    if(kind==="needs_input"){
+      const tok = ev.session_id||"";
+      return h("div",{class:"confirm"},
+        h("span",{}, esc(ev.text||"Confirm this action?")),
+        h("button",{class:"primary",onclick:()=>confirmDecision(tok,true)},"Approve"),
+        h("button",{onclick:()=>confirmDecision(tok,false)},"Deny")
+      );
+    }
+    const cls = kind==="result"?"ev result":kind==="error"?"ev error":"ev";
+    return h("div",{class:cls}, h("div",{class:"k"}, kind), h("pre",{}, esc(ev.text)));
+  }
+
+  function renderNotifs(){
+    const list = $("#notiflist"); if(!list) return;
+    if(!state.notifs.length){ list.replaceChildren(h("div",{class:"empty"},"No notifications yet.")); return; }
+    list.replaceChildren(...state.notifs.map(n=>
+      h("div",{class:"notif "+(n.level||"info")},
+        h("div",{class:"s"}, h("span",{}, esc(n.source)), h("span",{}, new Date(n.ts).toLocaleTimeString())),
+        h("div",{class:"x"}, esc(n.text))
+      )
+    ));
+  }
+
+  async function refreshSessions(){
+    try{
+      const r = await api("/sessions"); state.sessions = await r.json();
+      if(!state.active && state.sessions.length) state.active = state.sessions[0].id;
+      const hr = await (await api("/health")).json().catch(()=>({}));
+      if(hr && "transport_ok" in hr) state.transportOK = hr.transport_ok;
+      renderSessions();
+    }catch(e){ if(e&&e.unauth){ renderLogin(); return; } }
+  }
+
+  async function newSession(){
+    try{ const r=await api("/sessions",{method:"POST",body:JSON.stringify({title:"web session"})});
+      const j=await r.json(); state.active=j.id; await refreshSessions(); renderConv();
+    }catch(e){ if(e&&e.unauth) renderLogin(); }
+  }
+  async function resetActive(){
+    if(!state.active) return;
+    try{ await api("/sessions/"+state.active+"/reset",{method:"POST",body:JSON.stringify({reason:"explicit (web ui)"})}); }
+    catch(e){ if(e&&e.unauth) renderLogin(); }
+  }
+  async function confirmDecision(token, approve){
+    try{ await api("/confirm/"+encodeURIComponent(token),{method:"POST",body:JSON.stringify({approve})}); }
+    catch(e){ if(e&&e.unauth) renderLogin(); }
+  }
+
+  function send(){
+    const ta = $("#input"); const text = ta.value.trim(); if(!text) return;
+    ta.value="";
+    // Echo my message locally under the active (or soon-to-be web) session.
+    pushLocal(state.active||"", {_me:true,text});
+    if(state.ws && state.ws.readyState===1){ state.ws.send(JSON.stringify({type:"input",text})); }
+  }
+
+  function connectWS(){
+    const proto = location.protocol==="https:"?"wss:":"ws:";
+    const ws = new WebSocket(proto+"//"+location.host+"/ws");
+    state.ws = ws;
+    ws.onmessage = ev=>{
+      let m; try{ m=JSON.parse(ev.data); }catch(_){ return; }
+      if(m.type==="event"){ pushEv(m.event); if(m.event && !state.active) { state.active=m.event.session_id; renderSessions(); } refreshSessions(); }
+      else if(m.type==="notification"){ state.notifs.unshift(m.notification); if(state.notifs.length>100)state.notifs.pop(); renderNotifs(); }
+      else if(m.type==="reply"){ /* result already arrives as an event; reply is a fallback */ }
+    };
+    ws.onclose = ()=>{ setTimeout(connectWS, 1500); };
+    ws.onerror = ()=>{ try{ws.close();}catch(_){}} ;
+  }
+
+  async function boot(){
+    try{ await api("/health"); }catch(e){ if(e&&e.unauth){ renderLogin(); return; } }
+    renderShell();
+    await refreshSessions();
+    connectWS();
+    setInterval(refreshSessions, 5000);
+  }
+  boot();
+})();
+</script>
+</body>
+</html>

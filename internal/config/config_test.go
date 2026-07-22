@@ -89,6 +89,8 @@ kind = "codex"
 kind = "telegram"
 [[channel]]
 kind = "web"
+title = "Joe's agent"
+path = "/ui"
 `))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -98,6 +100,27 @@ kind = "web"
 	}
 	if len(cfg.Channel) != 2 || cfg.Channel[1].Kind != "web" {
 		t.Fatalf("channel = %+v", cfg.Channel)
+	}
+	// enabled defaults true for every channel block.
+	if !cfg.Channel[0].Enabled || !cfg.Channel[1].Enabled {
+		t.Fatalf("channels should default enabled=true: %+v", cfg.Channel)
+	}
+	if cfg.Channel[1].Title != "Joe's agent" || cfg.Channel[1].Path != "/ui" {
+		t.Fatalf("web channel fields = %+v", cfg.Channel[1])
+	}
+}
+
+func TestParseChannelEnabledFalse(t *testing.T) {
+	cfg, err := Parse([]byte(`
+[[channel]]
+kind = "web"
+enabled = false
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Channel[0].Enabled {
+		t.Fatal("enabled=false should park the channel")
 	}
 }
 

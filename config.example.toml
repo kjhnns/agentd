@@ -54,10 +54,26 @@ skip_permissions = true
 
 # One channel entry. Token is read from the environment (never inlined).
 [[channel]]
-kind   = "telegram"
-token  = "env:TG_BOT_TOKEN"      # export TG_BOT_TOKEN before starting
-allow  = ["7597951120"]          # chat-id allowlist, server-enforced
-policy = "dm-only"
+kind    = "telegram"
+enabled = true                   # default true; set false to park the channel
+token   = "env:TG_BOT_TOKEN"     # export TG_BOT_TOKEN before starting
+allow   = ["7597951120"]         # chat-id allowlist, server-enforced
+policy  = "dm-only"
+
+# The WEB channel: a self-contained local UI served by the SAME server (no 2nd
+# port) at /ui, and the reference ChannelAdapter the future wrist/phone app is a
+# client of. It shows the session list (status + context pressure), a live event
+# stream + input box for the active session, a notifications feed (scheduler job
+# notifications surface HERE via the notify hub), and confirm buttons. It is a
+# notify sink too. AUTH: it reuses the api_bearer. In a browser, open
+# http://127.0.0.1:8787/ui?token=<api_bearer> ONCE; that sets a same-origin
+# httponly cookie which then authenticates the page, its JSON calls, and the WS.
+# Default enabled; bound to 127.0.0.1 (reachable over Tailscale like the API).
+[[channel]]
+kind    = "web"
+enabled = true
+title   = "agentd"               # shown in the UI header/title
+path    = "/ui"                  # UI route (informational; the app is served at /ui)
 
 # ------------------------------------------------------------------------------
 # Jobs (internal/scheduler): declarative proactive work. A job = a TRIGGER + a

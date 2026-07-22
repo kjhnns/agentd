@@ -29,10 +29,12 @@ import (
 
 	"github.com/kjhnns/agentd/internal/api"
 	"github.com/kjhnns/agentd/internal/channel/telegram"
+	"github.com/kjhnns/agentd/internal/channel/web"
 	"github.com/kjhnns/agentd/internal/config"
 	"github.com/kjhnns/agentd/internal/eventbus"
 	"github.com/kjhnns/agentd/internal/harness"
 	"github.com/kjhnns/agentd/internal/harness/claudecode"
+	"github.com/kjhnns/agentd/internal/notify"
 	"github.com/kjhnns/agentd/internal/runlog"
 	"github.com/kjhnns/agentd/internal/scheduler"
 	"github.com/kjhnns/agentd/internal/session"
@@ -426,6 +428,13 @@ func serve(args []string) {
 	// wallclock) fire after each completed turn, in Manager.Send.
 	mgr.StartGC(ctx)
 
+	// Notification hub: the generic, channel-agnostic wire from any producer of
+	// user-facing notifications to every notify-capable channel. The scheduler's
+	// per-job notify policy is the first producer; each channel that can surface a
+	// notification (web, telegram) registers as a sink below. This is what finally
+	// gives scheduler.OnNotify a consumer WITHOUT hard-wiring it to any channel.
+	hub := notify.NewHub()
+
 	// Scheduler: declarative [[job]] blocks become proactive triggered sessions
 	// (a job run = one ordinary turn on the target workspace's warm session).
 	// Durable state (last fires + run history) lives in scheduler.jsonl next to
@@ -439,50 +448,106 @@ func serve(args []string) {
 	if err != nil {
 		log.Fatalf("scheduler: %v", err)
 	}
+	// Wire the scheduler's notify hook to the hub: a job run that the notify
+	// policy says should surface (issues/always) fans out to every channel.
+	sched.OnNotify = func(job *scheduler.Job, run scheduler.JobRun) {
+		lvl := notify.LevelResult
+		if run.Status != "ok" {
+			lvl = notify.LevelIssue
+		}
+		hub.Dispatch(notify.Notification{
+			Source: "job:" + job.Name,
+			Level:  lvl,
+			Text:   scheduler.NotifyText(job, run),
+			Ts:     run.End,
+		})
+	}
 	defer sched.Close()
 	sched.Start(ctx)
 	log.Printf("agentd: scheduler started with %d job(s)", len(jobDefs))
 
-	// Channel: telegram, if configured and a token is present.
+	// API server (created before channels so the web channel can mount its UI +
+	// WS routes on this ONE server, behind the SAME bearer gate, on no 2nd port).
 	var transportUp atomic.Bool
-	var tg *telegram.Adapter
-	for _, c := range cfg.Channel {
-		if c.Kind != "telegram" {
-			continue
-		}
-		token := config.ResolveToken(c.Token)
-		if token == "" {
-			log.Printf("agentd: telegram channel configured but token empty (%s); channel NOT started", c.Token)
-			continue
-		}
-		tg = telegram.New(token, c.Allow)
-		if err := tg.Start(ctx); err != nil {
-			log.Printf("agentd: telegram start failed: %v", err)
-			continue
-		}
-		transportUp.Store(true)
-		log.Printf("agentd: telegram channel started (allow=%v)", c.Allow)
-
-		sessionForChat := map[string]string{}
-		cwd := ""
-		if len(cfg.Harness) > 0 {
-			cwd = cfg.Harness[0].Cwd
-		}
-		go func(ch *telegram.Adapter) {
-			for in := range ch.Inbound() {
-				in := in
-				go func() {
-					if err := mgr.RouteInbound(ctx, ch, in, sessionForChat, cwd, model); err != nil {
-						log.Printf("agentd: route inbound error: %v", err)
-					}
-				}()
-			}
-		}(tg)
-	}
-
-	// API server.
 	srv := api.New(cfg.Server.APIBearer, mgr, bus, func() bool { return transportUp.Load() })
 	srv.AttachScheduler(sched)
+
+	cwd := ""
+	if len(cfg.Harness) > 0 {
+		cwd = cfg.Harness[0].Cwd
+	}
+
+	// Channels. Each configured channel is an in-process ChannelAdapter; the ones
+	// that can also deliver notifications register as notify-hub sinks.
+	var tg *telegram.Adapter
+	for _, c := range cfg.Channel {
+		if !c.Enabled {
+			log.Printf("agentd: channel %q disabled (enabled=false); skipped", c.Kind)
+			continue
+		}
+		switch c.Kind {
+		case "telegram":
+			token := config.ResolveToken(c.Token)
+			if token == "" {
+				log.Printf("agentd: telegram channel configured but token empty (%s); channel NOT started", c.Token)
+				continue
+			}
+			tg = telegram.New(token, c.Allow)
+			if err := tg.Start(ctx); err != nil {
+				log.Printf("agentd: telegram start failed: %v", err)
+				continue
+			}
+			transportUp.Store(true)
+			hub.Register(tg) // Telegram is a notify sink too (uniform hub)
+			log.Printf("agentd: telegram channel started (allow=%v)", c.Allow)
+
+			sessionForChat := map[string]string{}
+			go func(ch *telegram.Adapter) {
+				for in := range ch.Inbound() {
+					in := in
+					go func() {
+						if err := mgr.RouteInbound(ctx, ch, in, sessionForChat, cwd, model); err != nil {
+							log.Printf("agentd: route inbound error: %v", err)
+						}
+					}()
+				}
+			}(tg)
+
+		case "web":
+			webCh := web.New(bus, c.Title)
+			if err := webCh.Start(ctx); err != nil {
+				log.Printf("agentd: web start failed: %v", err)
+				continue
+			}
+			// Serve the UI + WS + confirm on the shared server (bearer-gated).
+			srv.Mount("/ui", webCh.UIHandler())
+			srv.Mount("/ws", webCh.WSHandler())
+			srv.Mount("/confirm/", webCh.ConfirmHandler())
+			srv.Mount("/", webCh.RootHandler())
+			hub.Register(webCh) // web is a notify sink: notifications push over its WS
+			transportUp.Store(true)
+			log.Printf("agentd: web channel started (UI at /ui, title=%q)", c.Title)
+
+			// Inbound: a message typed in the UI routes through the SAME
+			// RouteInbound path as any channel (one warm web session).
+			sessionForWeb := map[string]string{}
+			go func(ch *web.Adapter) {
+				for in := range ch.Inbound() {
+					in := in
+					go func() {
+						if err := mgr.RouteInbound(ctx, ch, in, sessionForWeb, cwd, model); err != nil {
+							log.Printf("agentd: web route inbound error: %v", err)
+						}
+					}()
+				}
+			}(webCh)
+
+		default:
+			log.Printf("agentd: unknown channel kind %q; skipped", c.Kind)
+		}
+	}
+	log.Printf("agentd: notification hub has %d sink(s)", hub.Count())
+
 	httpSrv := &http.Server{Addr: cfg.Server.Bind, Handler: srv.Handler()}
 	go func() {
 		log.Printf("agentd: API listening on http://%s (bearer %s)", cfg.Server.Bind, redact(cfg.Server.APIBearer))

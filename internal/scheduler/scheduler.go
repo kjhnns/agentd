@@ -426,6 +426,11 @@ func shouldNotify(p NotifyPolicy, status string) bool {
 	}
 }
 
+// NotifyText is the exported form of notifyText, so the notify-hub wiring in
+// main can build the same user-facing text the durable job_notify record uses
+// (single source of truth for the phrasing).
+func NotifyText(j *Job, run JobRun) string { return notifyText(j, run) }
+
 func notifyText(j *Job, run JobRun) string {
 	switch run.Status {
 	case "ok":

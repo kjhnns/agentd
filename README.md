@@ -52,6 +52,12 @@ scope. What is IN:
   **Telegram adapter** (`internal/channel/telegram`): getUpdates long-poll with
   backoff, server-enforced chat-id allowlist, `sendMessage`. No tg-bridge reuse,
   no SSE, no MCP proxy, no enabledPlugins flag.
+- **Web channel** (`internal/channel/web`): a self-contained, authenticated local
+  UI served by the SAME server, and the reference ChannelAdapter (see the
+  dedicated section below).
+- **Notification hub** (`internal/notify`): a generic, channel-agnostic wire from
+  any producer of user-facing notifications (the scheduler today) to every
+  notify-capable channel (see the Scheduler section's Notify discipline).
 - **Workspace** (`internal/workspace`): the WORKSPACE is a first-class concept
   (design 3.5) — see the dedicated section below.
 - **Session Manager** (`internal/session`): create/list/get/status/interrupt/
@@ -65,7 +71,9 @@ scope. What is IN:
   lesson from failure class 2), plus per-session `pressure` + `pressure_source`.
   `GET/POST /sessions`, `POST /sessions/:id/input`,
   `GET /sessions/:id/events` (WebSocket), `DELETE /sessions/:id`,
-  `POST /sessions/:id/interrupt`, `POST /sessions/:id/reset`.
+  `POST /sessions/:id/interrupt`, `POST /sessions/:id/reset`. The web channel
+  mounts `GET /ui`, the `/ws` WebSocket, and `POST /confirm/:token` on this same
+  server via `(*Server).Mount`, behind the same bearer gate.
 
 ## Workspace: the agent's persistent home (design 3.5)
 
@@ -247,8 +255,15 @@ never-fired schedule starts counting from server start (no fire-on-startup).
 
 **Notify discipline.** Per-job `notify` policy: `issues` (default — only non-ok
 runs surface), `always`, `never`. A notify is recorded on the JobRun + the
-durable log and handed to a clean `OnNotify` hook that a channel adapter will
-consume later; Telegram is NOT hard-wired to job results.
+durable log and handed to the `OnNotify` hook. That hook is now wired (in
+`cmd/agentd`) to the **notification hub** (`internal/notify`): a generic,
+channel-agnostic fan-out. Each channel that can surface a notification implements
+a one-method `notify.Sink` (`Notify(Notification)`) and registers with the hub;
+`Hub.Dispatch(n)` fans the notification out to ALL of them. So a job notification
+reaches every channel WITHOUT the scheduler knowing any channel exists — the web
+channel shows it in its Notifications panel, and Telegram (which also implements
+`Notify`, sending to its allowlist) would deliver it when live. Telegram is still
+NOT hard-wired to job results; it is just one uniform sink among others.
 
 **Ops surface.**
 
@@ -265,6 +280,60 @@ POST /hooks/:job                 # webhook trigger
 ```
 
 See the `[[job]]` examples in `config.example.toml`.
+
+## Web UI: the reference channel + wrist-app foundation (internal/channel/web)
+
+The **web channel** is a self-contained, authenticated single-page UI served by
+the SAME HTTP server as the rest of the API (no second port, no external assets —
+the HTML/CSS/JS is embedded via `go:embed`, so it works offline and over
+Tailscale). It is the **reference ChannelAdapter**: it implements the exact same
+`channel.Adapter` contract as Telegram AND the `notify.Sink` capability, so the
+core treats it uniformly. It is also the foundation the future **wrist/phone app**
+is a client of — same routes, same WS protocol, just a native client instead of
+the bundled page. It is responsive (single-column on phones), theme-aware
+(light/dark, with a manual toggle), and deliberately v1-focused.
+
+**What it shows.**
+
+- **Session list** — every session with its status, turn count, and live context
+  **pressure** bar (from `GET /sessions`, polled).
+- **Conversation / event view** — the active session's normalized events streamed
+  live over the WS (output, tool calls, results, errors).
+- **Input box** — a typed message is sent over the WS and routed through the SAME
+  `session.RouteInbound` path as any channel, so a web message drives the one warm
+  web session exactly like a Telegram message drives its session.
+- **Notifications panel** — fed by the notification hub, so scheduler job
+  notifications (and any future producer) surface here in real time.
+- **Confirm buttons** — Approve/Deny that `POST /confirm/:token`.
+  NOTE (honest status): the UI + endpoint are wired end to end, but agentd does
+  not yet EMIT confirm-gate tokens from the harness (no `needs_input` event
+  carries a token today), so there is no live gate to resolve yet. When the
+  confirm-gate plumbing lands, only the resolution target changes.
+
+**Inbound vs outbound.** Inbound (typed messages) become a normalized
+`channel.InboundMsg` and drive a turn via `RouteInbound` (warm web session, reused
+per web user). Outbound agent events stream back over the WS from the shared event
+bus; the turn's final reply is also pushed as a `reply` message; notifications
+push over the same socket via the channel's `Notify`.
+
+**Auth flow.** The UI reuses the existing API bearer (`api_bearer`). Because a
+browser cannot set an `Authorization` header on navigation or a WebSocket
+handshake, the same bearer is ALSO accepted as a `?token=` query param or an
+`agentd_token` cookie (`(*Server).authed`). The flow: open
+`http://127.0.0.1:8787/ui?token=<api_bearer>` once; the `/ui` handler stores the
+token as a same-origin **httponly** cookie, which then authenticates the page, its
+JSON calls, and the WS handshake. The token is stripped from the URL after load.
+A bare `/ui` with no token/cookie returns 401 (so the surface is never
+unauthenticated). The server binds `127.0.0.1` by default and is reachable over
+Tailscale like the rest of the API. It is registered as a `[[channel]]
+kind = "web"` block (default enabled; optional `title` / `path`).
+
+```
+GET  /ui                 # the SPA (sets the auth cookie from ?token= on first load)
+GET  /ws                 # WebSocket: streams events + notifications, receives typed input
+POST /confirm/:token     # Approve/Deny (stub: no live gate yet, see note above)
+/                        # redirects to /ui
+```
 
 **ACP-readiness (cheap future-proofing).** Tool permissions are modeled as a
 policy value on the adapter config (`PermissionMode: skip|prompt`) rather than a
@@ -303,6 +372,17 @@ What is DEFERRED (explicit non-goals here, separate go/no-go decisions later):
   adapter against a real bot (needs a `TG_BOT_TOKEN`); the full end-to-end
   Telegram <-> Claude round-trip is wired in `session.RouteInbound` but has not been
   run against a live bot in this scaffold.
+- **Web channel + notification hub — proven over the real HTTP/WS/scheduler
+  stack:** unit + integration tests cover the notifier fan-out
+  (`internal/notify`), the scheduler notify policy -> hub -> web sink path
+  (issues-only suppresses a clean run; always/result delivers), the `/ui` bearer
+  gate (401 without, 200 with), an authenticated Go WebSocket client round-trip
+  (typed input -> `RouteInbound` -> normalized events back), a notification pushed
+  over the WS, and the end-to-end money demo (`POST /jobs/:name/run` ->
+  scheduler -> notifier -> web WS client) in
+  `TestEndToEndSchedulerNotifyToWebClient`. The web inbound round-trip test uses a
+  fake echo harness (no live claude); the browser UI itself was exercised via
+  API/WS clients, not a headless browser.
 
 ## Run it
 
@@ -339,6 +419,14 @@ go run ./cmd/agentd serve -config config.toml
 
 # health (two signals):
 curl -s -H "Authorization: Bearer change-me-bearer" http://127.0.0.1:8787/health
+
+# open the web UI (sets the auth cookie from ?token= on first load):
+open "http://127.0.0.1:8787/ui?token=change-me-bearer"
+
+# the web UI is bearer-gated: 401 without, 200 with:
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8787/ui                                  # 401
+curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer change-me-bearer" \
+  http://127.0.0.1:8787/ui                                                                          # 200
 ```
 
 ## Design doc
