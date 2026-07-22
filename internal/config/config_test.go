@@ -99,3 +99,28 @@ kind = "web"
 		t.Fatalf("channel = %+v", cfg.Channel)
 	}
 }
+
+func TestParseWorkspaceTable(t *testing.T) {
+	cfg, err := Parse([]byte(`
+[workspace]
+root    = "/tmp/ws"
+default = "joe"
+git_autocommit = false
+remote  = "git@github.com:me/ws-backup.git"
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	w := cfg.Workspace
+	if w.Root != "/tmp/ws" || w.Default != "joe" || w.GitAutocommit || w.Remote != "git@github.com:me/ws-backup.git" {
+		t.Fatalf("workspace = %+v", w)
+	}
+	// Defaults: git_autocommit is ON when the table is absent.
+	cfg2, err := Parse([]byte("[server]\nbind = \"127.0.0.1:1\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg2.Workspace.GitAutocommit {
+		t.Fatal("git_autocommit should default to true")
+	}
+}

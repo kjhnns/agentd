@@ -87,17 +87,18 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.mgr.List())
 	case http.MethodPost:
 		var body struct {
-			Cwd   string `json:"cwd"`
-			Model string `json:"model"`
-			Title string `json:"title"`
+			Workspace string `json:"workspace"` // workspace name ("" = default)
+			Cwd       string `json:"cwd"`       // honored only without a workspace store
+			Model     string `json:"model"`
+			Title     string `json:"title"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		sess, err := s.mgr.Create(r.Context(), body.Cwd, body.Model, body.Title)
+		sess, err := s.mgr.Create(r.Context(), body.Workspace, body.Cwd, body.Model, body.Title)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, http.StatusCreated, map[string]string{"id": sess.ID, "harness": sess.Harness})
+		writeJSON(w, http.StatusCreated, map[string]string{"id": sess.ID, "harness": sess.Harness, "workspace": sess.Workspace})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}

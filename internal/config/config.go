@@ -30,6 +30,15 @@ type Harness struct {
 	SkipPermissions bool   // bypass the harness's own tool-approval prompts
 }
 
+// Workspace is the [workspace] table: where agent workspaces live and which
+// one sessions use by default. See internal/workspace.
+type Workspace struct {
+	Root          string // dir holding workspaces; default ~/.agentd/workspaces
+	Default       string // workspace name used when a session names none; default "default"
+	GitAutocommit bool   // commit workspace changes after each completed turn (default true)
+	Remote        string // optional git remote for MANUAL opt-in push; never pushed automatically
+}
+
 // Channel is one [[channel]] entry.
 type Channel struct {
 	Kind   string   // "telegram", ...
@@ -40,9 +49,10 @@ type Channel struct {
 
 // Config is the whole parsed file.
 type Config struct {
-	Server  Server
-	Harness []Harness
-	Channel []Channel
+	Server    Server
+	Workspace Workspace
+	Harness   []Harness
+	Channel   []Channel
 }
 
 // ResolveToken expands an "env:VAR" reference to the environment variable's
@@ -66,7 +76,10 @@ func Load(path string) (*Config, error) {
 
 // Parse parses config bytes.
 func Parse(data []byte) (*Config, error) {
-	cfg := &Config{Server: Server{Bind: "127.0.0.1:8787", StateDir: "state"}}
+	cfg := &Config{
+		Server:    Server{Bind: "127.0.0.1:8787", StateDir: "state"},
+		Workspace: Workspace{GitAutocommit: true}, // Root/Default resolved by workspace.NewStore
+	}
 	section := "" // "server" or "" (top-level)
 	var curHarness *Harness
 	var curChannel *Channel
@@ -138,6 +151,29 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, key, raw strin
 			cfg.Server.StateDir = s
 		default:
 			return fmt.Errorf("unknown [server] key %q", key)
+		}
+	case "workspace":
+		if key == "git_autocommit" {
+			b, err := asBool(raw)
+			if err != nil {
+				return fmt.Errorf("git_autocommit: %w", err)
+			}
+			cfg.Workspace.GitAutocommit = b
+			return nil
+		}
+		s, err := asString(raw)
+		if err != nil {
+			return err
+		}
+		switch key {
+		case "root":
+			cfg.Workspace.Root = s
+		case "default":
+			cfg.Workspace.Default = s
+		case "remote":
+			cfg.Workspace.Remote = s
+		default:
+			return fmt.Errorf("unknown [workspace] key %q", key)
 		}
 	case "harness":
 		if key == "skip_permissions" {

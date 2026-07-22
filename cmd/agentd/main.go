@@ -15,11 +15,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -32,6 +34,7 @@ import (
 	"github.com/kjhnns/agentd/internal/harness/claudecode"
 	"github.com/kjhnns/agentd/internal/runlog"
 	"github.com/kjhnns/agentd/internal/session"
+	"github.com/kjhnns/agentd/internal/workspace"
 )
 
 func main() {
@@ -46,10 +49,132 @@ func main() {
 		smoke(os.Args[2:])
 	case "chat":
 		chat(os.Args[2:])
+	case "init-workspace":
+		initWorkspace(os.Args[2:])
+	case "memory":
+		memoryCmd(os.Args[2:])
 	case "-h", "--help", "help":
-		fmt.Println("usage: agentd [serve|smoke|chat] [flags]")
+		fmt.Println("usage: agentd [serve|smoke|chat|init-workspace|memory] [flags]")
+		fmt.Println("  init-workspace [name]              scaffold a workspace (default ~/.agentd/workspaces/<name>)")
+		fmt.Println("  memory index|links|add|get [...]   maintain a workspace's memory wiki")
 	default:
 		serve(os.Args[1:])
+	}
+}
+
+// initWorkspace scaffolds a named workspace under the workspaces root: starter
+// instructions (AGENTS.md + CLAUDE.md mirror), an example memory wiki, an
+// empty handoff, and a git repo with the initial commit.
+func initWorkspace(args []string) {
+	fs := flag.NewFlagSet("init-workspace", flag.ExitOnError)
+	root := fs.String("root", workspace.DefaultRoot(), "directory holding workspaces")
+	_ = fs.Parse(args)
+	name := fs.Arg(0)
+	if name == "" {
+		name = "default"
+	}
+	st := workspace.NewStore(*root, name)
+	ws, err := workspace.Init(st.Path(name))
+	if err != nil {
+		log.Fatalf("init-workspace: %v", err)
+	}
+	if !workspace.GitAvailable() {
+		log.Printf("init-workspace: git not found on PATH; workspace is unversioned")
+	}
+	fmt.Printf("workspace %q ready at %s\n", ws.Name, ws.Root)
+	fmt.Println("  instructions/AGENTS.md   the constitution (CLAUDE.md mirrors it)")
+	fmt.Println("  memory/INDEX.md          injected memory index; pages in memory/pages/")
+	fmt.Println("  context.md               session handoff")
+	fmt.Println("  work/                    scratch space")
+}
+
+// memoryCmd maintains a workspace's memory wiki: rebuild the INDEX from page
+// frontmatter, check [[wikilinks]], add/get pages.
+func memoryCmd(args []string) {
+	if len(args) < 1 {
+		log.Fatal("usage: agentd memory <index|links|add|get> [flags]")
+	}
+	sub := args[0]
+	fs := flag.NewFlagSet("memory "+sub, flag.ExitOnError)
+	root := fs.String("root", workspace.DefaultRoot(), "directory holding workspaces")
+	wsName := fs.String("workspace", "default", "workspace name")
+	slug := fs.String("slug", "", "page slug (add/get)")
+	title := fs.String("title", "", "page title (add)")
+	hook := fs.String("hook", "", "one-line hook shown in the INDEX (add)")
+	tags := fs.String("tags", "", "comma-separated tags (add)")
+	body := fs.String("body", "", "page body; reads stdin if empty (add)")
+	_ = fs.Parse(args[1:])
+
+	ws, err := workspace.Load(workspace.NewStore(*root, *wsName).Path(*wsName))
+	if err != nil {
+		log.Fatalf("memory: %v", err)
+	}
+	switch sub {
+	case "index":
+		content, err := ws.RebuildIndex()
+		if err != nil {
+			log.Fatalf("memory index: %v", err)
+		}
+		fmt.Print(content)
+	case "links":
+		links, dangling, err := ws.CheckLinks()
+		if err != nil {
+			log.Fatalf("memory links: %v", err)
+		}
+		for from, targets := range links {
+			fmt.Printf("%s -> %s\n", from, strings.Join(targets, ", "))
+		}
+		if len(dangling) == 0 {
+			fmt.Println("no dangling wikilinks")
+			return
+		}
+		for _, d := range dangling {
+			fmt.Printf("DANGLING: [[%s]] in pages/%s.md\n", d.Target, d.FromSlug)
+		}
+		os.Exit(1)
+	case "add":
+		if *slug == "" {
+			log.Fatal("memory add: -slug required")
+		}
+		b := *body
+		if b == "" {
+			data, _ := io.ReadAll(os.Stdin)
+			b = string(data)
+		}
+		var tagList []string
+		for _, t := range strings.Split(*tags, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				tagList = append(tagList, t)
+			}
+		}
+		p := &workspace.Page{Slug: *slug, Title: *title, Hook: *hook, Tags: tagList, Body: b}
+		if p.Title == "" {
+			p.Title = *slug
+		}
+		if err := ws.PutPage(p); err != nil {
+			log.Fatalf("memory add: %v", err)
+		}
+		// A memory update is a natural commit boundary of its own, so a page
+		// re-synthesis reads clearly in the workspace's git history.
+		if workspace.GitAvailable() && ws.IsGitRepo() {
+			if sha, err := ws.GitCommitAll("memory: " + p.Slug); err != nil {
+				log.Printf("memory add: autocommit failed: %v", err)
+			} else if sha != "" {
+				fmt.Printf("committed %s\n", sha)
+			}
+		}
+		fmt.Printf("wrote pages/%s.md and rebuilt INDEX.md\n", p.Slug)
+	case "get":
+		if *slug == "" {
+			log.Fatal("memory get: -slug required")
+		}
+		p, err := ws.GetPage(*slug)
+		if err != nil {
+			log.Fatalf("memory get: %v", err)
+		}
+		fmt.Print(p.Render())
+	default:
+		log.Fatalf("memory: unknown subcommand %q (want index|links|add|get)", sub)
 	}
 }
 
@@ -152,7 +277,12 @@ func serve(args []string) {
 	if len(cfg.Harness) > 0 {
 		mgr.SkipPermissions = cfg.Harness[0].SkipPermissions
 	}
-	log.Printf("agentd: harness=claude-code skip_permissions=%v", mgr.SkipPermissions)
+	// Workspaces: every session is homed in a workspace (cwd = workspace root,
+	// composed injection via --append-system-prompt). See internal/workspace.
+	mgr.Workspaces = workspace.NewStore(cfg.Workspace.Root, cfg.Workspace.Default)
+	mgr.GitAutoCommit = cfg.Workspace.GitAutocommit
+	log.Printf("agentd: harness=claude-code skip_permissions=%v workspaces=%s default=%q git_autocommit=%v",
+		mgr.SkipPermissions, mgr.Workspaces.Root, mgr.Workspaces.Default, mgr.GitAutoCommit)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -14,20 +14,25 @@ import (
 	"sync"
 	"time"
 
+	"log"
+
 	"github.com/kjhnns/agentd/internal/channel"
 	"github.com/kjhnns/agentd/internal/eventbus"
 	"github.com/kjhnns/agentd/internal/harness"
 	"github.com/kjhnns/agentd/internal/runlog"
+	"github.com/kjhnns/agentd/internal/workspace"
 )
 
 // Session is one live conversation bound to a harness handle.
 type Session struct {
-	ID      string          `json:"id"`
-	Harness string          `json:"harness"`
-	Title   string          `json:"title"`
-	Created time.Time       `json:"created"`
-	handle  harness.Handle  `json:"-"`
-	adapter harness.Adapter `json:"-"`
+	ID        string          `json:"id"`
+	Harness   string          `json:"harness"`
+	Title     string          `json:"title"`
+	Workspace string          `json:"workspace,omitempty"` // workspace name homing this session
+	Created   time.Time       `json:"created"`
+	handle    harness.Handle  `json:"-"`
+	adapter   harness.Adapter `json:"-"`
+	ws        *workspace.Workspace
 
 	mu      sync.Mutex
 	status  harness.Status
@@ -54,6 +59,19 @@ type Manager struct {
 	// SkipPermissions is the harness default applied to new sessions (design:
 	// run hands-free; agentd's own confirm-gate is the intended safety layer).
 	SkipPermissions bool
+
+	// Workspaces homes sessions in named workspaces (design 3.5). When set,
+	// Create resolves the requested (or default) workspace, runs the harness
+	// with cwd = the workspace root, and injects a composed system prompt:
+	// instructions/AGENTS.md + memory/INDEX.md + context.md ("index-in,
+	// pages-on-demand": the memory corpus itself is never injected; the agent
+	// opens memory/pages/<slug>.md on demand with its file tools). When nil,
+	// sessions fall back to the caller-provided cwd with no injection.
+	Workspaces *workspace.Store
+
+	// GitAutoCommit commits workspace changes after each completed turn (see
+	// workspace/git.go for the commit policy). Config [workspace] git_autocommit.
+	GitAutoCommit bool
 }
 
 // NewManager builds a Session Manager over one harness adapter.
@@ -73,12 +91,34 @@ func newID() string {
 }
 
 // Create starts a new session bound to the manager's harness adapter.
-func (m *Manager) Create(ctx context.Context, cwd, model, title string) (*Session, error) {
+// workspaceName selects the workspace homing the session ("" = the store's
+// default); when the manager has a workspace store, the harness cwd IS the
+// workspace root and SessionConfig.SystemPrompt carries the composed
+// injection (instructions + memory index + handoff). The cwd argument is only
+// honored when no workspace store is configured (legacy/bare mode).
+func (m *Manager) Create(ctx context.Context, workspaceName, cwd, model, title string) (*Session, error) {
 	id := newID()
+	var ws *workspace.Workspace
+	systemPrompt := ""
+	if m.Workspaces != nil {
+		var err error
+		ws, err = m.Workspaces.Ensure(workspaceName)
+		if err != nil {
+			return nil, fmt.Errorf("session: workspace %q: %w", workspaceName, err)
+		}
+		cwd = ws.Cwd()
+		systemPrompt, err = ws.ComposeSystemPrompt()
+		if err != nil {
+			return nil, fmt.Errorf("session: compose injection for workspace %q: %w", ws.Name, err)
+		}
+	} else if workspaceName != "" {
+		return nil, fmt.Errorf("session: workspace %q requested but no workspace store configured", workspaceName)
+	}
 	h, err := m.adapter.Start(ctx, harness.SessionConfig{
 		SessionID:       id,
 		Cwd:             cwd,
 		Model:           model,
+		SystemPrompt:    systemPrompt,
 		SkipPermissions: m.SkipPermissions,
 	})
 	if err != nil {
@@ -91,14 +131,18 @@ func (m *Manager) Create(ctx context.Context, cwd, model, title string) (*Sessio
 		Created: time.Now().UTC(),
 		handle:  h,
 		adapter: m.adapter,
+		ws:      ws,
 		status:  harness.StatusIdle,
+	}
+	if ws != nil {
+		s.Workspace = ws.Name
 	}
 	m.mu.Lock()
 	m.sessions[id] = s
 	m.mu.Unlock()
 
 	if m.log != nil {
-		_ = m.log.Append("session_create", map[string]string{"id": id, "harness": s.Harness, "title": title})
+		_ = m.log.Append("session_create", map[string]string{"id": id, "harness": s.Harness, "title": title, "workspace": s.Workspace})
 	}
 	// Pump the adapter's per-session events onto the shared bus + run-log.
 	go m.pump(s)
@@ -174,6 +218,19 @@ func (m *Manager) Send(ctx context.Context, id, text string) (*SendResult, error
 	if err != nil {
 		return nil, err
 	}
+
+	// End-of-turn workspace commit: if the turn changed anything under the
+	// workspace (memory re-syntheses, context.md handoff, working files),
+	// commit it now so history accrues at natural boundaries. Best-effort:
+	// autocommit failure is logged, never fails the turn.
+	if m.GitAutoCommit && s.ws != nil {
+		sha, cerr := s.ws.AutoCommit("turn " + id)
+		if cerr != nil {
+			log.Printf("session %s: workspace autocommit failed: %v", id, cerr)
+		} else if sha != "" && m.log != nil {
+			_ = m.log.Append("workspace_commit", map[string]string{"session": id, "workspace": s.ws.Name, "commit": sha})
+		}
+	}
 	return &SendResult{}, nil
 }
 
@@ -214,7 +271,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	}
 	id, ok := sessionForChat[in.UserID]
 	if !ok {
-		s, err := m.Create(ctx, cwd, model, "telegram:"+in.UserID)
+		s, err := m.Create(ctx, "", cwd, model, "telegram:"+in.UserID)
 		if err != nil {
 			return err
 		}

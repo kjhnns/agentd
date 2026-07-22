@@ -85,20 +85,7 @@ func (a *Adapter) Start(ctx context.Context, cfg harness.SessionConfig) (harness
 	if cfg.SessionID == "" {
 		return nil, fmt.Errorf("claudecode: SessionConfig.SessionID required")
 	}
-	args := []string{"-p",
-		"--input-format", "stream-json",
-		"--output-format", "stream-json",
-		"--verbose",
-	}
-	if cfg.SkipPermissions {
-		args = append(args, "--dangerously-skip-permissions")
-	}
-	if cfg.Model != "" {
-		args = append(args, "--model", cfg.Model)
-	}
-	if cfg.SystemPrompt != "" {
-		args = append(args, "--append-system-prompt", cfg.SystemPrompt)
-	}
+	args := buildArgs(cfg)
 
 	procCtx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(procCtx, a.bin, args...)
@@ -136,6 +123,28 @@ func (a *Adapter) Start(ctx context.Context, cfg harness.SessionConfig) (harness
 	}
 	go h.readLoop()
 	return h, nil
+}
+
+// buildArgs assembles the CLI arguments for a persistent streaming session.
+// SessionConfig.SystemPrompt (the workspace injection composed by the Session
+// Manager: instructions + memory index + handoff) maps to
+// --append-system-prompt, the server-owned context hook (design 3.5).
+func buildArgs(cfg harness.SessionConfig) []string {
+	args := []string{"-p",
+		"--input-format", "stream-json",
+		"--output-format", "stream-json",
+		"--verbose",
+	}
+	if cfg.SkipPermissions {
+		args = append(args, "--dangerously-skip-permissions")
+	}
+	if cfg.Model != "" {
+		args = append(args, "--model", cfg.Model)
+	}
+	if cfg.SystemPrompt != "" {
+		args = append(args, "--append-system-prompt", cfg.SystemPrompt)
+	}
+	return args
 }
 
 // Attach re-binds by claude session id. In the persistent model there is no live

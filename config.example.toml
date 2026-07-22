@@ -6,6 +6,15 @@ bind       = "127.0.0.1:8787"   # local-only by default (design 3.9)
 api_bearer = "change-me-bearer"  # gates the local HTTP/WS API
 state_dir  = "state"             # run-log + durable state live here
 
+# Workspaces: every session is homed in a workspace (the agent's persistent
+# home dir: instructions/ + memory/ wiki + context.md handoff + work/), kept
+# under git. See internal/workspace and the README's Workspace section.
+[workspace]
+root    = ""                     # dir holding workspaces; empty = ~/.agentd/workspaces
+default = ""                     # workspace when a session names none; empty = "default"
+git_autocommit = true            # commit workspace changes after each completed turn
+# remote = ""                    # optional git remote for MANUAL opt-in push; agentd never auto-pushes
+
 # One harness entry. Only "claude-code" is implemented in this scaffold.
 # A second adapter (e.g. codex) is a drop-in later; the interface is ready.
 [[harness]]
