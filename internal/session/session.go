@@ -23,7 +23,9 @@ import (
 	"github.com/kjhnns/agentd/internal/workspace"
 )
 
-// Session is one live conversation bound to a harness handle.
+// Session is one live conversation bound to a harness handle. Its identity
+// (ID/Title/Workspace) is stable ACROSS a context reset; only the underlying
+// harness handle (the process with its context window) is replaced.
 type Session struct {
 	ID        string          `json:"id"`
 	Harness   string          `json:"harness"`
@@ -33,19 +35,33 @@ type Session struct {
 	handle    harness.Handle  `json:"-"`
 	adapter   harness.Adapter `json:"-"`
 	ws        *workspace.Workspace
+	model     string // captured at create, so a reset re-Starts with the same model
+	cwd       string // harness working dir (workspace root, or bare cwd), reused on reset
 
-	mu      sync.Mutex
-	status  harness.Status
-	running bool
+	// turnMu serializes whole turns for this session: Send, the checkpoint-flush,
+	// and the handle swap during a reset all take it, so an inbound that arrives
+	// mid-turn QUEUES as the next turn (single-active-session policy) and a reset
+	// never races a live turn.
+	turnMu sync.Mutex
+
+	mu           sync.Mutex
+	status       harness.Status
+	running      bool
+	turns        int       // turns on the CURRENT handle (reset back to 0 on reset)
+	handleStart  time.Time // when the current handle was started (for max_wallclock)
+	lastActivity time.Time // last turn boundary (for idle GC)
 }
 
 // Status snapshots the session for the API.
 type Status struct {
-	ID      string         `json:"id"`
-	Harness string         `json:"harness"`
-	Title   string         `json:"title"`
-	Status  harness.Status `json:"status"`
-	AgentOK bool           `json:"agent_ok"` // distinct from transport_ok (failure class 2)
+	ID             string         `json:"id"`
+	Harness        string         `json:"harness"`
+	Title          string         `json:"title"`
+	Status         harness.Status `json:"status"`
+	AgentOK        bool           `json:"agent_ok"` // distinct from transport_ok (failure class 2)
+	Turns          int            `json:"turns"`
+	Pressure       float64        `json:"pressure"`        // context pressure 0..1 on the live handle
+	PressureSource string         `json:"pressure_source"` // real | proxy
 }
 
 // Manager owns all sessions plus the shared bus and run-log.
@@ -59,6 +75,16 @@ type Manager struct {
 	// SkipPermissions is the harness default applied to new sessions (design:
 	// run hands-free; agentd's own confirm-gate is the intended safety layer).
 	SkipPermissions bool
+
+	// PermissionMode is the ACP-ready permission policy passed to every new
+	// session (overrides SkipPermissions on the adapter when set). Derived from
+	// SkipPermissions by the wiring in main unless set explicitly.
+	PermissionMode harness.PermissionMode
+
+	// Policy holds the session-lifecycle + context-reset tuning ([session]
+	// config): pressure threshold, idle timeout, turn/wallclock backstops, GC
+	// cadence, checkpoint-flush bound. See Policy.
+	Policy Policy
 
 	// Workspaces homes sessions in named workspaces (design 3.5). When set,
 	// Create resolves the requested (or default) workspace, runs the harness
@@ -74,6 +100,46 @@ type Manager struct {
 	GitAutoCommit bool
 }
 
+// Policy is the session-lifecycle + context-reset tuning (mirrors config
+// [session]). agentd keeps ONE warm session per workspace and, rather than
+// compacting, performs a controlled RESET when a threshold trips. A zero field
+// disables that trigger (except ContextResetPressure/GCInterval which fall back
+// to a default). DefaultPolicy supplies sane values.
+type Policy struct {
+	ContextResetPressure float64       // reset when pressure crosses this after a turn
+	IdleTimeout          time.Duration // idle this long -> checkpoint-flush + reclaim (0 = off)
+	MaxTurns             int           // hard backstop: reset after N turns on a handle (0 = off)
+	MaxWallclock         time.Duration // hard backstop: reset after this handle age (0 = off)
+	GCInterval           time.Duration // sweeper cadence (0 = default 1m)
+	CheckpointTimeout    time.Duration // bound on the checkpoint-flush turn (0 = default 120s)
+}
+
+// DefaultPolicy returns the built-in tuning used when none is configured.
+func DefaultPolicy() Policy {
+	return Policy{
+		ContextResetPressure: 0.75,
+		IdleTimeout:          30 * time.Minute,
+		MaxTurns:             200,
+		MaxWallclock:         8 * time.Hour,
+		GCInterval:           time.Minute,
+		CheckpointTimeout:    120 * time.Second,
+	}
+}
+
+func (p Policy) checkpointTimeout() time.Duration {
+	if p.CheckpointTimeout > 0 {
+		return p.CheckpointTimeout
+	}
+	return 120 * time.Second
+}
+
+func (p Policy) gcInterval() time.Duration {
+	if p.GCInterval > 0 {
+		return p.GCInterval
+	}
+	return time.Minute
+}
+
 // NewManager builds a Session Manager over one harness adapter.
 func NewManager(adapter harness.Adapter, bus *eventbus.Bus, log *runlog.Log) *Manager {
 	return &Manager{
@@ -81,6 +147,7 @@ func NewManager(adapter harness.Adapter, bus *eventbus.Bus, log *runlog.Log) *Ma
 		adapter:  adapter,
 		bus:      bus,
 		log:      log,
+		Policy:   DefaultPolicy(),
 	}
 }
 
@@ -120,19 +187,25 @@ func (m *Manager) Create(ctx context.Context, workspaceName, cwd, model, title s
 		Model:           model,
 		SystemPrompt:    systemPrompt,
 		SkipPermissions: m.SkipPermissions,
+		PermissionMode:  m.PermissionMode,
 	})
 	if err != nil {
 		return nil, err
 	}
+	now := time.Now().UTC()
 	s := &Session{
-		ID:      id,
-		Harness: m.adapter.Name(),
-		Title:   title,
-		Created: time.Now().UTC(),
-		handle:  h,
-		adapter: m.adapter,
-		ws:      ws,
-		status:  harness.StatusIdle,
+		ID:           id,
+		Harness:      m.adapter.Name(),
+		Title:        title,
+		Created:      now,
+		handle:       h,
+		adapter:      m.adapter,
+		ws:           ws,
+		model:        model,
+		cwd:          cwd,
+		status:       harness.StatusIdle,
+		handleStart:  now,
+		lastActivity: now,
 	}
 	if ws != nil {
 		s.Workspace = ws.Name
@@ -144,14 +217,18 @@ func (m *Manager) Create(ctx context.Context, workspaceName, cwd, model, title s
 	if m.log != nil {
 		_ = m.log.Append("session_create", map[string]string{"id": id, "harness": s.Harness, "title": title, "workspace": s.Workspace})
 	}
-	// Pump the adapter's per-session events onto the shared bus + run-log.
-	go m.pump(s)
+	// Pump the adapter's per-session events onto the shared bus + run-log. The
+	// handle is passed explicitly so a reset can start a fresh pump for the new
+	// handle while the old pump drains and exits on its closed event channel.
+	go m.pump(s, h)
 	return s, nil
 }
 
-// pump forwards a session's harness events to the bus and durable log.
-func (m *Manager) pump(s *Session) {
-	for e := range s.adapter.Events(s.handle) {
+// pump forwards ONE handle's harness events to the bus and durable log until
+// that handle's event channel closes (teardown). A reset spawns a new pump for
+// the replacement handle.
+func (m *Manager) pump(s *Session, h harness.Handle) {
+	for e := range s.adapter.Events(h) {
 		m.bus.Publish(e)
 		if m.log != nil {
 			_ = m.log.Append("event", e)
@@ -182,17 +259,32 @@ func (s *Session) statusSnapshot() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	agentOK := s.status != harness.StatusError && s.status != harness.StatusDead
-	return Status{ID: s.ID, Harness: s.Harness, Title: s.Title, Status: s.status, AgentOK: agentOK}
+	cp := s.adapter.Pressure(s.handle)
+	return Status{
+		ID:             s.ID,
+		Harness:        s.Harness,
+		Title:          s.Title,
+		Status:         s.status,
+		AgentOK:        agentOK,
+		Turns:          s.turns,
+		Pressure:       cp.Fraction,
+		PressureSource: string(cp.Source),
+	}
 }
 
 // SendResult holds the outcome of one turn for a caller (channel/API).
 type SendResult struct {
-	Result string            // the final result text
-	Events []eventbus.Event  // all normalized events from the turn
+	Result string           // the final result text
+	Events []eventbus.Event // all normalized events from the turn
 }
 
 // Send routes one user turn to the session's harness and returns the result. It
-// runs synchronously (the turn) and records inbound to the run-log.
+// takes the per-session turn lock so concurrent inbound serializes as the NEXT
+// turn (single-active-session policy) rather than spawning a parallel session.
+// After a COMPLETED turn it evaluates the context-reset triggers (pressure /
+// max_turns / max_wallclock) at that natural boundary and, if one trips, kicks
+// off a controlled reset in the background so the just-produced reply is not
+// delayed. It never checks mid-turn.
 func (m *Manager) Send(ctx context.Context, id, text string) (*SendResult, error) {
 	s, ok := m.Get(id)
 	if !ok {
@@ -201,21 +293,30 @@ func (m *Manager) Send(ctx context.Context, id, text string) (*SendResult, error
 	if m.log != nil {
 		_ = m.log.Append("input", map[string]string{"session": id, "text": text})
 	}
+
+	s.turnMu.Lock()
+
 	s.mu.Lock()
 	s.running = true
 	s.status = harness.StatusThinking
+	handle := s.handle
 	s.mu.Unlock()
 
-	err := s.adapter.Send(ctx, s.handle, harness.Input{Text: text})
+	err := s.adapter.Send(ctx, handle, harness.Input{Text: text})
 
+	now := time.Now().UTC()
 	s.mu.Lock()
 	s.running = false
 	s.status = s.adapter.Status(s.handle)
 	if err != nil {
 		s.status = harness.StatusError
 	}
+	s.turns++
+	s.lastActivity = now
 	s.mu.Unlock()
+
 	if err != nil {
+		s.turnMu.Unlock()
 		return nil, err
 	}
 
@@ -231,7 +332,47 @@ func (m *Manager) Send(ctx context.Context, id, text string) (*SendResult, error
 			_ = m.log.Append("workspace_commit", map[string]string{"session": id, "workspace": s.ws.Name, "commit": sha})
 		}
 	}
+
+	tripped, reason := m.evalTriggers(s)
+	s.turnMu.Unlock()
+
+	if tripped {
+		// Background so the reply goes out promptly; Reset re-takes turnMu and
+		// serializes against any queued turn. Use a detached context so an
+		// ending request context does not abort the reset.
+		go func() {
+			if rerr := m.Reset(context.Background(), id, reason); rerr != nil {
+				log.Printf("session %s: post-turn reset (%s) failed: %v", id, reason, rerr)
+			}
+		}()
+	}
 	return &SendResult{}, nil
+}
+
+// evalTriggers returns whether a context reset should fire after a completed
+// turn, and why. Order: hard backstops first (they protect proxy-only harnesses
+// and runaway sessions), then the pressure threshold. Caller holds turnMu.
+func (m *Manager) evalTriggers(s *Session) (bool, string) {
+	p := m.Policy
+	s.mu.Lock()
+	turns := s.turns
+	age := time.Since(s.handleStart)
+	handle := s.handle
+	s.mu.Unlock()
+
+	if p.MaxTurns > 0 && turns >= p.MaxTurns {
+		return true, fmt.Sprintf("max_turns (%d)", turns)
+	}
+	if p.MaxWallclock > 0 && age >= p.MaxWallclock {
+		return true, fmt.Sprintf("max_wallclock (%s)", age.Round(time.Second))
+	}
+	if p.ContextResetPressure > 0 {
+		cp := s.adapter.Pressure(handle)
+		if cp.Fraction >= p.ContextResetPressure {
+			return true, fmt.Sprintf("pressure %.2f>=%.2f (%s)", cp.Fraction, p.ContextResetPressure, cp.Source)
+		}
+	}
+	return false, ""
 }
 
 // Interrupt cancels the current turn.
@@ -270,6 +411,14 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		_ = m.log.Append("inbound", in)
 	}
 	id, ok := sessionForChat[in.UserID]
+	if ok {
+		// A session the idle-GC reclaimed (process freed) no longer exists; the
+		// next inbound lazily re-hydrates a FRESH one from the workspace
+		// artifacts (context.md + memory), which is exactly the reclaim contract.
+		if _, alive := m.Get(id); !alive {
+			ok = false
+		}
+	}
 	if !ok {
 		s, err := m.Create(ctx, "", cwd, model, "telegram:"+in.UserID)
 		if err != nil {

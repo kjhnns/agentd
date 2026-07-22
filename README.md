@@ -55,14 +55,17 @@ scope. What is IN:
 - **Workspace** (`internal/workspace`): the WORKSPACE is a first-class concept
   (design 3.5) — see the dedicated section below.
 - **Session Manager** (`internal/session`): create/list/get/status/interrupt/
-  teardown; homes every session in a workspace (cwd = workspace root, composed
-  system-prompt injection); routes Telegram inbound -> Claude Code turn -> reply
-  back to Telegram; auto-commits workspace changes at end of turn.
+  teardown/**reset**; homes every session in a workspace (cwd = workspace root,
+  composed system-prompt injection); routes Telegram inbound -> Claude Code turn
+  -> reply back to Telegram; auto-commits workspace changes at end of turn; owns
+  the warm-session lifecycle + context reset + GC sweeper (see the dedicated
+  section below).
 - **Local API** (`internal/api`): bearer-gated HTTP on `127.0.0.1`. `GET /health`
   returns BOTH `transport_ok` and per-session `agent_ok` as distinct signals (the
-  lesson from failure class 2). `GET/POST /sessions`, `POST /sessions/:id/input`,
+  lesson from failure class 2), plus per-session `pressure` + `pressure_source`.
+  `GET/POST /sessions`, `POST /sessions/:id/input`,
   `GET /sessions/:id/events` (WebSocket), `DELETE /sessions/:id`,
-  `POST /sessions/:id/interrupt`.
+  `POST /sessions/:id/interrupt`, `POST /sessions/:id/reset`.
 
 ## Workspace: the agent's persistent home (design 3.5)
 
@@ -132,6 +135,78 @@ over time** (`git -C <ws> log -p memory/pages/<slug>.md`). A remote is optional
 and OFF by default: agentd never auto-pushes; `[workspace] remote` merely
 records one for a manual, opt-in push.
 
+## Session lifecycle + context reset (agentd owns RESET, not compaction)
+
+Steady state is **ONE long-lived warm session per workspace** (single-active-
+session policy; the Manager stays keyed by id so multi-session is a future
+toggle). agentd keeps feeding turns to the same live harness process, which
+manages its own context window internally. agentd does **not** compact. When the
+window fills up (or a backstop trips), agentd performs a **controlled context
+RESET**:
+
+1. **Checkpoint-flush turn.** A bounded instruction is injected telling the agent
+   to persist anything worth keeping (open threads, decisions, blockers, new
+   durable learnings) into `context.md` and the relevant `memory/pages/*.md`,
+   concisely, then stop. agentd waits for that turn so the git autocommit
+   captures the artifacts.
+2. **Teardown.** The harness process is stopped.
+3. **Fresh, re-hydrated process.** A NEW process is started for the SAME session
+   id, cwd = the workspace root, its system prompt re-composed by
+   `ComposeSystemPrompt` over the now-updated artifacts.
+
+The session identity (id/title/workspace) is continuous from agentd's side; only
+the harness process (its context window) is new. **The workspace artifacts are
+what make the reset lossless:** the fresh process reads the facts back from
+`context.md`/memory, not from the old process's context. A live gated test
+(`TestLiveLosslessResetNovember3`, `AGENTD_LIVE_CLAUDE=1`) proves this: it plants
+"launch date is NOVEMBER 3", forces a reset, and the fresh (empty-context)
+process answers "November 3" because the checkpoint-flush wrote it to the
+artifact. If the checkpoint-flush errors or times out, agentd still tears down
+and starts fresh (a wedged flush never strands the session); the incomplete
+flush is logged.
+
+**Context pressure is a harness-agnostic adapter signal** (real *or* proxy). The
+`HarnessAdapter` reports a normalized `ContextPressure{ fraction 0..1, source }`
+for the live session:
+
+- **real** — the Claude Code adapter parses token usage from the stream-json
+  `result`/assistant events (`input + cache_read + cache_creation + output`) and
+  divides by the model context window (configurable, default 200000; a known
+  model id sets its own window).
+- **proxy** — adapters with no usage (a future Codex/PTY adapter) estimate
+  pressure from cumulative turns / bytes exchanged / wall-clock since start
+  (the largest normalized ratio). The Claude adapter uses this as a backstop
+  before the first usage line; a proxy-only harness uses it throughout.
+
+Pressure is observable via the session status and `GET /health` (`pressure` +
+`pressure_source` per session).
+
+**Reset triggers + backstops**, all config-tunable in `[session]`:
+
+- `context_reset_pressure` (default 0.75) — reset when pressure crosses this
+  after a completed turn.
+- `idle_timeout` (default 30m) — a session idle this long is checkpoint-flushed
+  and its process reclaimed (GC); the next inbound lazily re-hydrates a fresh one
+  from the artifacts.
+- `max_turns` (default 200) and `max_wallclock` (default 8h) — hard backstops
+  that force a reset regardless of the pressure signal (this is what protects
+  proxy-only harnesses and runaway sessions). 0 disables a backstop.
+- **explicit** — `Manager.Reset` exposed as `POST /sessions/:id/reset`.
+- **error/death** — the GC sweeper recovers a dead/stale process with a
+  fresh-from-artifacts restart in place (always the safe fallback).
+
+Pressure/turn/wallclock are checked at a natural boundary (after each completed
+turn, in `Manager.Send`); idle/dead reclaim runs on a **GC sweeper** goroutine
+(`gc_interval`, default 1m). Checks NEVER run mid-turn. An inbound that arrives
+while a turn is running serializes as the next turn (a per-session turn lock),
+never a parallel session.
+
+**ACP-readiness (cheap future-proofing).** Tool permissions are modeled as a
+policy value on the adapter config (`PermissionMode: skip|prompt`) rather than a
+hard-coded `--dangerously-skip-permissions` inline, so a future ACP-based adapter
+can map the same policy to ACP's client-side permission handling. No ACP is built
+here.
+
 What is DEFERRED (explicit non-goals here, separate go/no-go decisions later):
 
 - **Secrets Vault** subsystem (design 3.8) — the Telegram token comes from an env
@@ -187,6 +262,10 @@ AGENTD_LIVE_CLAUDE=1 go test ./internal/harness/claudecode/ -run Continuity -v
 
 # live proof that the workspace injection takes effect (ORCHID test):
 AGENTD_LIVE_CLAUDE=1 go test ./internal/session/ -run LiveWorkspaceInjection -v
+
+# THE MONEY TEST: live proof a context RESET is lossless (NOVEMBER 3 survives a
+# checkpoint-flush -> teardown -> fresh re-hydrated process):
+AGENTD_LIVE_CLAUDE=1 go test ./internal/session/ -run LiveLosslessReset -v -timeout 20m
 
 # run the daemon:
 cp config.example.toml config.toml   # edit bearer + allowlist

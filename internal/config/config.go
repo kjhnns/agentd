@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Server is the [server] table.
@@ -39,6 +40,20 @@ type Workspace struct {
 	Remote        string // optional git remote for MANUAL opt-in push; never pushed automatically
 }
 
+// Session is the [session] table: the SESSION LIFECYCLE + CONTEXT-RESET tuning.
+// agentd keeps ONE warm session per workspace and, instead of compacting, owns
+// a controlled RESET (checkpoint-flush -> teardown -> fresh re-hydrated process)
+// when a threshold trips. These are the config-tunable triggers + backstops.
+type Session struct {
+	ContextResetPressure float64       // reset when context pressure (0..1) crosses this after a turn (default 0.75)
+	IdleTimeout          time.Duration // a session idle this long is checkpoint-flushed + reclaimed (default 30m)
+	MaxTurns             int           // hard backstop: force a reset after this many turns (0 = off; default 200)
+	MaxWallclock         time.Duration // hard backstop: force a reset after this session age (0 = off; default 8h)
+	ContextWindow        int           // model context window (tokens) for real pressure (default 200000)
+	GCInterval           time.Duration // how often the sweeper enforces idle/dead reclaim (default 1m)
+	CheckpointTimeout    time.Duration // bound on the checkpoint-flush turn before teardown proceeds anyway (default 120s)
+}
+
 // Channel is one [[channel]] entry.
 type Channel struct {
 	Kind   string   // "telegram", ...
@@ -51,8 +66,23 @@ type Channel struct {
 type Config struct {
 	Server    Server
 	Workspace Workspace
+	Session   Session
 	Harness   []Harness
 	Channel   []Channel
+}
+
+// DefaultSession returns the built-in session-lifecycle tuning applied when
+// [session] is absent or only partially specified.
+func DefaultSession() Session {
+	return Session{
+		ContextResetPressure: 0.75,
+		IdleTimeout:          30 * time.Minute,
+		MaxTurns:             200,
+		MaxWallclock:         8 * time.Hour,
+		ContextWindow:        200000,
+		GCInterval:           time.Minute,
+		CheckpointTimeout:    120 * time.Second,
+	}
 }
 
 // ResolveToken expands an "env:VAR" reference to the environment variable's
@@ -79,6 +109,7 @@ func Parse(data []byte) (*Config, error) {
 	cfg := &Config{
 		Server:    Server{Bind: "127.0.0.1:8787", StateDir: "state"},
 		Workspace: Workspace{GitAutocommit: true}, // Root/Default resolved by workspace.NewStore
+		Session:   DefaultSession(),
 	}
 	section := "" // "server" or "" (top-level)
 	var curHarness *Harness
@@ -174,6 +205,53 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, key, raw strin
 			cfg.Workspace.Remote = s
 		default:
 			return fmt.Errorf("unknown [workspace] key %q", key)
+		}
+	case "session":
+		switch key {
+		case "context_reset_pressure":
+			f, err := asFloat(raw)
+			if err != nil {
+				return fmt.Errorf("context_reset_pressure: %w", err)
+			}
+			cfg.Session.ContextResetPressure = f
+		case "idle_timeout":
+			d, err := asDuration(raw)
+			if err != nil {
+				return fmt.Errorf("idle_timeout: %w", err)
+			}
+			cfg.Session.IdleTimeout = d
+		case "max_turns":
+			n, err := asInt(raw)
+			if err != nil {
+				return fmt.Errorf("max_turns: %w", err)
+			}
+			cfg.Session.MaxTurns = int(n)
+		case "max_wallclock":
+			d, err := asDuration(raw)
+			if err != nil {
+				return fmt.Errorf("max_wallclock: %w", err)
+			}
+			cfg.Session.MaxWallclock = d
+		case "context_window":
+			n, err := asInt(raw)
+			if err != nil {
+				return fmt.Errorf("context_window: %w", err)
+			}
+			cfg.Session.ContextWindow = int(n)
+		case "gc_interval":
+			d, err := asDuration(raw)
+			if err != nil {
+				return fmt.Errorf("gc_interval: %w", err)
+			}
+			cfg.Session.GCInterval = d
+		case "checkpoint_timeout":
+			d, err := asDuration(raw)
+			if err != nil {
+				return fmt.Errorf("checkpoint_timeout: %w", err)
+			}
+			cfg.Session.CheckpointTimeout = d
+		default:
+			return fmt.Errorf("unknown [session] key %q", key)
 		}
 	case "harness":
 		if key == "skip_permissions" {
@@ -282,12 +360,34 @@ func asStringArray(raw string) ([]string, error) {
 	return out, nil
 }
 
-// asInt is available for future numeric keys (kept for the schema's growth).
+// asInt parses a bare integer value (trailing comment tolerated).
 func asInt(raw string) (int64, error) {
 	return strconv.ParseInt(stripComment(raw), 10, 64)
 }
 
-// asBool is available for future boolean keys.
+// asBool parses a bare boolean value (trailing comment tolerated).
 func asBool(raw string) (bool, error) {
 	return strconv.ParseBool(stripComment(raw))
+}
+
+// asFloat parses a bare float value (trailing comment tolerated).
+func asFloat(raw string) (float64, error) {
+	return strconv.ParseFloat(stripComment(raw), 64)
+}
+
+// asDuration parses a duration. It accepts a quoted or bare Go duration string
+// ("30m", "8h", "120s"); a bare integer is treated as seconds for convenience.
+func asDuration(raw string) (time.Duration, error) {
+	s := stripComment(raw)
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = s[1 : len(s)-1]
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return time.Duration(n) * time.Second, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("expected a duration like \"30m\" or a number of seconds, got %q", s)
+	}
+	return d, nil
 }

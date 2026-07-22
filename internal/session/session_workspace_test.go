@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/kjhnns/agentd/internal/eventbus"
@@ -10,41 +11,119 @@ import (
 	"github.com/kjhnns/agentd/internal/workspace"
 )
 
-// fakeAdapter captures the SessionConfig the manager passes to Start, so tests
-// can assert the workspace wiring (cwd + composed system prompt) without a
-// live harness.
+// fakeAdapter is an instrumented in-memory harness for the manager tests. It
+// records the SessionConfig of every Start (so tests can assert workspace wiring
+// AND the re-composed prompt on a reset), every Send text (so a checkpoint-flush
+// is observable), and teardown count. Its reported status and context pressure
+// are settable so tests can drive dead-recovery and pressure-triggered resets.
 type fakeAdapter struct {
-	started []harness.SessionConfig
-	events  chan eventbus.Event
+	mu       sync.Mutex
+	started  []harness.SessionConfig
+	sends    []string
+	teardown int
+
+	status   harness.Status
+	pressure harness.ContextPressure
+	// optional hook invoked on each Send (e.g. to have the checkpoint-flush
+	// write to the workspace before teardown).
+	onSend func(text string)
 }
 
-type fakeHandle struct{ id string }
+type fakeHandle struct {
+	id     string
+	events chan eventbus.Event
+}
 
 func (f *fakeHandle) ID() string { return f.id }
+
+func (a *fakeAdapter) startedConfigs() []harness.SessionConfig {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]harness.SessionConfig, len(a.started))
+	copy(out, a.started)
+	return out
+}
+
+func (a *fakeAdapter) sentTexts() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]string, len(a.sends))
+	copy(out, a.sends)
+	return out
+}
+
+func (a *fakeAdapter) teardownCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.teardown
+}
+
+func (a *fakeAdapter) setStatus(s harness.Status) {
+	a.mu.Lock()
+	a.status = s
+	a.mu.Unlock()
+}
+
+func (a *fakeAdapter) setPressure(p harness.ContextPressure) {
+	a.mu.Lock()
+	a.pressure = p
+	a.mu.Unlock()
+}
 
 func (a *fakeAdapter) Name() string { return "fake" }
 func (a *fakeAdapter) Capabilities() harness.Capabilities {
 	return harness.Capabilities{}
 }
 func (a *fakeAdapter) Start(ctx context.Context, cfg harness.SessionConfig) (harness.Handle, error) {
+	a.mu.Lock()
 	a.started = append(a.started, cfg)
-	return &fakeHandle{id: cfg.SessionID}, nil
+	a.status = harness.StatusIdle
+	a.mu.Unlock()
+	return &fakeHandle{id: cfg.SessionID, events: make(chan eventbus.Event, 8)}, nil
 }
 func (a *fakeAdapter) Attach(ctx context.Context, existing string) (harness.Handle, error) {
-	return &fakeHandle{id: existing}, nil
+	return &fakeHandle{id: existing, events: make(chan eventbus.Event, 8)}, nil
 }
 func (a *fakeAdapter) Send(ctx context.Context, h harness.Handle, in harness.Input) error {
+	a.mu.Lock()
+	a.sends = append(a.sends, in.Text)
+	hook := a.onSend
+	a.mu.Unlock()
+	if hook != nil {
+		hook(in.Text)
+	}
 	return nil
 }
-func (a *fakeAdapter) Interrupt(h harness.Handle) error       { return nil }
-func (a *fakeAdapter) Status(h harness.Handle) harness.Status { return harness.StatusIdle }
-func (a *fakeAdapter) Teardown(h harness.Handle) error        { return nil }
-func (a *fakeAdapter) Events(h harness.Handle) <-chan eventbus.Event {
-	if a.events == nil {
-		a.events = make(chan eventbus.Event)
-		close(a.events)
+func (a *fakeAdapter) Interrupt(h harness.Handle) error { return nil }
+func (a *fakeAdapter) Status(h harness.Handle) harness.Status {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.status == "" {
+		return harness.StatusIdle
 	}
-	return a.events
+	return a.status
+}
+func (a *fakeAdapter) Teardown(h harness.Handle) error {
+	a.mu.Lock()
+	a.teardown++
+	a.mu.Unlock()
+	if fh, ok := h.(*fakeHandle); ok && fh.events != nil {
+		close(fh.events)
+	}
+	return nil
+}
+func (a *fakeAdapter) Pressure(h harness.Handle) harness.ContextPressure {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.pressure
+}
+func (a *fakeAdapter) Events(h harness.Handle) <-chan eventbus.Event {
+	if fh, ok := h.(*fakeHandle); ok && fh.events != nil {
+		return fh.events
+	}
+	ch := make(chan eventbus.Event)
+	close(ch)
+	return ch
 }
 
 // TestCreateHomesSessionInWorkspace: with a workspace store configured,
@@ -79,9 +158,9 @@ func TestCreateHomesSessionInWorkspace(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Agent instructions (workspace constitution)", // instructions/AGENTS.md
-		"Memory index",                                // memory/INDEX.md
-		"Context handoff",                             // context.md
-		"memory-conventions",                          // an INDEX entry
+		"Memory index",       // memory/INDEX.md
+		"Context handoff",    // context.md
+		"memory-conventions", // an INDEX entry
 	} {
 		if !strings.Contains(cfg.SystemPrompt, want) {
 			t.Errorf("injected prompt missing %q", want)

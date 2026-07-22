@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 const sample = `
@@ -122,5 +123,55 @@ remote  = "git@github.com:me/ws-backup.git"
 	}
 	if !cfg2.Workspace.GitAutocommit {
 		t.Fatal("git_autocommit should default to true")
+	}
+}
+
+// TestParseSessionBlock: the [session] block parses the context-reset tunables
+// (float, durations, ints) and defaults apply when absent or partial.
+func TestParseSessionBlock(t *testing.T) {
+	cfg, err := Parse([]byte(`
+[session]
+context_reset_pressure = 0.6
+idle_timeout      = "15m"
+max_turns         = 50
+max_wallclock     = "4h"
+context_window    = 1000000
+gc_interval       = "30s"
+checkpoint_timeout = "90s"
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	s := cfg.Session
+	if s.ContextResetPressure != 0.6 {
+		t.Errorf("context_reset_pressure = %v", s.ContextResetPressure)
+	}
+	if s.IdleTimeout != 15*time.Minute {
+		t.Errorf("idle_timeout = %v", s.IdleTimeout)
+	}
+	if s.MaxTurns != 50 {
+		t.Errorf("max_turns = %d", s.MaxTurns)
+	}
+	if s.MaxWallclock != 4*time.Hour {
+		t.Errorf("max_wallclock = %v", s.MaxWallclock)
+	}
+	if s.ContextWindow != 1000000 {
+		t.Errorf("context_window = %d", s.ContextWindow)
+	}
+	if s.GCInterval != 30*time.Second {
+		t.Errorf("gc_interval = %v", s.GCInterval)
+	}
+	if s.CheckpointTimeout != 90*time.Second {
+		t.Errorf("checkpoint_timeout = %v", s.CheckpointTimeout)
+	}
+
+	// Defaults when [session] is absent.
+	def, err := Parse([]byte("[server]\nbind = \"127.0.0.1:1\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def.Session.ContextResetPressure != 0.75 || def.Session.IdleTimeout != 30*time.Minute ||
+		def.Session.MaxTurns != 200 || def.Session.ContextWindow != 200000 {
+		t.Fatalf("session defaults not applied: %+v", def.Session)
 	}
 }

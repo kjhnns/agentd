@@ -272,10 +272,27 @@ func serve(args []string) {
 	if len(cfg.Harness) > 0 {
 		model = cfg.Harness[0].Model
 	}
-	adapter := claudecode.New("claude")
+	adapter := claudecode.New("claude").WithContextWindow(cfg.Session.ContextWindow)
 	mgr := session.NewManager(adapter, bus, rl)
 	if len(cfg.Harness) > 0 {
 		mgr.SkipPermissions = cfg.Harness[0].SkipPermissions
+	}
+	// ACP-ready permission policy (value, not a hard-coded flag): derive from
+	// the skip_permissions toggle. A future ACP adapter maps the SAME policy to
+	// client-side permission handling.
+	if mgr.SkipPermissions {
+		mgr.PermissionMode = harness.PermissionSkip
+	} else {
+		mgr.PermissionMode = harness.PermissionPrompt
+	}
+	// Session lifecycle + context-reset tuning ([session] config).
+	mgr.Policy = session.Policy{
+		ContextResetPressure: cfg.Session.ContextResetPressure,
+		IdleTimeout:          cfg.Session.IdleTimeout,
+		MaxTurns:             cfg.Session.MaxTurns,
+		MaxWallclock:         cfg.Session.MaxWallclock,
+		GCInterval:           cfg.Session.GCInterval,
+		CheckpointTimeout:    cfg.Session.CheckpointTimeout,
 	}
 	// Workspaces: every session is homed in a workspace (cwd = workspace root,
 	// composed injection via --append-system-prompt). See internal/workspace.
@@ -283,9 +300,17 @@ func serve(args []string) {
 	mgr.GitAutoCommit = cfg.Workspace.GitAutocommit
 	log.Printf("agentd: harness=claude-code skip_permissions=%v workspaces=%s default=%q git_autocommit=%v",
 		mgr.SkipPermissions, mgr.Workspaces.Root, mgr.Workspaces.Default, mgr.GitAutoCommit)
+	log.Printf("agentd: session policy context_window=%d reset_pressure=%.2f idle=%s max_turns=%d max_wallclock=%s gc=%s",
+		cfg.Session.ContextWindow, mgr.Policy.ContextResetPressure, mgr.Policy.IdleTimeout,
+		mgr.Policy.MaxTurns, mgr.Policy.MaxWallclock, mgr.Policy.GCInterval)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Session GC/sweeper: enforces idle_timeout (checkpoint-flush + reclaim) and
+	// recovers dead sessions on a ticker. Reset triggers (pressure/turns/
+	// wallclock) fire after each completed turn, in Manager.Send.
+	mgr.StartGC(ctx)
 
 	// Channel: telegram, if configured and a token is present.
 	var transportUp atomic.Bool

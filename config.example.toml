@@ -15,6 +15,30 @@ default = ""                     # workspace when a session names none; empty = 
 git_autocommit = true            # commit workspace changes after each completed turn
 # remote = ""                    # optional git remote for MANUAL opt-in push; agentd never auto-pushes
 
+# Session lifecycle + context reset. agentd keeps ONE warm session per workspace
+# and never compacts; instead it owns a controlled RESET (checkpoint-flush ->
+# teardown -> fresh process re-hydrated from the workspace artifacts). These are
+# the config-tunable triggers and backstops; omit the block to accept defaults.
+[session]
+# Reset when the live context PRESSURE (0..1 of the window) crosses this after a
+# completed turn. Pressure is REAL for Claude Code (measured token usage) and a
+# turns/bytes/wallclock PROXY for harnesses without usage.
+context_reset_pressure = 0.75
+# A session idle this long is checkpoint-flushed and its process reclaimed (GC).
+idle_timeout       = "30m"
+# Hard backstops that force a reset regardless of the pressure signal (protects
+# proxy-only harnesses and runaway sessions). 0 disables a backstop.
+max_turns          = 200
+max_wallclock      = "8h"
+# Model context window (tokens) used as the denominator for REAL pressure. A
+# known model id overrides this per session.
+context_window     = 200000
+# How often the sweeper enforces idle_timeout and reclaims dead/stale sessions.
+gc_interval        = "1m"
+# Upper bound on the checkpoint-flush turn; if it overruns, agentd tears down and
+# starts fresh anyway (a wedged flush never strands the session).
+checkpoint_timeout = "120s"
+
 # One harness entry. Only "claude-code" is implemented in this scaffold.
 # A second adapter (e.g. codex) is a drop-in later; the interface is ready.
 [[harness]]

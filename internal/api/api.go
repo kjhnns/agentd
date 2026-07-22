@@ -136,6 +136,24 @@ func (s *Server) handleSessionSubpath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "interrupted", "id": id})
+	case "reset":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Reason string `json:"reason"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		reason := body.Reason
+		if reason == "" {
+			reason = "explicit (api)"
+		}
+		if err := s.mgr.Reset(r.Context(), id, reason); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "reset", "id": id, "reason": reason})
 	case "events":
 		s.handleEvents(w, r, id)
 	default:

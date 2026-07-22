@@ -26,6 +26,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,9 +34,24 @@ import (
 	"github.com/kjhnns/agentd/internal/harness"
 )
 
+// DefaultContextWindow is the assumed model context window (tokens) when the
+// model id is unknown and no override is configured. Real pressure = measured
+// tokens / this window.
+const DefaultContextWindow = 200000
+
+// modelWindows maps known model id substrings to their context window so
+// pressure divides by the RIGHT denominator when the model is known. Matched by
+// substring (case-insensitive) so both aliases and full ids resolve.
+var modelWindows = map[string]int{
+	"opus":   200000,
+	"sonnet": 200000,
+	"haiku":  200000,
+}
+
 // Adapter drives the claude CLI as a persistent streaming session.
 type Adapter struct {
-	bin string // path/name of the claude binary
+	bin           string // path/name of the claude binary
+	contextWindow int    // default context window for real pressure (0 => DefaultContextWindow)
 }
 
 // New returns an adapter using the given binary name (default "claude").
@@ -43,13 +59,41 @@ func New(bin string) *Adapter {
 	if bin == "" {
 		bin = "claude"
 	}
-	return &Adapter{bin: bin}
+	return &Adapter{bin: bin, contextWindow: DefaultContextWindow}
+}
+
+// WithContextWindow overrides the default context window (tokens) used to
+// normalize real token usage into a 0..1 pressure fraction. A known model id
+// still takes precedence per session (see resolveWindow). Zero/negative keeps
+// the default.
+func (a *Adapter) WithContextWindow(tokens int) *Adapter {
+	if tokens > 0 {
+		a.contextWindow = tokens
+	}
+	return a
+}
+
+// resolveWindow picks the context window for a session: a known model id wins,
+// else the adapter's configured/default window.
+func (a *Adapter) resolveWindow(model string) int {
+	if model != "" {
+		lm := strings.ToLower(model)
+		for frag, w := range modelWindows {
+			if strings.Contains(lm, frag) {
+				return w
+			}
+		}
+	}
+	if a.contextWindow > 0 {
+		return a.contextWindow
+	}
+	return DefaultContextWindow
 }
 
 func (a *Adapter) Name() string { return "claude-code" }
 
 func (a *Adapter) Capabilities() harness.Capabilities {
-	return harness.Capabilities{StructuredEvents: true, Interrupt: true, Resume: true}
+	return harness.Capabilities{StructuredEvents: true, Interrupt: true, Resume: true, RealContextPressure: true}
 }
 
 // handle is the per-session state around ONE long-lived claude process.
@@ -74,6 +118,17 @@ type handle struct {
 	status          harness.Status
 	dead            bool
 	waiter          chan eventbus.Event // set while a turn awaits its result/error
+
+	// context-pressure tracking (see Pressure). contextWindow is the real
+	// denominator; lastTotalTokens/haveUsage hold the latest measured usage;
+	// turns/bytes/startedAt feed the proxy backstop before any usage is seen.
+	contextWindow   int
+	proxyBudget     harness.ProxyBudget
+	startedAt       time.Time
+	turns           int
+	bytes           int64
+	lastTotalTokens int
+	haveUsage       bool
 }
 
 func (h *handle) ID() string { return h.id }
@@ -110,16 +165,19 @@ func (a *Adapter) Start(ctx context.Context, cfg harness.SessionConfig) (harness
 	}
 
 	h := &handle{
-		id:         cfg.SessionID,
-		bin:        a.bin,
-		cfg:        cfg,
-		cmd:        cmd,
-		stdin:      stdin,
-		stdout:     stdout,
-		events:     make(chan eventbus.Event, 256),
-		procCancel: cancel,
-		done:       make(chan struct{}),
-		status:     harness.StatusIdle,
+		id:            cfg.SessionID,
+		bin:           a.bin,
+		cfg:           cfg,
+		cmd:           cmd,
+		stdin:         stdin,
+		stdout:        stdout,
+		events:        make(chan eventbus.Event, 256),
+		procCancel:    cancel,
+		done:          make(chan struct{}),
+		status:        harness.StatusIdle,
+		contextWindow: a.resolveWindow(cfg.Model),
+		proxyBudget:   harness.DefaultProxyBudget(),
+		startedAt:     time.Now(),
 	}
 	go h.readLoop()
 	return h, nil
@@ -135,7 +193,18 @@ func buildArgs(cfg harness.SessionConfig) []string {
 		"--output-format", "stream-json",
 		"--verbose",
 	}
-	if cfg.SkipPermissions {
+	// Permission policy: PermissionMode (ACP-ready value) wins when set, else
+	// fall back to the SkipPermissions bool. This keeps the flag from being
+	// hard-coded inline so a future ACP adapter can map the same policy to
+	// client-side permission handling instead of a CLI flag.
+	skip := cfg.SkipPermissions
+	switch cfg.PermissionMode {
+	case harness.PermissionSkip:
+		skip = true
+	case harness.PermissionPrompt:
+		skip = false
+	}
+	if skip {
 		args = append(args, "--dangerously-skip-permissions")
 	}
 	if cfg.Model != "" {
@@ -160,6 +229,9 @@ func (a *Adapter) Attach(ctx context.Context, existing string) (harness.Handle, 
 		status:          harness.StatusDead,
 		dead:            true,
 		claudeSessionID: existing,
+		contextWindow:   a.resolveWindow(""),
+		proxyBudget:     harness.DefaultProxyBudget(),
+		startedAt:       time.Now(),
 	}, nil
 }
 
@@ -172,6 +244,77 @@ func (a *Adapter) Status(h harness.Handle) harness.Status {
 	hh.mu.Lock()
 	defer hh.mu.Unlock()
 	return hh.status
+}
+
+// Pressure reports the live context pressure. If any measured usage has been
+// seen it is REAL (latest measured tokens / the session's context window),
+// otherwise a PROXY estimate from turns/bytes/wall-clock (the backstop that
+// protects an early session or a would-be usage gap).
+func (a *Adapter) Pressure(h harness.Handle) harness.ContextPressure {
+	hh := h.(*handle)
+	hh.mu.Lock()
+	defer hh.mu.Unlock()
+	if hh.haveUsage && hh.contextWindow > 0 {
+		frac := float64(hh.lastTotalTokens) / float64(hh.contextWindow)
+		if frac < 0 {
+			frac = 0
+		}
+		if frac > 1 {
+			frac = 1
+		}
+		return harness.ContextPressure{
+			Fraction: frac,
+			Source:   harness.PressureReal,
+			Tokens:   hh.lastTotalTokens,
+			Window:   hh.contextWindow,
+		}
+	}
+	return hh.proxyBudget.Pressure(hh.turns, hh.bytes, time.Since(hh.startedAt))
+}
+
+// usageBlock is the subset of a stream-json usage object we sum. The tokens
+// occupying the context window at the end of a turn are the prompt tokens
+// (input + cache_read + cache_creation) plus the produced output.
+type usageBlock struct {
+	InputTokens              int `json:"input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+}
+
+func (u usageBlock) total() int {
+	return u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens + u.OutputTokens
+}
+
+// usageLine locates a usage block on either a top-level result line
+// (`{"type":"result","usage":{...}}`) or an assistant message line
+// (`{"type":"assistant","message":{"usage":{...}}}`).
+type usageLine struct {
+	Usage   *usageBlock `json:"usage"`
+	Message *struct {
+		Usage *usageBlock `json:"usage"`
+	} `json:"message"`
+}
+
+// extractUsage parses the total context tokens from one stream-json line,
+// returning (0,false) when the line carries no usage. This is what makes Claude
+// pressure REAL rather than a proxy.
+func extractUsage(line []byte) (int, bool) {
+	var ul usageLine
+	if err := json.Unmarshal(line, &ul); err != nil {
+		return 0, false
+	}
+	if ul.Usage != nil {
+		if t := ul.Usage.total(); t > 0 {
+			return t, true
+		}
+	}
+	if ul.Message != nil && ul.Message.Usage != nil {
+		if t := ul.Message.Usage.total(); t > 0 {
+			return t, true
+		}
+	}
+	return 0, false
 }
 
 // readLoop consumes the stdout stream for the whole process lifetime, publishing
@@ -189,6 +332,20 @@ func (h *handle) readLoop() {
 		}
 		line := make([]byte, len(raw))
 		copy(line, raw)
+
+		// Track I/O bytes (proxy backstop) and any measured token usage (real
+		// pressure). Usage appears on assistant + result lines; latest wins.
+		if total, ok := extractUsage(line); ok {
+			h.mu.Lock()
+			h.bytes += int64(len(line))
+			h.lastTotalTokens = total
+			h.haveUsage = true
+			h.mu.Unlock()
+		} else {
+			h.mu.Lock()
+			h.bytes += int64(len(line))
+			h.mu.Unlock()
+		}
 
 		evs, sess := ParseLine(line, h.id)
 		if sess != "" {
@@ -266,6 +423,10 @@ func (a *Adapter) Send(ctx context.Context, h harness.Handle, in harness.Input) 
 	if _, err := hh.stdin.Write(append(env, '\n')); err != nil {
 		return fmt.Errorf("claudecode: write stdin: %w", err)
 	}
+	hh.mu.Lock()
+	hh.turns++
+	hh.bytes += int64(len(env) + 1)
+	hh.mu.Unlock()
 
 	select {
 	case e := <-waiter:

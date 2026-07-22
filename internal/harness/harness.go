@@ -11,10 +11,22 @@ import (
 
 // Capabilities lets the core pick the richest available mode per adapter.
 type Capabilities struct {
-	StructuredEvents bool `json:"structured_events"` // native stream-json / SDK events?
-	Interrupt        bool `json:"interrupt"`         // can it be interrupted mid-turn?
-	Resume           bool `json:"resume"`            // can a prior session resume by id?
+	StructuredEvents    bool `json:"structured_events"`     // native stream-json / SDK events?
+	Interrupt           bool `json:"interrupt"`             // can it be interrupted mid-turn?
+	Resume              bool `json:"resume"`                // can a prior session resume by id?
+	RealContextPressure bool `json:"real_context_pressure"` // reports MEASURED token usage (else proxy-only)
 }
+
+// PermissionMode is the tool-approval policy for a session, modeled as a value
+// (not a hard-coded flag) so a future ACP-based adapter can map it to ACP's
+// client-side permission handling instead of a CLI flag. Empty means "fall back
+// to SessionConfig.SkipPermissions" for backward compatibility.
+type PermissionMode string
+
+const (
+	PermissionSkip   PermissionMode = "skip"   // run tools without asking (hands-free)
+	PermissionPrompt PermissionMode = "prompt" // keep the harness's own approval prompts
+)
 
 // Status is the coarse lifecycle state of a running session.
 type Status string
@@ -34,6 +46,7 @@ type SessionConfig struct {
 	Model           string            // model override (optional)
 	SystemPrompt    string            // injected server-owned context (design 3.5)
 	SkipPermissions bool              // run the harness with its permission guardrail bypassed
+	PermissionMode  PermissionMode    // ACP-ready permission policy; overrides SkipPermissions when set
 	Extra           map[string]string // adapter-specific knobs
 }
 
@@ -63,6 +76,12 @@ type Adapter interface {
 	Interrupt(h Handle) error
 	Status(h Handle) Status
 	Teardown(h Handle) error
+
+	// Pressure reports the live session's normalized context pressure (0..1)
+	// plus its source (real|proxy). The core reads this after each completed
+	// turn to decide whether to perform a controlled context reset. An adapter
+	// with no usage instrumentation returns a proxy estimate.
+	Pressure(h Handle) ContextPressure
 
 	// output: normalized event stream (design 3.4)
 	Events(h Handle) <-chan eventbus.Event
