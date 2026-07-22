@@ -29,11 +29,12 @@ const (
 
 // SessionConfig configures a session on start.
 type SessionConfig struct {
-	SessionID    string            // agentd's session id (stable across restarts)
-	Cwd          string            // working directory for the agent
-	Model        string            // model override (optional)
-	SystemPrompt string            // injected server-owned context (design 3.5)
-	Extra        map[string]string // adapter-specific knobs
+	SessionID       string            // agentd's session id (stable across restarts)
+	Cwd             string            // working directory for the agent
+	Model           string            // model override (optional)
+	SystemPrompt    string            // injected server-owned context (design 3.5)
+	SkipPermissions bool              // run the harness with its permission guardrail bypassed
+	Extra           map[string]string // adapter-specific knobs
 }
 
 // Input is a user turn or a control key. Exactly one of Text/Key is set.

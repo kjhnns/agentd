@@ -28,11 +28,26 @@ scope. What is IN:
   resume-by-replay (the durability model from clawd's `workflows/runner`). Every
   session event, inbound/outbound, and control decision is recorded.
 - **Harness adapter interface** (`internal/harness`) + the **Claude Code adapter**
-  (`internal/harness/claudecode`): CLAUDE-CODE-NATIVE, driving
-  `claude -p --output-format stream-json --verbose` and parsing the structured JSON
-  events into normalized Events (assistant text -> `output`, `tool_use` ->
-  `tool_call`, final `result` -> `result`, errors -> `error`). Turn-to-turn
-  continuity via `--resume`. **This is the proven vertical.**
+  (`internal/harness/claudecode`): CLAUDE-CODE-NATIVE, running a PERSISTENT,
+  full-continuity streaming session. `Start` spawns ONE long-lived process per
+  agentd session:
+  `claude -p --input-format stream-json --output-format stream-json --verbose
+  [--dangerously-skip-permissions]`. `Send` writes a user-message JSON envelope to
+  its stdin and never closes stdin, so every turn runs on the SAME process with
+  full conversation continuity (memory, context, tools carry across turns); a
+  background reader maps stdout JSON lines to normalized Events (assistant text ->
+  `output`, `tool_use` -> `tool_call`, each turn's `result` -> `result`, errors ->
+  `error`), one `result` per turn. **This is the proven vertical (see below).**
+
+  **Skip-permissions default.** With `skip_permissions = true` (Joe's default in
+  `config.example.toml`) the adapter passes `--dangerously-skip-permissions`, so
+  claude runs tools WITHOUT asking for approval: a hands-free autonomous agent.
+  This disables Claude's own permission guardrail; agentd's confirm-gate is the
+  intended safety layer for visible/destructive actions. Set it `false` to keep
+  Claude's prompts. It is a per-`[[harness]]` config toggle.
+
+  A one-shot `claude -p` path is retained only for the `smoke` subcommand; the real
+  session path is the persistent one above.
 - **Channel adapter interface** (`internal/channel`) + a fresh in-process
   **Telegram adapter** (`internal/channel/telegram`): getUpdates long-poll with
   backoff, server-enforced chat-id allowlist, `sendMessage`. No tg-bridge reuse,
@@ -62,10 +77,15 @@ What is DEFERRED (explicit non-goals here, separate go/no-go decisions later):
 
 ## What is actually proven vs stubbed
 
-- **Proven working:** the Claude Code stream-json vertical, both as a fixture-based
-  parser test and (when `claude` is on PATH) a real headless round-trip. Config
-  parse, event bus, run-log durability, the API `/health` two-signal contract, and
-  the Telegram allowlist + send (against a mock server) are unit-tested.
+- **Proven working:** the Claude Code PERSISTENT streaming vertical. A live gated
+  test (`TestClaudePersistentContinuity`, `AGENTD_LIVE_CLAUDE=1`) opens ONE session
+  and sends two turns: turn 1 sets a codeword, turn 2 recalls HELIOTROPE, proving
+  the same process retained context across turns (not a cold start per message).
+  `go run ./cmd/agentd chat` demos the same 2-turn persistent exchange. A
+  fixture-based multi-turn parse test (`TestParseMultiTurnFixture`, recorded real
+  transcript) proves the plumbing without a live call. Config parse, event bus,
+  run-log durability, the API `/health` two-signal contract, and the Telegram
+  allowlist + send (against a mock server) are unit-tested.
 - **Compiles + unit-tested, NOT exercised against live infra:** the Telegram
   adapter against a real bot (needs a `TG_BOT_TOKEN`); the full end-to-end
   Telegram <-> Claude round-trip is wired in `session.RouteInbound` but has not been
@@ -78,8 +98,14 @@ What is DEFERRED (explicit non-goals here, separate go/no-go decisions later):
 go build ./...
 go test ./...
 
-# prove the Claude Code vertical directly (needs `claude` on PATH):
+# prove the persistent multi-turn vertical (needs `claude` on PATH):
+go run ./cmd/agentd chat     # 2 turns on ONE process; turn 2 recalls the codeword
+
+# one-shot mapping smoke test:
 go run ./cmd/agentd smoke -prompt "Reply with exactly the word PONG and nothing else"
+
+# the live continuity test:
+AGENTD_LIVE_CLAUDE=1 go test ./internal/harness/claudecode/ -run Continuity -v
 
 # run the daemon:
 cp config.example.toml config.toml   # edit bearer + allowlist

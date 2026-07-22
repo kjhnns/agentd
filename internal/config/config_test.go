@@ -16,6 +16,7 @@ state_dir  = "/var/lib/agentd"
 kind  = "claude-code"
 model = "claude-sonnet"
 cwd   = "/home/joe/work"
+skip_permissions = true
 
 [[channel]]
 kind   = "telegram"
@@ -43,6 +44,9 @@ func TestParseSample(t *testing.T) {
 	}
 	if cfg.Harness[0].Cwd != "/home/joe/work" {
 		t.Errorf("harness cwd = %q", cfg.Harness[0].Cwd)
+	}
+	if !cfg.Harness[0].SkipPermissions {
+		t.Errorf("harness skip_permissions = %v, want true", cfg.Harness[0].SkipPermissions)
 	}
 	if len(cfg.Channel) != 1 {
 		t.Fatalf("channels = %d, want 1", len(cfg.Channel))

@@ -44,36 +44,83 @@ func main() {
 		serve(os.Args[2:])
 	case "smoke":
 		smoke(os.Args[2:])
+	case "chat":
+		chat(os.Args[2:])
 	case "-h", "--help", "help":
-		fmt.Println("usage: agentd [serve|smoke] [flags]")
+		fmt.Println("usage: agentd [serve|smoke|chat] [flags]")
 	default:
 		serve(os.Args[1:])
 	}
 }
 
-// smoke proves the Claude Code stream-json vertical without the full server: it
-// runs ONE headless turn and prints the normalized events as JSON.
+// smoke proves the Claude Code stream-json mapping with ONE classic `claude -p`
+// headless turn (one-shot) and prints the normalized events as JSON.
 func smoke(args []string) {
 	fs := flag.NewFlagSet("smoke", flag.ExitOnError)
 	prompt := fs.String("prompt", "Reply with exactly the word PONG and nothing else", "prompt to send")
 	bin := fs.String("claude", "claude", "claude binary")
+	skip := fs.Bool("skip-permissions", true, "pass --dangerously-skip-permissions")
 	_ = fs.Parse(args)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	a := claudecode.New(*bin)
-	h, err := a.Start(ctx, harness.SessionConfig{SessionID: "smoke", Cwd: os.TempDir()})
+	evs, err := claudecode.OneShot(ctx, *bin, *prompt, *skip)
 	if err != nil {
-		log.Fatalf("start: %v", err)
-	}
-	evs, err := a.SendPrompt(ctx, h, *prompt)
-	if err != nil {
-		log.Fatalf("send: %v", err)
+		log.Fatalf("smoke: %v", err)
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(evs)
+}
+
+// chat demos a real 2-turn PERSISTENT exchange on ONE claude process, proving
+// continuity: turn 1 sets a codeword, turn 2 asks for it back.
+func chat(args []string) {
+	fs := flag.NewFlagSet("chat", flag.ExitOnError)
+	bin := fs.String("claude", "claude", "claude binary")
+	skip := fs.Bool("skip-permissions", true, "pass --dangerously-skip-permissions")
+	_ = fs.Parse(args)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
+	defer cancel()
+
+	a := claudecode.New(*bin)
+	h, err := a.Start(ctx, harness.SessionConfig{
+		SessionID: "chat-demo", Cwd: os.TempDir(), SkipPermissions: *skip,
+	})
+	if err != nil {
+		log.Fatalf("chat start: %v", err)
+	}
+	defer a.Teardown(h)
+
+	// Collect result events off the persistent stream.
+	results := make(chan string, 4)
+	go func() {
+		for e := range a.Events(h) {
+			if e.Kind == eventbus.KindResult {
+				results <- e.Text
+			}
+		}
+	}()
+
+	turns := []string{
+		"Remember the codeword is HELIOTROPE. Reply with just OK.",
+		"What is the codeword? Reply with just the word.",
+	}
+	for i, t := range turns {
+		fmt.Printf("turn %d >>> %s\n", i+1, t)
+		if err := a.Send(ctx, h, harness.Input{Text: t}); err != nil {
+			log.Fatalf("chat turn %d: %v", i+1, err)
+		}
+		select {
+		case r := <-results:
+			fmt.Printf("turn %d <<< %s\n", i+1, r)
+		case <-time.After(120 * time.Second):
+			log.Fatalf("chat turn %d: no result", i+1)
+		}
+	}
+	fmt.Println("(both turns ran on the SAME process; turn 2 recalling the codeword proves continuity)")
 }
 
 func serve(args []string) {
@@ -102,6 +149,10 @@ func serve(args []string) {
 	}
 	adapter := claudecode.New("claude")
 	mgr := session.NewManager(adapter, bus, rl)
+	if len(cfg.Harness) > 0 {
+		mgr.SkipPermissions = cfg.Harness[0].SkipPermissions
+	}
+	log.Printf("agentd: harness=claude-code skip_permissions=%v", mgr.SkipPermissions)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -24,9 +24,10 @@ type Server struct {
 
 // Harness is one [[harness]] entry.
 type Harness struct {
-	Kind  string // "claude-code", "codex", ...
-	Model string // per-session default model (optional)
-	Cwd   string // default working dir for sessions
+	Kind            string // "claude-code", "codex", ...
+	Model           string // per-session default model (optional)
+	Cwd             string // default working dir for sessions
+	SkipPermissions bool   // bypass the harness's own tool-approval prompts
 }
 
 // Channel is one [[channel]] entry.
@@ -139,6 +140,14 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, key, raw strin
 			return fmt.Errorf("unknown [server] key %q", key)
 		}
 	case "harness":
+		if key == "skip_permissions" {
+			b, err := asBool(raw)
+			if err != nil {
+				return fmt.Errorf("skip_permissions: %w", err)
+			}
+			h.SkipPermissions = b
+			return nil
+		}
 		s, err := asString(raw)
 		if err != nil {
 			return err

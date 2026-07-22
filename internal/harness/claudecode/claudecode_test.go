@@ -13,14 +13,10 @@ import (
 	"github.com/kjhnns/agentd/internal/harness"
 )
 
-func harnessCfg() harness.SessionConfig {
-	return harness.SessionConfig{SessionID: "live-test", Cwd: os.TempDir()}
-}
-
 // TestParseFixture drives the stream-json parser against a recorded transcript
 // (testdata/pong.stream-json), captured from a real
-// `claude -p --output-format stream-json --verbose "...PONG..."` run on
-// 2026-07-21. This proves the mapping WITHOUT a live model call.
+// `claude -p --output-format stream-json --verbose "...PONG..."` run. This proves
+// the mapping WITHOUT a live model call.
 func TestParseFixture(t *testing.T) {
 	f, err := os.Open("testdata/pong.stream-json")
 	if err != nil {
@@ -49,9 +45,6 @@ func TestParseFixture(t *testing.T) {
 	if lastSession != "36f3e368-27ef-47b3-82ee-3c05149069a3" {
 		t.Errorf("captured session id = %q", lastSession)
 	}
-
-	// Expect: one output "PONG" then one result "PONG". system/rate_limit/thinking
-	// produce nothing.
 	if len(got) != 2 {
 		t.Fatalf("got %d events, want 2: %+v", len(got), got)
 	}
@@ -63,6 +56,45 @@ func TestParseFixture(t *testing.T) {
 	}
 	if got[0].Source != eventbus.SourceNative {
 		t.Errorf("source = %q, want native", got[0].Source)
+	}
+}
+
+// TestParseMultiTurnFixture proves the streaming/multi-message case: a persistent
+// session emits MANY result events over its lifetime, one per turn. The recorded
+// two-turn transcript (testdata/two-turns.stream-json) carries a codeword across
+// turns; the parser must surface both turns' results in order.
+func TestParseMultiTurnFixture(t *testing.T) {
+	f, err := os.Open("testdata/two-turns.stream-json")
+	if err != nil {
+		t.Fatalf("open fixture: %v", err)
+	}
+	defer f.Close()
+
+	var results []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		evs, _ := ParseLine(line, "sess-multi")
+		for _, e := range evs {
+			if e.Kind == eventbus.KindResult {
+				results = append(results, e.Text)
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 result events (one per turn), got %d: %v", len(results), results)
+	}
+	if results[0] != "OK" {
+		t.Errorf("turn1 result = %q, want OK", results[0])
+	}
+	if !strings.Contains(results[1], "HELIOTROPE") {
+		t.Errorf("turn2 result = %q, want it to contain HELIOTROPE (continuity)", results[1])
 	}
 }
 
@@ -92,36 +124,68 @@ func TestParseLineNonJSON(t *testing.T) {
 	}
 }
 
-// TestClaudeLiveRoundTrip does a REAL headless round-trip. It is skipped unless
-// AGENTD_LIVE_CLAUDE=1 and `claude` is on PATH, so `go test ./...` does not burn
-// tokens or hang by default. Run manually to capture live evidence.
-func TestClaudeLiveRoundTrip(t *testing.T) {
+func TestUserEnvelopeShape(t *testing.T) {
+	got := string(userEnvelope("hello there"))
+	want := `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello there"}]}}`
+	if got != want {
+		t.Fatalf("envelope = %s\nwant     = %s", got, want)
+	}
+}
+
+// TestClaudePersistentContinuity is the acceptance centerpiece: it opens ONE
+// persistent streaming session and sends TWO turns on it. Turn 1 establishes a
+// codeword; turn 2 asks for it back and must get HELIOTROPE, proving the SAME
+// process retained context across turns (not a fresh cold start per message).
+//
+// Skipped unless AGENTD_LIVE_CLAUDE=1 and `claude` is on PATH so `go test ./...`
+// does not burn tokens by default. Run manually to capture live evidence.
+func TestClaudePersistentContinuity(t *testing.T) {
 	if os.Getenv("AGENTD_LIVE_CLAUDE") != "1" {
-		t.Skip("set AGENTD_LIVE_CLAUDE=1 to exercise a real claude -p round-trip")
+		t.Skip("set AGENTD_LIVE_CLAUDE=1 to exercise a real persistent 2-turn session")
 	}
 	if _, err := exec.LookPath("claude"); err != nil {
 		t.Skip("claude not on PATH")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
 	defer cancel()
 
 	a := New("claude")
-	h, err := a.Start(ctx, harnessCfg())
+	h, err := a.Start(ctx, harness.SessionConfig{
+		SessionID: "continuity-test", Cwd: os.TempDir(), SkipPermissions: true,
+	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	evs, err := a.SendPrompt(ctx, h, "Reply with exactly the word PONG and nothing else")
-	if err != nil {
-		t.Fatalf("SendPrompt: %v", err)
-	}
-	var result string
-	for _, e := range evs {
-		if e.Kind == eventbus.KindResult {
-			result = e.Text
+	defer a.Teardown(h)
+
+	results := make(chan string, 4)
+	go func() {
+		for e := range a.Events(h) {
+			if e.Kind == eventbus.KindResult {
+				results <- e.Text
+			}
+		}
+	}()
+
+	send := func(text string) string {
+		if err := a.Send(ctx, h, harness.Input{Text: text}); err != nil {
+			t.Fatalf("Send(%q): %v", text, err)
+		}
+		select {
+		case r := <-results:
+			return r
+		case <-time.After(150 * time.Second):
+			t.Fatalf("no result for %q", text)
+			return ""
 		}
 	}
-	if !strings.Contains(strings.ToUpper(result), "PONG") {
-		t.Fatalf("live result did not contain PONG: %q (events: %+v)", result, evs)
+
+	r1 := send("Remember the codeword is HELIOTROPE. Reply with just OK.")
+	t.Logf("turn 1 result: %q", r1)
+	r2 := send("What is the codeword? Reply with just the word.")
+	t.Logf("turn 2 result: %q", r2)
+
+	if !strings.Contains(strings.ToUpper(r2), "HELIOTROPE") {
+		t.Fatalf("turn 2 did not recall the codeword across turns: %q", r2)
 	}
-	t.Logf("live claude result: %q", result)
 }

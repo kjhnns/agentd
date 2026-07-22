@@ -12,6 +12,12 @@ state_dir  = "state"             # run-log + durable state live here
 kind  = "claude-code"
 model = ""                       # optional model override; empty = harness default
 cwd   = ""                       # optional default working dir for sessions
+# skip_permissions=true passes --dangerously-skip-permissions: claude runs tools
+# WITHOUT asking for approval (hands-free autonomous agent, Joe's default). This
+# DISABLES Claude's own permission guardrail; agentd's confirm-gate is the
+# intended safety layer for visible/destructive actions. Set false to keep
+# Claude's prompts.
+skip_permissions = true
 
 # One channel entry. Token is read from the environment (never inlined).
 [[channel]]

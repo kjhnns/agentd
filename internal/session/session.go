@@ -50,6 +50,10 @@ type Manager struct {
 	adapter  harness.Adapter // single harness kind in this scaffold
 	bus      *eventbus.Bus
 	log      *runlog.Log
+
+	// SkipPermissions is the harness default applied to new sessions (design:
+	// run hands-free; agentd's own confirm-gate is the intended safety layer).
+	SkipPermissions bool
 }
 
 // NewManager builds a Session Manager over one harness adapter.
@@ -72,9 +76,10 @@ func newID() string {
 func (m *Manager) Create(ctx context.Context, cwd, model, title string) (*Session, error) {
 	id := newID()
 	h, err := m.adapter.Start(ctx, harness.SessionConfig{
-		SessionID: id,
-		Cwd:       cwd,
-		Model:     model,
+		SessionID:       id,
+		Cwd:             cwd,
+		Model:           model,
+		SkipPermissions: m.SkipPermissions,
 	})
 	if err != nil {
 		return nil, err
