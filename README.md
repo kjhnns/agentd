@@ -201,6 +201,71 @@ turn, in `Manager.Send`); idle/dead reclaim runs on a **GC sweeper** goroutine
 while a turn is running serializes as the next turn (a per-session turn lock),
 never a parallel session.
 
+## Scheduler / triggers: proactive jobs (internal/scheduler)
+
+agentd is not only reactive: the **scheduler** runs continuous/scheduled jobs.
+The model is deliberately thin: **a job = a triggered session turn.** A `[[job]]`
+config block declares a TRIGGER, a target WORKSPACE, and a task PROMPT. When the
+trigger fires, agentd creates-or-reuses the warm session homed in that workspace
+and Sends the prompt as an ordinary turn; the harness does the work with its own
+shell/file tools against the workspace (running whatever CLIs live there —
+capabilities are CLIs in the workspace, not MCP servers), and the normal session
+lifecycle handles events, **git autocommit**, context reset, and idle reclaim.
+There is no parallel execution path.
+
+**Trigger taxonomy (v1):**
+
+- `schedule` — cron-like, dependency-free internal parser: `"@every 30m"`,
+  `"@daily 07:00"`, or basic 5-field cron `"M H DOM MON DOW"` (`*`, `N`, `N-M`,
+  `*/S`, lists; DOW 0-6 with 7=Sunday; standard DOM/DOW OR semantics). A job may
+  set an IANA `tz` (e.g. `"Europe/Zurich"`) for `@daily`/cron; the default is the
+  server's **local** timezone. `@every` is timezone-independent.
+- `file` — a path watcher: fires when anything under `path` changes (poll-based
+  mtime/size/count signature, default `poll = "10s"`, no fsnotify dependency;
+  the first scan is the baseline, pre-existing content does not fire).
+- `webhook` — `POST /hooks/:job` fires the job (gated by the same API bearer as
+  the rest of the API; only webhook-kind jobs are exposed there).
+- `message` — already exists: inbound channel messages drive turns via
+  `session.RouteInbound`; not configured as a job.
+
+**Serialization.** A job run reuses the workspace's live session, so the
+per-session turn lock (`turnMu`) queues it behind any in-progress interactive
+turn — never two harness turns concurrently in one workspace. v1 is additionally
+conservative ACROSS workspaces: a single worker drains the run queue, so at most
+**one job-driven harness turn runs at a time overall** (interactive turns in
+other workspaces are unaffected). A fire while the same job is still
+queued/running records a `skipped` run instead of stacking.
+
+**Durability + catch-up policy.** The scheduler appends `job_fire` / `job_skip` /
+`job_run` / `job_notify` records to `state/scheduler.jsonl` (append-only JSONL,
+fsync per record — the same discipline as the run-log; records are mirrored into
+the main run-log too) and rebuilds last-fire times + run history by replay on
+startup. A restart therefore never double-fires a just-run schedule. Catch-up
+policy is **skip-with-log**: occurrences missed while the server was down or
+asleep (more than 5 minutes stale) are skipped and logged, not fired late; a
+never-fired schedule starts counting from server start (no fire-on-startup).
+
+**Notify discipline.** Per-job `notify` policy: `issues` (default — only non-ok
+runs surface), `always`, `never`. A notify is recorded on the JobRun + the
+durable log and handed to a clean `OnNotify` hook that a channel adapter will
+consume later; Telegram is NOT hard-wired to job results.
+
+**Ops surface.**
+
+```sh
+agentd jobs list                 # jobs + next fire + last run (talks to the daemon)
+agentd jobs run morning-triage   # fire now (manual trigger)
+agentd jobs runs morning-triage  # recent run history
+
+# API (bearer-gated like everything else):
+GET  /jobs                       # list + next_fire + last_run
+POST /jobs/:name/run             # fire now
+GET  /jobs/:name/runs            # recent JobRun history
+POST /hooks/:job                 # webhook trigger
+```
+
+See the `[[job]]` examples in `config.example.toml`.
+
 **ACP-readiness (cheap future-proofing).** Tool permissions are modeled as a
 policy value on the adapter config (`PermissionMode: skip|prompt`) rather than a
 hard-coded `--dangerously-skip-permissions` inline, so a future ACP-based adapter

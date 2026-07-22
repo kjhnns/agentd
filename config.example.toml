@@ -58,3 +58,49 @@ kind   = "telegram"
 token  = "env:TG_BOT_TOKEN"      # export TG_BOT_TOKEN before starting
 allow  = ["7597951120"]          # chat-id allowlist, server-enforced
 policy = "dm-only"
+
+# ------------------------------------------------------------------------------
+# Jobs (internal/scheduler): declarative proactive work. A job = a TRIGGER + a
+# target WORKSPACE + a task PROMPT. A job run is an ordinary harness turn on the
+# workspace's warm session (create-or-reuse), so the harness does the work with
+# its own shell/file tools against the workspace and the normal lifecycle
+# (git autocommit, context reset, idle reclaim) applies. Runs serialize behind
+# any in-progress interactive turn in the same workspace; v1 additionally runs
+# at most ONE job turn at a time overall.
+#
+# Trigger kinds: "schedule" (default) | "file" | "webhook". Inbound messages
+# are already a trigger via the channel path and are NOT configured as jobs.
+# Schedule specs: "@every 30m" | "@daily 07:00" | basic cron "M H DOM MON DOW".
+# tz is an IANA name for @daily/cron; default is the server's local timezone.
+# notify: "issues" (default, surface only non-ok runs) | "always" | "never".
+# Catch-up policy: occurrences missed while the server was down/asleep are
+# SKIPPED with a logged job_skip record (no fire-on-startup).
+# ------------------------------------------------------------------------------
+
+[[job]]
+name      = "morning-triage"
+trigger   = "schedule"
+schedule  = "@daily 07:00"
+tz        = "Europe/Zurich"
+workspace = ""                   # empty = the default workspace
+prompt    = "Morning triage: read context.md, check work/ for anything pending, update context.md with today's priorities. Note issues that need my attention concisely."
+notify    = "issues"             # surface only when something is wrong
+
+[[job]]
+name      = "hourly-heartbeat"
+schedule  = "@every 1h"          # trigger defaults to "schedule"
+prompt    = "Append the current date and time as one line to work/heartbeat.log, then note in context.md when the last heartbeat ran."
+notify    = "never"
+enabled   = false                # parked; fire manually with `agentd jobs run hourly-heartbeat`
+
+# [[job]]
+# name    = "inbox-drop"          # fire when files under a watched path change
+# trigger = "file"
+# path    = "/Users/me/Drop"
+# poll    = "10s"                  # poll interval (mtime/size/count signature)
+# prompt  = "A new file landed in the watched drop folder. Inspect it and file the result under work/."
+
+# [[job]]
+# name    = "deploy-check"        # fire via: POST /hooks/deploy-check (API bearer)
+# trigger = "webhook"
+# prompt  = "A deploy just finished. Verify the service health endpoints and summarize."

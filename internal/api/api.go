@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/kjhnns/agentd/internal/eventbus"
+	"github.com/kjhnns/agentd/internal/scheduler"
 	"github.com/kjhnns/agentd/internal/session"
 )
 
@@ -25,6 +26,7 @@ type Server struct {
 	mgr       *session.Manager
 	bus       *eventbus.Bus
 	transport TransportChecker
+	sched     *scheduler.Scheduler
 	mux       *http.ServeMux
 }
 
@@ -44,7 +46,15 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/sessions", s.handleSessions)        // GET list, POST create
 	s.mux.HandleFunc("/sessions/", s.handleSessionSubpath) // /:id, /:id/input, /:id/events, /:id/interrupt
+	s.mux.HandleFunc("/jobs", s.handleJobs)                // GET list
+	s.mux.HandleFunc("/jobs/", s.handleJobSubpath)         // /:name/run (POST), /:name/runs (GET)
+	s.mux.HandleFunc("/hooks/", s.handleHook)              // POST /hooks/:job (webhook trigger)
 }
+
+// AttachScheduler wires the jobs/scheduler surface (GET /jobs, POST
+// /jobs/:name/run, GET /jobs/:name/runs, POST /hooks/:job). Without it those
+// routes answer 503. All routes share the API bearer gate.
+func (s *Server) AttachScheduler(sched *scheduler.Scheduler) { s.sched = sched }
 
 // auth enforces the API bearer token (design 3.9). /health is also gated; a bare
 // liveness probe can be added unauthenticated later if needed.
@@ -159,6 +169,107 @@ func (s *Server) handleSessionSubpath(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
+}
+
+// handleJobs lists jobs with next-fire + last-run status.
+func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
+	if s.sched == nil {
+		http.Error(w, "scheduler not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.sched.List())
+}
+
+// handleJobSubpath dispatches /jobs/:name/run (POST, manual fire-now) and
+// /jobs/:name/runs (GET, recent run history).
+func (s *Server) handleJobSubpath(w http.ResponseWriter, r *http.Request) {
+	if s.sched == nil {
+		http.Error(w, "scheduler not configured", http.StatusServiceUnavailable)
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/jobs/")
+	parts := strings.SplitN(rest, "/", 2)
+	name := parts[0]
+	sub := ""
+	if len(parts) == 2 {
+		sub = parts[1]
+	}
+	if name == "" {
+		http.Error(w, "missing job name", http.StatusBadRequest)
+		return
+	}
+	switch sub {
+	case "run":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		queued, reason, err := s.sched.RunNow(name, "manual")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		if !queued {
+			writeJSON(w, http.StatusConflict, map[string]string{"status": "skipped", "job": name, "reason": reason})
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "queued", "job": name})
+	case "runs":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		runs, err := s.sched.Runs(name, 20)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, runs)
+	default:
+		http.Error(w, "not found", http.StatusNotFound)
+	}
+}
+
+// handleHook fires a webhook-trigger job: POST /hooks/:job. It is gated by the
+// same API bearer as everything else and only fires jobs whose trigger kind is
+// "webhook" (schedule/file jobs are fired manually via /jobs/:name/run).
+func (s *Server) handleHook(w http.ResponseWriter, r *http.Request) {
+	if s.sched == nil {
+		http.Error(w, "scheduler not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	name := strings.TrimPrefix(r.URL.Path, "/hooks/")
+	job, ok := s.sched.Get(name)
+	if !ok {
+		http.Error(w, "unknown job", http.StatusNotFound)
+		return
+	}
+	if job.Trigger.Kind != scheduler.TriggerWebhook {
+		http.Error(w, "job is not webhook-triggered", http.StatusNotFound)
+		return
+	}
+	if !job.Enabled {
+		http.Error(w, "job disabled", http.StatusConflict)
+		return
+	}
+	queued, reason, err := s.sched.RunNow(name, "webhook")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if !queued {
+		writeJSON(w, http.StatusConflict, map[string]string{"status": "skipped", "job": name, "reason": reason})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "queued", "job": name})
 }
 
 func (s *Server) handleInput(w http.ResponseWriter, r *http.Request, id string) {

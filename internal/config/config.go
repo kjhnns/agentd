@@ -62,6 +62,23 @@ type Channel struct {
 	Policy string   // e.g. "dm-only"
 }
 
+// Job is one [[job]] entry: a declaratively configured proactive job for the
+// scheduler (internal/scheduler). A job = a trigger + a target workspace + a
+// task prompt; a job run is an ordinary harness turn on the workspace's warm
+// session.
+type Job struct {
+	Name      string        // unique job name (also its id in the API/CLI)
+	Enabled   bool          // default true; enabled = false parks the job
+	Trigger   string        // "schedule" (default) | "file" | "webhook"
+	Schedule  string        // schedule spec: "@every 30m" | "@daily 07:00" | "M H DOM MON DOW"
+	TZ        string        // IANA tz for @daily/cron (default: server local time)
+	Workspace string        // target workspace ("" = the default workspace)
+	Prompt    string        // the task told to the harness
+	Notify    string        // "issues" (default) | "always" | "never"
+	Path      string        // watched path (trigger = "file")
+	Poll      time.Duration // file poll interval (default 10s)
+}
+
 // Config is the whole parsed file.
 type Config struct {
 	Server    Server
@@ -69,6 +86,7 @@ type Config struct {
 	Session   Session
 	Harness   []Harness
 	Channel   []Channel
+	Job       []Job
 }
 
 // DefaultSession returns the built-in session-lifecycle tuning applied when
@@ -114,6 +132,7 @@ func Parse(data []byte) (*Config, error) {
 	section := "" // "server" or "" (top-level)
 	var curHarness *Harness
 	var curChannel *Channel
+	var curJob *Job
 
 	sc := bufio.NewScanner(strings.NewReader(string(data)))
 	lineNo := 0
@@ -131,12 +150,20 @@ func Parse(data []byte) (*Config, error) {
 				cfg.Harness = append(cfg.Harness, Harness{})
 				curHarness = &cfg.Harness[len(cfg.Harness)-1]
 				curChannel = nil
+				curJob = nil
 				section = "harness"
 			case "channel":
 				cfg.Channel = append(cfg.Channel, Channel{})
 				curChannel = &cfg.Channel[len(cfg.Channel)-1]
 				curHarness = nil
+				curJob = nil
 				section = "channel"
+			case "job":
+				cfg.Job = append(cfg.Job, Job{Enabled: true}) // enabled defaults true
+				curJob = &cfg.Job[len(cfg.Job)-1]
+				curHarness = nil
+				curChannel = nil
+				section = "job"
 			default:
 				return nil, fmt.Errorf("config line %d: unknown array table [[%s]]", lineNo, name)
 			}
@@ -147,6 +174,7 @@ func Parse(data []byte) (*Config, error) {
 			section = strings.TrimSpace(line[1 : len(line)-1])
 			curHarness = nil
 			curChannel = nil
+			curJob = nil
 			continue
 		}
 		// key = value
@@ -156,7 +184,7 @@ func Parse(data []byte) (*Config, error) {
 		}
 		key := strings.TrimSpace(line[:eq])
 		raw := strings.TrimSpace(line[eq+1:])
-		if err := assign(cfg, section, curHarness, curChannel, key, raw); err != nil {
+		if err := assign(cfg, section, curHarness, curChannel, curJob, key, raw); err != nil {
 			return nil, fmt.Errorf("config line %d: %w", lineNo, err)
 		}
 	}
@@ -166,7 +194,7 @@ func Parse(data []byte) (*Config, error) {
 	return cfg, nil
 }
 
-func assign(cfg *Config, section string, h *Harness, ch *Channel, key, raw string) error {
+func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, raw string) error {
 	switch section {
 	case "server":
 		s, err := asString(raw)
@@ -304,6 +332,47 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, key, raw strin
 			ch.Allow = arr
 		default:
 			return fmt.Errorf("unknown [[channel]] key %q", key)
+		}
+	case "job":
+		switch key {
+		case "enabled":
+			b, err := asBool(raw)
+			if err != nil {
+				return fmt.Errorf("enabled: %w", err)
+			}
+			j.Enabled = b
+			return nil
+		case "poll":
+			d, err := asDuration(raw)
+			if err != nil {
+				return fmt.Errorf("poll: %w", err)
+			}
+			j.Poll = d
+			return nil
+		}
+		s, err := asString(raw)
+		if err != nil {
+			return err
+		}
+		switch key {
+		case "name":
+			j.Name = s
+		case "trigger":
+			j.Trigger = s
+		case "schedule":
+			j.Schedule = s
+		case "tz":
+			j.TZ = s
+		case "workspace":
+			j.Workspace = s
+		case "prompt":
+			j.Prompt = s
+		case "notify":
+			j.Notify = s
+		case "path":
+			j.Path = s
+		default:
+			return fmt.Errorf("unknown [[job]] key %q", key)
 		}
 	default:
 		return fmt.Errorf("key %q outside a known section", key)

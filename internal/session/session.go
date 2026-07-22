@@ -244,6 +244,24 @@ func (m *Manager) Get(id string) (*Session, bool) {
 	return s, ok
 }
 
+// FindByWorkspace returns the live session homed in the named workspace, if
+// any ("" resolves to the store default). Used by the scheduler to REUSE the
+// warm session for a job run (single-active-session per workspace): the job
+// turn then serializes behind any in-progress interactive turn via turnMu.
+func (m *Manager) FindByWorkspace(name string) (*Session, bool) {
+	if name == "" && m.Workspaces != nil {
+		name = m.Workspaces.Default
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, s := range m.sessions {
+		if s.Workspace == name && s.Workspace != "" {
+			return s, true
+		}
+	}
+	return nil, false
+}
+
 // List returns a status snapshot of every session.
 func (m *Manager) List() []Status {
 	m.mu.RLock()

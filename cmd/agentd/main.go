@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/kjhnns/agentd/internal/api"
@@ -33,6 +34,7 @@ import (
 	"github.com/kjhnns/agentd/internal/harness"
 	"github.com/kjhnns/agentd/internal/harness/claudecode"
 	"github.com/kjhnns/agentd/internal/runlog"
+	"github.com/kjhnns/agentd/internal/scheduler"
 	"github.com/kjhnns/agentd/internal/session"
 	"github.com/kjhnns/agentd/internal/workspace"
 )
@@ -53,10 +55,13 @@ func main() {
 		initWorkspace(os.Args[2:])
 	case "memory":
 		memoryCmd(os.Args[2:])
+	case "jobs":
+		jobsCmd(os.Args[2:])
 	case "-h", "--help", "help":
-		fmt.Println("usage: agentd [serve|smoke|chat|init-workspace|memory] [flags]")
+		fmt.Println("usage: agentd [serve|smoke|chat|init-workspace|memory|jobs] [flags]")
 		fmt.Println("  init-workspace [name]              scaffold a workspace (default ~/.agentd/workspaces/<name>)")
 		fmt.Println("  memory index|links|add|get [...]   maintain a workspace's memory wiki")
+		fmt.Println("  jobs list|run <name>|runs <name>   inspect and fire scheduler jobs (talks to the running daemon)")
 	default:
 		serve(os.Args[1:])
 	}
@@ -175,6 +180,115 @@ func memoryCmd(args []string) {
 		fmt.Print(p.Render())
 	default:
 		log.Fatalf("memory: unknown subcommand %q (want index|links|add|get)", sub)
+	}
+}
+
+// jobsCmd is the local ops surface for the scheduler: it talks to the RUNNING
+// daemon's API (bind + bearer from config.toml), so lists reflect live state.
+//
+//	agentd jobs list          jobs + next fire + last run status
+//	agentd jobs run <name>    fire a job now (manual trigger)
+//	agentd jobs runs <name>   recent run history for a job
+func jobsCmd(args []string) {
+	if len(args) < 1 {
+		log.Fatal("usage: agentd jobs <list|run NAME|runs NAME> [-config config.toml]")
+	}
+	sub := args[0]
+	fs := flag.NewFlagSet("jobs "+sub, flag.ExitOnError)
+	cfgPath := fs.String("config", "config.toml", "path to config.toml (for bind + bearer)")
+	_ = fs.Parse(args[1:])
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		log.Fatalf("jobs: config: %v", err)
+	}
+	base := "http://" + cfg.Server.Bind
+	call := func(method, path string) []byte {
+		req, err := http.NewRequest(method, base+path, nil)
+		if err != nil {
+			log.Fatalf("jobs: %v", err)
+		}
+		if cfg.Server.APIBearer != "" {
+			req.Header.Set("Authorization", "Bearer "+cfg.Server.APIBearer)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Fatalf("jobs: %v (is the daemon running on %s?)", err, cfg.Server.Bind)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= 300 {
+			log.Fatalf("jobs: %s %s -> %s: %s", method, path, resp.Status, strings.TrimSpace(string(body)))
+		}
+		return body
+	}
+
+	switch sub {
+	case "list":
+		var jobs []scheduler.JobStatus
+		if err := json.Unmarshal(call(http.MethodGet, "/jobs"), &jobs); err != nil {
+			log.Fatalf("jobs list: %v", err)
+		}
+		if len(jobs) == 0 {
+			fmt.Println("no jobs configured (add [[job]] blocks to config.toml)")
+			return
+		}
+		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+		fmt.Fprintln(w, "NAME\tENABLED\tTRIGGER\tWORKSPACE\tNOTIFY\tNEXT FIRE\tLAST RUN")
+		for _, j := range jobs {
+			next := "-"
+			if j.NextFire != nil {
+				next = j.NextFire.Local().Format("2006-01-02 15:04:05")
+			}
+			last := "-"
+			if j.LastRun != nil {
+				last = fmt.Sprintf("%s %s (%s)", j.LastRun.Status, j.LastRun.Start.Local().Format("01-02 15:04"), j.LastRun.Trigger)
+			}
+			ws := j.Workspace
+			if ws == "" {
+				ws = "(default)"
+			}
+			fmt.Fprintf(w, "%s\t%v\t%s\t%s\t%s\t%s\t%s\n", j.Name, j.Enabled, j.Trigger, ws, j.Notify, next, last)
+		}
+		_ = w.Flush()
+	case "run":
+		name := fs.Arg(0)
+		if name == "" {
+			log.Fatal("usage: agentd jobs run NAME")
+		}
+		fmt.Println(strings.TrimSpace(string(call(http.MethodPost, "/jobs/"+name+"/run"))))
+	case "runs":
+		name := fs.Arg(0)
+		if name == "" {
+			log.Fatal("usage: agentd jobs runs NAME")
+		}
+		var runs []scheduler.JobRun
+		if err := json.Unmarshal(call(http.MethodGet, "/jobs/"+name+"/runs"), &runs); err != nil {
+			log.Fatalf("jobs runs: %v", err)
+		}
+		if len(runs) == 0 {
+			fmt.Println("no runs recorded")
+			return
+		}
+		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+		fmt.Fprintln(w, "RUN\tTRIGGER\tSTART\tDURATION\tSTATUS\tRESULT/ERROR")
+		for _, r := range runs {
+			dur := "-"
+			if !r.End.IsZero() {
+				dur = r.End.Sub(r.Start).Round(time.Millisecond).String()
+			}
+			msg := r.Result
+			if r.Error != "" {
+				msg = r.Error
+			}
+			if len(msg) > 80 {
+				msg = msg[:80] + "..."
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", r.RunID, r.Trigger, r.Start.Local().Format("01-02 15:04:05"), dur, r.Status, msg)
+		}
+		_ = w.Flush()
+	default:
+		log.Fatalf("jobs: unknown subcommand %q (want list|run|runs)", sub)
 	}
 }
 
@@ -312,6 +426,23 @@ func serve(args []string) {
 	// wallclock) fire after each completed turn, in Manager.Send.
 	mgr.StartGC(ctx)
 
+	// Scheduler: declarative [[job]] blocks become proactive triggered sessions
+	// (a job run = one ordinary turn on the target workspace's warm session).
+	// Durable state (last fires + run history) lives in scheduler.jsonl next to
+	// the run-log; records are mirrored into the main run-log too.
+	jobDefs, err := scheduler.FromConfig(cfg.Job)
+	if err != nil {
+		log.Fatalf("jobs config: %v", err)
+	}
+	runner := &scheduler.ManagerRunner{Mgr: mgr, Bus: bus, Model: model}
+	sched, err := scheduler.New(jobDefs, runner, filepath.Join(cfg.Server.StateDir, "scheduler.jsonl"), rl)
+	if err != nil {
+		log.Fatalf("scheduler: %v", err)
+	}
+	defer sched.Close()
+	sched.Start(ctx)
+	log.Printf("agentd: scheduler started with %d job(s)", len(jobDefs))
+
 	// Channel: telegram, if configured and a token is present.
 	var transportUp atomic.Bool
 	var tg *telegram.Adapter
@@ -351,6 +482,7 @@ func serve(args []string) {
 
 	// API server.
 	srv := api.New(cfg.Server.APIBearer, mgr, bus, func() bool { return transportUp.Load() })
+	srv.AttachScheduler(sched)
 	httpSrv := &http.Server{Addr: cfg.Server.Bind, Handler: srv.Handler()}
 	go func() {
 		log.Printf("agentd: API listening on http://%s (bearer %s)", cfg.Server.Bind, redact(cfg.Server.APIBearer))
