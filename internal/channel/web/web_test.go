@@ -6,6 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -484,5 +487,102 @@ func TestEndToEndSchedulerNotifyToWebClient(t *testing.T) {
 		case <-deadline:
 			t.Fatal("scheduler job notification never reached the web WS client")
 		}
+	}
+}
+
+// TestUIMarkdownRendererServed: the served single-page app carries the inline
+// markdown renderer (no CDN/external scripts) and routes agent card text
+// through it, with the safety invariants visible in the source: escape-first
+// helper present, links restricted to http(s) with rel="noopener".
+func TestUIMarkdownRendererServed(t *testing.T) {
+	ts, _ := newStack(t)
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/ui", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	page := string(body)
+	for _, want := range []string{
+		"function mdRender",
+		"function mdEscapeHtml",
+		"function mdInline",
+		`target="_blank" rel="noopener"`,
+		"mdRender(ev.text)",
+		"https?:", // link scheme allowlist
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("served /ui missing %q", want)
+		}
+	}
+	if strings.Contains(page, "src=\"http") || strings.Contains(page, "<script src") {
+		t.Error("served /ui references an external script; must be self-contained")
+	}
+}
+
+// mdGoldenJS drives the EXTRACTED renderer (the exact bytes served in /ui,
+// between the marker comments) through golden cases, most importantly the
+// XSS ones: raw model HTML must come out fully escaped, never as markup, and
+// javascript: URLs must never become links. Run under node by
+// TestMarkdownRendererXSSGolden.
+const mdGoldenJS = `
+function is(got, want, name){
+  if(got !== want){ console.error("FAIL "+name+"\ngot:  "+got+"\nwant: "+want); process.exitCode=1; }
+  else console.log("ok " + name);
+}
+is(mdRender("**bold** and *ital* and ` + "`x<y`" + `"),
+   '<p><strong>bold</strong> and <em>ital</em> and <code>x&lt;y</code></p>', "inline basics");
+is(mdRender("1. one\n2. two"), '<ol><li>one</li><li>two</li></ol>', "ordered list");
+is(mdRender("- a\n- b"), '<ul><li>a</li><li>b</li></ul>', "unordered list");
+is(mdRender("## Head\ntext"), '<h2>Head</h2><p>text</p>', "heading then para");
+is(mdRender("see [docs](https://example.com/x)"),
+   '<p>see <a href="https://example.com/x" target="_blank" rel="noopener">docs</a></p>', "http link");
+is(mdRender("[bad](javascript:alert(1))"), '<p>[bad](javascript:alert(1))</p>', "javascript: link NOT linked");
+var xss = mdRender('<script>alert(1)</scr'+'ipt> <img src=x onerror=alert(2)>');
+is(xss, '<p>&lt;script&gt;alert(1)&lt;/script&gt; &lt;img src=x onerror=alert(2)&gt;</p>', "script and img text fully escaped");
+if(xss.indexOf("<script") !== -1 || xss.indexOf("<img") !== -1){ console.error("FAIL xss markup leaked"); process.exitCode=1; }
+is(mdRender('**<b>x</b>**'), '<p><strong>&lt;b&gt;x&lt;/b&gt;</strong></p>', "escape happens BEFORE transforms");
+`
+
+// TestMarkdownRendererXSSGolden extracts the renderer from the served /ui and
+// golden-tests it under node, XSS cases included. Skipped when node is not on
+// PATH (no JS engine is a Go dependency of this repo, and none is added for
+// this); the same cases were verified manually with node during development.
+func TestMarkdownRendererXSSGolden(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not on PATH; renderer golden cases need a JS engine (verified manually)")
+	}
+	ts, _ := newStack(t)
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/ui", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	page := string(body)
+
+	const start = "// --- markdown renderer (mdRender) ---"
+	const end = "// --- end markdown renderer ---"
+	a := strings.Index(page, start)
+	b := strings.Index(page, end)
+	if a < 0 || b < 0 || b <= a {
+		t.Fatalf("renderer markers not found in served /ui (a=%d b=%d)", a, b)
+	}
+	js := page[a:b] + "\n" + mdGoldenJS
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "md_golden.js")
+	if err := os.WriteFile(path, []byte(js), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, path).CombinedOutput()
+	t.Logf("node output:\n%s", out)
+	if err != nil {
+		t.Fatalf("renderer golden cases failed under node: %v", err)
 	}
 }

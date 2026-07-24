@@ -71,6 +71,21 @@
   .ev .tool{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;background:var(--code);
     padding:.1rem .3rem;border-radius:5px}
   .ev pre{margin:0;white-space:pre-wrap;word-break:break-word;font:inherit}
+  .ev .md{word-break:break-word}
+  .ev .md p{margin:0 0 .35rem}
+  .ev .md p:last-child,.ev .md ul:last-child,.ev .md ol:last-child,.ev .md pre:last-child{margin-bottom:0}
+  .ev .md ul,.ev .md ol{margin:0 0 .35rem;padding-left:1.25rem}
+  .ev .md li{margin:.1rem 0}
+  .ev .md code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;
+    background:var(--code);padding:.08rem .3rem;border-radius:5px}
+  .ev .md pre{margin:0 0 .35rem;padding:.5rem .6rem;background:var(--code);border-radius:8px;
+    overflow-x:auto;white-space:pre;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+  .ev .md pre code{background:none;padding:0}
+  .ev .md h1,.ev .md h2,.ev .md h3,.ev .md h4,.ev .md h5,.ev .md h6{margin:.4rem 0 .25rem;font-size:14px;font-weight:650}
+  .ev .md h1{font-size:15.5px} .ev .md h2{font-size:14.5px}
+  .ev .md a{color:var(--accent)}
+  .ev.me .md a{color:inherit}
+  .ev .md strong{font-weight:650}
   .confirm{align-self:center;display:flex;gap:.5rem;align-items:center;background:var(--panel);
     border:1px dashed var(--warn);padding:.5rem .7rem;border-radius:12px}
   .composer{display:flex;gap:.5rem;padding:.6rem;border-top:1px solid var(--line);background:var(--panel)}
@@ -110,6 +125,71 @@
     return e;
   };
   const esc = s => (s==null?"":String(s));
+
+  // --- markdown renderer (mdRender) ---
+  // Renders the COMMON markdown subset the agent emits (bold, italic, inline
+  // code, fenced code blocks, headings, ordered/unordered lists, http(s)
+  // links, paragraphs/line breaks) into an HTML string. XSS-safe BY
+  // CONSTRUCTION: the raw model text is HTML-escaped FIRST (mdEscapeHtml) and
+  // every transform below operates on that escaped text, so model-supplied
+  // <script>/<img>/attribute text can never reach the DOM as markup; the only
+  // markup in the output is what these functions themselves emit. Links are
+  // generated for http/https URLs only. No tables/images on purpose. Kept as
+  // pure functions between these markers so a Go test can extract and
+  // golden-test them under node (see web_test.go).
+  function mdEscapeHtml(s){
+    return String(s==null?"":s)
+      .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+      .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+  }
+  function mdInline(s){
+    // Protect code spans first so their contents skip bold/italic/link rules.
+    const codes=[];
+    s = s.replace(/`([^`]+)`/g, function(_,c){ codes.push(c); return "\u0000"+(codes.length-1)+"\u0000"; });
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    s = s.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>");
+    s = s.replace(/(^|[\s(])\*([^*\s](?:[^*]*[^*\s])?)\*/g,"$1<em>$2</em>");
+    s = s.replace(/(^|[\s(])_([^_\s](?:[^_]*[^_\s])?)_/g,"$1<em>$2</em>");
+    s = s.replace(/\u0000(\d+)\u0000/g, function(_,i){ return "<code>"+codes[+i]+"</code>"; });
+    return s;
+  }
+  function mdRender(src){
+    const lines = mdEscapeHtml(src).split(/\r?\n/);
+    const out=[]; const para=[];
+    const flush=function(){ if(para.length){ out.push("<p>"+para.map(mdInline).join("<br>")+"</p>"); para.length=0; } };
+    for(let i=0;i<lines.length;i++){
+      const l=lines[i]; let m;
+      if(/^```/.test(l)){ // fenced code block: verbatim (already escaped)
+        flush(); const code=[]; i++;
+        while(i<lines.length && !/^```/.test(lines[i])){ code.push(lines[i]); i++; }
+        out.push("<pre><code>"+code.join("\n")+"</code></pre>");
+        continue;
+      }
+      if((m=/^(#{1,6})\s+(.+)$/.exec(l))){
+        flush(); const n=m[1].length;
+        out.push("<h"+n+">"+mdInline(m[2])+"</h"+n+">");
+        continue;
+      }
+      if(/^\s*[-*+]\s+/.test(l)){
+        flush(); const items=[];
+        while(i<lines.length && (m=/^\s*[-*+]\s+(.*)$/.exec(lines[i]))){ items.push("<li>"+mdInline(m[1])+"</li>"); i++; }
+        i--; out.push("<ul>"+items.join("")+"</ul>");
+        continue;
+      }
+      if(/^\s*\d+[.)]\s+/.test(l)){
+        flush(); const items=[];
+        while(i<lines.length && (m=/^\s*\d+[.)]\s+(.*)$/.exec(lines[i]))){ items.push("<li>"+mdInline(m[1])+"</li>"); i++; }
+        i--; out.push("<ol>"+items.join("")+"</ol>");
+        continue;
+      }
+      if(/^\s*$/.test(l)){ flush(); continue; }
+      para.push(l);
+    }
+    flush();
+    return out.join("");
+  }
+  // --- end markdown renderer ---
 
   // ---- auth: token comes in ?token= on first load; server set an httponly
   // cookie from it, so subsequent fetch/WS are authenticated by the cookie.
@@ -246,7 +326,14 @@
     // is already on screen as the output card.
     if(kind==="result" && !ev.text) return null;
     const cls = kind==="result"?"ev result":kind==="error"?"ev error":"ev";
-    return h("div",{class:cls}, h("div",{class:"k"}, kind), h("pre",{}, esc(ev.text)));
+    // Agent output/result render as markdown; errors stay verbatim. Safe:
+    // mdRender HTML-escapes the whole text before any transform, so this is
+    // never innerHTML of raw model text. History-replayed entries flow through
+    // this same function, so refreshed pages render identically to live ones.
+    if(kind==="error") return h("div",{class:cls}, h("div",{class:"k"}, kind), h("pre",{}, esc(ev.text)));
+    const md = h("div",{class:"md"});
+    md.innerHTML = mdRender(ev.text);
+    return h("div",{class:cls}, h("div",{class:"k"}, kind), md);
   }
 
   function renderNotifs(){
