@@ -179,7 +179,7 @@
     if(!state.sessions.length){ list.replaceChildren(h("div",{class:"empty"},"No sessions yet.")); return; }
     list.replaceChildren(...state.sessions.map(s=>{
       const st = s.status||"idle";
-      return h("div",{class:"sess"+(s.id===state.active?" active":""),onclick:()=>{state.active=s.id;renderSessions();renderConv();}},
+      return h("div",{class:"sess"+(s.id===state.active?" active":""),onclick:()=>{state.active=s.id;renderSessions();renderConv();loadHistory(s.id);}},
         h("div",{class:"t"}, esc(s.title||s.id)),
         h("div",{class:"m"},
           h("span",{class:"pill "+st}, st),
@@ -193,6 +193,26 @@
 
   // Per-session event log kept client-side, keyed by session id.
   const logs = {};
+  // History backfill: on page load / session select, replay the prior
+  // conversation from GET /sessions/:id/history (the durable run-log; server
+  // caps at the last 50 turns). Without this a browser refresh showed
+  // "No messages yet." because only live WS events were rendered. Replayed
+  // entries are PREPENDED before any live events that raced in during the
+  // fetch; fetched once per session per page load.
+  const histLoaded = {};
+  async function loadHistory(sid){
+    if(!sid || histLoaded[sid]) return;
+    histLoaded[sid] = true;
+    try{
+      const r = await api("/sessions/"+encodeURIComponent(sid)+"/history");
+      const hist = await r.json();
+      const mapped = (hist||[]).map(en => en.role==="user"
+        ? {_me:true, text:en.text}
+        : {kind:en.kind, text:en.text, tool:en.tool, session_id:sid, ts:en.ts});
+      logs[sid] = mapped.concat(logs[sid]||[]);
+      if(sid===state.active) renderConv();
+    }catch(e){ histLoaded[sid] = false; if(e&&e.unauth) renderLogin(); }
+  }
   function pushEv(ev){
     const sid = ev.session_id||"";
     (logs[sid] = logs[sid]||[]).push(ev);
@@ -205,7 +225,7 @@
     const conv = $("#conv"); if(!conv) return;
     const evs = logs[state.active]||[];
     if(!evs.length){ conv.replaceChildren(h("div",{class:"empty"}, state.active?"No messages yet.":"Pick or start a session.")); return; }
-    conv.replaceChildren(...evs.map(renderEv));
+    conv.replaceChildren(...evs.map(renderEv).filter(Boolean));
     conv.scrollTop = conv.scrollHeight;
   }
 
@@ -221,6 +241,10 @@
         h("button",{onclick:()=>confirmDecision(tok,false)},"Deny")
       );
     }
+    // A result event whose text was already streamed as the turn's final output
+    // arrives text-less (turn-terminal marker only): render nothing, the reply
+    // is already on screen as the output card.
+    if(kind==="result" && !ev.text) return null;
     const cls = kind==="result"?"ev result":kind==="error"?"ev error":"ev";
     return h("div",{class:cls}, h("div",{class:"k"}, kind), h("pre",{}, esc(ev.text)));
   }
@@ -240,6 +264,7 @@
     try{
       const r = await api("/sessions"); state.sessions = await r.json();
       if(!state.active && state.sessions.length) state.active = state.sessions[0].id;
+      if(state.active) loadHistory(state.active);
       const hr = await (await api("/health")).json().catch(()=>({}));
       if(hr && "transport_ok" in hr) state.transportOK = hr.transport_ok;
       renderSessions();
@@ -275,7 +300,7 @@
     state.ws = ws;
     ws.onmessage = ev=>{
       let m; try{ m=JSON.parse(ev.data); }catch(_){ return; }
-      if(m.type==="event"){ pushEv(m.event); if(m.event && !state.active) { state.active=m.event.session_id; renderSessions(); } refreshSessions(); }
+      if(m.type==="event"){ pushEv(m.event); if(m.event && !state.active) { state.active=m.event.session_id; renderSessions(); loadHistory(state.active); } refreshSessions(); }
       else if(m.type==="notification"){ state.notifs.unshift(m.notification); if(state.notifs.length>100)state.notifs.pop(); renderNotifs(); }
       else if(m.type==="reply"){ /* result already arrives as an event; reply is a fallback */ }
     };

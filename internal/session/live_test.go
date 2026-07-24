@@ -64,14 +64,25 @@ func TestLiveWorkspaceInjection(t *testing.T) {
 		done <- err
 	}()
 
-	var result string
+	var result, lastOutput string
 	sendDone := false
 collect:
 	for {
 		select {
 		case e := <-events:
-			if e.SessionID == s.ID && e.Kind == eventbus.KindResult {
+			if e.SessionID != s.ID {
+				continue
+			}
+			if e.Kind == eventbus.KindOutput {
+				lastOutput = e.Text
+			}
+			if e.Kind == eventbus.KindResult {
+				// The harness blanks a result text that duplicates the turn's
+				// final output; the reply is then that output text.
 				result = e.Text
+				if result == "" {
+					result = lastOutput
+				}
 				if sendDone {
 					break collect
 				}

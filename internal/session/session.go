@@ -456,18 +456,50 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		turnErr <- err
 	}()
 
-	var result string
+	// The harness blanks a result text that merely duplicates the turn's final
+	// streamed output (single user-visible reply on the bus); the reply is then
+	// that last output text.
+	var result, lastOutput string
+	gotResult := false
+	collectEv := func(e eventbus.Event) {
+		if e.SessionID != id {
+			return
+		}
+		switch e.Kind {
+		case eventbus.KindOutput:
+			lastOutput = e.Text
+		case eventbus.KindResult:
+			gotResult = true
+			if e.Text != "" {
+				result = e.Text
+			} else {
+				result = lastOutput
+			}
+		}
+	}
 	timeout := time.After(150 * time.Second)
 collect:
 	for {
 		select {
 		case e := <-events:
-			if e.SessionID == id && e.Kind == eventbus.KindResult {
-				result = e.Text
-			}
+			collectEv(e)
 		case err := <-turnErr:
 			if err != nil {
 				return err
+			}
+			// Send returning can race the bus delivery of the turn's events;
+			// drain briefly until the result event lands (same grace as the
+			// scheduler runner) so the reply is not built from a partial turn.
+			grace := time.After(2 * time.Second)
+			for !gotResult {
+				select {
+				case e := <-events:
+					collectEv(e)
+				case <-grace:
+					break collect
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
 			break collect
 		case <-timeout:

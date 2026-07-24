@@ -98,6 +98,125 @@ func TestParseMultiTurnFixture(t *testing.T) {
 	}
 }
 
+// TestStreamedFixtureSingleVisibleReply asserts the DEDUPED streaming path (the
+// one readLoop/OneShot actually use: ParseLine + resultDeduper): the turn's
+// final reply text must reach the event stream EXACTLY ONCE. claude's terminal
+// result line repeats the final assistant text; without the deduper every
+// channel rendered the reply twice (web UI: identical OUTPUT + RESULT cards).
+func TestStreamedFixtureSingleVisibleReply(t *testing.T) {
+	f, err := os.Open("testdata/pong.stream-json")
+	if err != nil {
+		t.Fatalf("open fixture: %v", err)
+	}
+	defer f.Close()
+
+	var got []eventbus.Event
+	dedup := &resultDeduper{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		evs, _ := ParseLine(line, "sess-1")
+		got = append(got, dedup.Apply(evs)...)
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	visible := 0
+	var sawResult bool
+	for _, e := range got {
+		if strings.Contains(e.Text, "PONG") {
+			visible++
+		}
+		if e.Kind == eventbus.KindResult {
+			sawResult = true
+			if e.Text != "" {
+				t.Errorf("result event still carries duplicated text %q, want blank", e.Text)
+			}
+			if e.Status != string(harness.StatusIdle) {
+				t.Errorf("result event lost its status metadata: %+v", e)
+			}
+		}
+	}
+	if visible != 1 {
+		t.Fatalf("reply text appears in %d events, want exactly 1: %+v", visible, got)
+	}
+	if !sawResult {
+		t.Fatal("turn-terminal result event missing from the stream")
+	}
+}
+
+// TestStreamedMultiTurnDedup proves the deduper resets at turn boundaries: over
+// the recorded two-turn transcript each turn's reply text appears exactly once,
+// and each turn still ends with a (text-less) result event.
+func TestStreamedMultiTurnDedup(t *testing.T) {
+	f, err := os.Open("testdata/two-turns.stream-json")
+	if err != nil {
+		t.Fatalf("open fixture: %v", err)
+	}
+	defer f.Close()
+
+	var got []eventbus.Event
+	dedup := &resultDeduper{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		evs, _ := ParseLine(line, "sess-multi")
+		got = append(got, dedup.Apply(evs)...)
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	results := 0
+	counts := map[string]int{}
+	for _, e := range got {
+		if e.Kind == eventbus.KindResult {
+			results++
+			if e.Text != "" {
+				t.Errorf("result event still carries duplicated text %q", e.Text)
+			}
+		}
+		if e.Text != "" {
+			counts[e.Text]++
+		}
+	}
+	if results != 2 {
+		t.Fatalf("want 2 result events (one per turn), got %d", results)
+	}
+	for text, n := range counts {
+		if n != 1 {
+			t.Errorf("text %q appears %d times, want 1", text, n)
+		}
+	}
+}
+
+// TestDeduperKeepsDistinctResultText: a result whose text does NOT duplicate the
+// streamed output (or an error) keeps its text.
+func TestDeduperKeepsDistinctResultText(t *testing.T) {
+	d := &resultDeduper{}
+	evs := d.Apply([]eventbus.Event{
+		{Kind: eventbus.KindOutput, Text: "working on it"},
+		{Kind: eventbus.KindResult, Text: "final summary"},
+	})
+	if evs[1].Text != "final summary" {
+		t.Errorf("distinct result text was blanked: %+v", evs[1])
+	}
+	evs = d.Apply([]eventbus.Event{
+		{Kind: eventbus.KindOutput, Text: "boom"},
+		{Kind: eventbus.KindError, Text: "boom"},
+	})
+	if evs[1].Text != "boom" {
+		t.Errorf("error text must never be blanked: %+v", evs[1])
+	}
+}
+
 func TestParseLineToolUse(t *testing.T) {
 	line := []byte(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]},"session_id":"s"}`)
 	evs, sess := ParseLine(line, "sess-1")
@@ -160,9 +279,20 @@ func TestClaudePersistentContinuity(t *testing.T) {
 
 	results := make(chan string, 4)
 	go func() {
+		var lastOutput string
 		for e := range a.Events(h) {
-			if e.Kind == eventbus.KindResult {
-				results <- e.Text
+			switch e.Kind {
+			case eventbus.KindOutput:
+				lastOutput = e.Text
+			case eventbus.KindResult:
+				// The streaming path blanks a result text that duplicates the
+				// turn's final output; the reply is then that output text.
+				r := e.Text
+				if r == "" {
+					r = lastOutput
+				}
+				results <- r
+				lastOutput = ""
 			}
 		}
 	}()

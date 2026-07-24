@@ -46,26 +46,45 @@ func (r *ManagerRunner) RunTurn(ctx context.Context, workspaceName, prompt, titl
 		turnErr <- err
 	}()
 
-	var result string
+	// The harness blanks a result text that merely duplicates the turn's final
+	// streamed output (single user-visible reply on the bus), so the job result
+	// is the result text when present, else the last output text of the turn.
+	var result, lastOutput string
+	gotResult := false
+	collect := func(e eventbus.Event) {
+		if e.SessionID != s.ID {
+			return
+		}
+		switch e.Kind {
+		case eventbus.KindOutput:
+			lastOutput = e.Text
+		case eventbus.KindResult:
+			gotResult = true
+			if e.Text != "" {
+				result = e.Text
+			} else {
+				result = lastOutput
+			}
+		}
+	}
 	for {
 		select {
 		case e := <-events:
-			if e.SessionID == s.ID && e.Kind == eventbus.KindResult {
-				result = e.Text
-			}
+			collect(e)
 		case err := <-turnErr:
 			if err != nil {
 				return "", err
 			}
-			if result == "" {
+			if !gotResult {
 				// The result event may still be in flight behind Send
 				// returning; drain briefly.
 				grace := time.After(2 * time.Second)
 				for {
 					select {
 					case e := <-events:
-						if e.SessionID == s.ID && e.Kind == eventbus.KindResult {
-							return e.Text, nil
+						collect(e)
+						if gotResult {
+							return result, nil
 						}
 					case <-grace:
 						return result, nil

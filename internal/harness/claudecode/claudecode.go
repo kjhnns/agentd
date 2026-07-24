@@ -317,12 +317,43 @@ func extractUsage(line []byte) (int, bool) {
 	return 0, false
 }
 
+// resultDeduper blanks the redundant text on a turn's success result event when
+// the identical text was already streamed as the turn's final output event.
+// claude's stream-json terminal result line repeats the final assistant text
+// verbatim; forwarding both means every channel renders the reply twice (the
+// web UI showed an OUTPUT card and an identical RESULT card). The result event
+// still flows as the turn-terminal marker (kind, status, session id); only the
+// duplicated text is dropped. Error events are never blanked. Consumers that
+// want the turn's final reply text use the result text when present, else the
+// last output text of the turn (see session.RouteInbound).
+type resultDeduper struct{ lastOutput string }
+
+// Apply rewrites evs in place, blanking a success result's text that duplicates
+// the last streamed output, and resets its state at each turn boundary.
+func (d *resultDeduper) Apply(evs []eventbus.Event) []eventbus.Event {
+	for i := range evs {
+		switch evs[i].Kind {
+		case eventbus.KindOutput:
+			d.lastOutput = evs[i].Text
+		case eventbus.KindResult:
+			if evs[i].Text != "" && evs[i].Text == d.lastOutput {
+				evs[i].Text = ""
+			}
+			d.lastOutput = "" // turn boundary: next turn starts fresh
+		case eventbus.KindError:
+			d.lastOutput = ""
+		}
+	}
+	return evs
+}
+
 // readLoop consumes the stdout stream for the whole process lifetime, publishing
 // normalized events and signaling any in-flight turn's waiter on result/error.
 func (h *handle) readLoop() {
 	defer close(h.events)
 	defer h.markDead()
 
+	dedup := &resultDeduper{}
 	sc := bufio.NewScanner(h.stdout)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for sc.Scan() {
@@ -348,6 +379,7 @@ func (h *handle) readLoop() {
 		}
 
 		evs, sess := ParseLine(line, h.id)
+		evs = dedup.Apply(evs)
 		if sess != "" {
 			h.mu.Lock()
 			h.claudeSessionID = sess
@@ -515,6 +547,7 @@ func OneShot(ctx context.Context, bin, prompt string, skipPermissions bool) ([]e
 		return nil, fmt.Errorf("claudecode: start %s: %w", bin, err)
 	}
 	var out []eventbus.Event
+	dedup := &resultDeduper{}
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for sc.Scan() {
@@ -523,7 +556,7 @@ func OneShot(ctx context.Context, bin, prompt string, skipPermissions bool) ([]e
 			continue
 		}
 		evs, _ := ParseLine(line, "smoke")
-		out = append(out, evs...)
+		out = append(out, dedup.Apply(evs)...)
 	}
 	if err := cmd.Wait(); err != nil {
 		return out, fmt.Errorf("claudecode: claude exited: %w", err)
@@ -564,7 +597,10 @@ type contentBlock struct {
 //   - assistant text block            -> KindOutput
 //   - assistant tool_use block        -> KindToolCall (Tool=name)
 //   - assistant thinking block        -> dropped (internal)
-//   - result/success                  -> KindResult (Text=result)
+//   - result/success                  -> KindResult (Text=result; NOTE the
+//     streaming paths (readLoop/OneShot) then blank that text via resultDeduper
+//     when it duplicates the turn's final output event, so the reply reaches
+//     channels exactly once)
 //   - result with is_error, or type=="error" -> KindError
 func ParseLine(line []byte, sessionID string) ([]eventbus.Event, string) {
 	var m streamMsg

@@ -335,12 +335,23 @@ func chat(args []string) {
 	}
 	defer a.Teardown(h)
 
-	// Collect result events off the persistent stream.
+	// Collect result events off the persistent stream. The adapter blanks a
+	// result text that duplicates the turn's final output event, so fall back
+	// to the last output text for the printed reply.
 	results := make(chan string, 4)
 	go func() {
+		var lastOutput string
 		for e := range a.Events(h) {
-			if e.Kind == eventbus.KindResult {
-				results <- e.Text
+			switch e.Kind {
+			case eventbus.KindOutput:
+				lastOutput = e.Text
+			case eventbus.KindResult:
+				r := e.Text
+				if r == "" {
+					r = lastOutput
+				}
+				results <- r
+				lastOutput = ""
 			}
 		}
 	}()

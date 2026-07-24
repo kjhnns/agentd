@@ -23,8 +23,9 @@ type Record struct {
 
 // Log is a thread-safe append-only JSONL writer with fsync-per-record.
 type Log struct {
-	mu sync.Mutex
-	f  *os.File
+	mu   sync.Mutex
+	f    *os.File
+	path string
 }
 
 // Open opens (creating parent dirs as needed) the JSONL file for appending.
@@ -36,8 +37,11 @@ func Open(path string) (*Log, error) {
 	if err != nil {
 		return nil, fmt.Errorf("runlog open: %w", err)
 	}
-	return &Log{f: f}, nil
+	return &Log{f: f, path: path}, nil
 }
+
+// Path returns the file the log appends to (so readers can Replay it).
+func (l *Log) Path() string { return l.path }
 
 // Append marshals payload, writes one JSON line, and fsyncs before returning.
 // The fsync makes the record durable against a crash the instant it returns.

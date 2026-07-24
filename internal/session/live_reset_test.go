@@ -68,13 +68,24 @@ func TestLiveLosslessResetNovember3(t *testing.T) {
 	send := func(text string) string {
 		done := make(chan error, 1)
 		go func() { _, e := mgr.Send(ctx, s.ID, text); done <- e }()
-		var result string
+		var result, lastOutput string
 		sendDone := false
 		for {
 			select {
 			case e := <-events:
-				if e.SessionID == s.ID && e.Kind == eventbus.KindResult {
+				if e.SessionID != s.ID {
+					continue
+				}
+				if e.Kind == eventbus.KindOutput {
+					lastOutput = e.Text
+				}
+				if e.Kind == eventbus.KindResult {
+					// The harness blanks a result text that duplicates the
+					// turn's final output; fall back to that output text.
 					result = e.Text
+					if result == "" {
+						result = lastOutput
+					}
 					if sendDone {
 						return result
 					}

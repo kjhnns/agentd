@@ -70,9 +70,13 @@ var _ harness.Adapter = echoAdapter{}
 // the inbound loop that routes web input through session.RouteInbound. Returns
 // the running httptest server and the web adapter.
 func newStack(t *testing.T) (*httptest.Server, *web.Adapter) {
+	return newStackWith(t, echoAdapter{})
+}
+
+func newStackWith(t *testing.T, ha harness.Adapter) (*httptest.Server, *web.Adapter) {
 	t.Helper()
 	bus := eventbus.New()
-	mgr := session.NewManager(echoAdapter{}, bus, nil)
+	mgr := session.NewManager(ha, bus, nil)
 	mgr.Policy = session.Policy{} // no lifecycle triggers
 
 	webCh := web.New(bus, "test-ui")
@@ -207,9 +211,12 @@ func TestWSInputRoundTrip(t *testing.T) {
 		t.Fatalf("ws write: %v", err)
 	}
 
+	// The bus forwarder and the reply broadcast are separate goroutines, so the
+	// reply envelope can legally arrive before the streamed events: wait until
+	// BOTH the intermediate output and a terminal (result or reply) landed.
 	var sawOutput, sawResult, sawReply bool
 	deadline := time.After(5 * time.Second)
-	for !(sawResult || sawReply) {
+	for !sawOutput || !(sawResult || sawReply) {
 		select {
 		case m := <-envs:
 			switch m["type"] {
@@ -232,6 +239,93 @@ func TestWSInputRoundTrip(t *testing.T) {
 	}
 	if !sawOutput {
 		t.Error("did not receive the intermediate output event over WS")
+	}
+}
+
+// claudeLikeAdapter mimics the REAL claudecode harness contract after the
+// dedupe fix: the turn's reply text streams as ONE output event and the result
+// event is a text-less turn-terminal marker (its text was blanked because
+// claude's terminal result line duplicated the final assistant text).
+type claudeLikeAdapter struct{ echoAdapter }
+
+func (claudeLikeAdapter) Send(ctx context.Context, h harness.Handle, in harness.Input) error {
+	bh := h.(*echoHandle)
+	bh.events <- eventbus.Event{SessionID: bh.id, Kind: eventbus.KindOutput, Text: "PONG " + in.Text}
+	bh.events <- eventbus.Event{SessionID: bh.id, Kind: eventbus.KindResult, Text: "", Status: "idle"}
+	return nil
+}
+
+// TestSingleVisibleReplyPerTurn is the regression test for the doubled web UI
+// reply (every answer rendered once as OUTPUT and again as RESULT): with the
+// harness emitting the deduped stream, the reply text must reach the WS in
+// EXACTLY ONE event envelope, the result envelope must arrive text-less (so
+// the UI renders nothing for it), and the RouteInbound reply envelope (which
+// the UI ignores; Telegram consumes its equivalent) must still carry the full
+// reply text via the last-output fallback.
+func TestSingleVisibleReplyPerTurn(t *testing.T) {
+	ts, webCh := newStackWith(t, claudeLikeAdapter{})
+
+	conn, err := wsutil.Dial(wsURL(ts, "/ws?token=tok"), nil)
+	if err != nil {
+		t.Fatalf("ws dial: %v", err)
+	}
+	defer conn.Close()
+	waitClients(t, webCh, 1)
+
+	envs := readEnvelopes(conn)
+	if err := conn.WriteText([]byte(`{"type":"input","text":"ping"}`)); err != nil {
+		t.Fatalf("ws write: %v", err)
+	}
+
+	visibleEvents := 0
+	replyText := ""
+	sawResultMarker := false
+	handleEnv := func(m map[string]any) {
+		switch m["type"] {
+		case "event":
+			ev, _ := m["event"].(map[string]any)
+			if strings.Contains(str(ev["text"]), "PONG") {
+				visibleEvents++
+			}
+			if ev["kind"] == "result" {
+				sawResultMarker = true
+				if str(ev["text"]) != "" {
+					t.Errorf("result event still carries reply text %q over the WS", ev["text"])
+				}
+			}
+		case "reply":
+			replyText = str(m["text"])
+		}
+	}
+	deadline := time.After(5 * time.Second)
+	for replyText == "" || !sawResultMarker {
+		select {
+		case m := <-envs:
+			handleEnv(m)
+		case <-deadline:
+			t.Fatalf("timeout; visibleEvents=%d sawResultMarker=%v replyText=%q", visibleEvents, sawResultMarker, replyText)
+		}
+	}
+	// Drain a short quiet window to catch any late duplicate.
+	quiet := time.After(300 * time.Millisecond)
+drain:
+	for {
+		select {
+		case m := <-envs:
+			handleEnv(m)
+		case <-quiet:
+			break drain
+		}
+	}
+
+	if visibleEvents != 1 {
+		t.Fatalf("reply text arrived in %d event envelopes, want exactly 1", visibleEvents)
+	}
+	if !sawResultMarker {
+		t.Error("turn-terminal result event never arrived over the WS")
+	}
+	if !strings.Contains(replyText, "PONG ping") {
+		t.Fatalf("reply envelope = %q, want the turn's reply text via last-output fallback", replyText)
 	}
 }
 

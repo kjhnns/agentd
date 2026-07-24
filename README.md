@@ -37,7 +37,12 @@ scope. What is IN:
   full conversation continuity (memory, context, tools carry across turns); a
   background reader maps stdout JSON lines to normalized Events (assistant text ->
   `output`, `tool_use` -> `tool_call`, each turn's `result` -> `result`, errors ->
-  `error`), one `result` per turn. **This is the proven vertical (see below).**
+  `error`), one `result` per turn. Claude's terminal `result` line repeats the
+  final assistant text verbatim; the adapter BLANKS that duplicated text (the
+  `result` event stays as the turn-terminal marker with its status metadata), so
+  the reply reaches channels exactly once. Consumers wanting the turn's final
+  reply text use the result text when present, else the turn's last `output`
+  text. **This is the proven vertical (see below).**
 
   **Skip-permissions default.** With `skip_permissions = true` (Joe's default in
   `config.example.toml`) the adapter passes `--dangerously-skip-permissions`, so
@@ -70,7 +75,9 @@ scope. What is IN:
   returns BOTH `transport_ok` and per-session `agent_ok` as distinct signals (the
   lesson from failure class 2), plus per-session `pressure` + `pressure_source`.
   `GET/POST /sessions`, `POST /sessions/:id/input`,
-  `GET /sessions/:id/events` (WebSocket), `DELETE /sessions/:id`,
+  `GET /sessions/:id/events` (WebSocket),
+  `GET /sessions/:id/history` (conversation replay from the run-log, capped at
+  the last 50 turns; `?turns=N` narrows it), `DELETE /sessions/:id`,
   `POST /sessions/:id/interrupt`, `POST /sessions/:id/reset`. The web channel
   mounts `GET /ui`, the `/ws` WebSocket, and `POST /confirm/:token` on this same
   server via `(*Server).Mount`, behind the same bearer gate.
@@ -298,7 +305,11 @@ the bundled page. It is responsive (single-column on phones), theme-aware
 - **Session list** — every session with its status, turn count, and live context
   **pressure** bar (from `GET /sessions`, polled).
 - **Conversation / event view** — the active session's normalized events streamed
-  live over the WS (output, tool calls, results, errors).
+  live over the WS (output, tool calls, results, errors). On page load / session
+  select the prior conversation is backfilled from `GET /sessions/:id/history`
+  (replayed from the durable run-log, last 50 turns), so a browser refresh does
+  not blank the pane; replayed turns render exactly like live ones, including
+  the single-visible-reply dedupe.
 - **Input box** — a typed message is sent over the WS and routed through the SAME
   `session.RouteInbound` path as any channel, so a web message drives the one warm
   web session exactly like a Telegram message drives its session.

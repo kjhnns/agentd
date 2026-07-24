@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,7 +46,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) routes() {
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/sessions", s.handleSessions)        // GET list, POST create
-	s.mux.HandleFunc("/sessions/", s.handleSessionSubpath) // /:id, /:id/input, /:id/events, /:id/interrupt
+	s.mux.HandleFunc("/sessions/", s.handleSessionSubpath) // /:id, /:id/input, /:id/events, /:id/history, /:id/interrupt
 	s.mux.HandleFunc("/jobs", s.handleJobs)                // GET list
 	s.mux.HandleFunc("/jobs/", s.handleJobSubpath)         // /:name/run (POST), /:name/runs (GET)
 	s.mux.HandleFunc("/hooks/", s.handleHook)              // POST /hooks/:job (webhook trigger)
@@ -190,9 +191,34 @@ func (s *Server) handleSessionSubpath(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "reset", "id": id, "reason": reason})
 	case "events":
 		s.handleEvents(w, r, id)
+	case "history":
+		s.handleHistory(w, r, id)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
+}
+
+// handleHistory replays a session's prior conversation from the durable
+// run-log (GET /sessions/:id/history[?turns=N], default/cap
+// session.HistoryMaxTurns) so the UI can backfill after a page reload. A
+// session with nothing logged yet yields an empty list, not a 404.
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	turns := 0
+	if v := r.URL.Query().Get("turns"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n < session.HistoryMaxTurns {
+			turns = n
+		}
+	}
+	entries, err := s.mgr.History(id, turns)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, entries)
 }
 
 // handleJobs lists jobs with next-fire + last-run status.
