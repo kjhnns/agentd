@@ -95,6 +95,44 @@ func initWorkspace(args []string) {
 	fmt.Println("  work/                    scratch space")
 }
 
+// resolveWorkspaceTarget fills an empty -root / -workspace from a config.toml
+// ([workspace] root/default) so `agentd memory ...` works bare on a configured
+// machine. Config path precedence: explicit cfgPath flag, $AGENTD_CONFIG, then
+// ~/.agentd/config.toml if it exists. Explicit flags always win; if nothing
+// resolves, the empty values fall through to workspace.NewStore's defaults
+// (~/.agentd/workspaces, "default").
+func resolveWorkspaceTarget(root, name, cfgPath string) (string, string) {
+	if root != "" && name != "" {
+		return root, name
+	}
+	path := cfgPath
+	if path == "" {
+		path = os.Getenv("AGENTD_CONFIG")
+	}
+	if path == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			p := filepath.Join(home, ".agentd", "config.toml")
+			if _, err := os.Stat(p); err == nil {
+				path = p
+			}
+		}
+	}
+	if path == "" {
+		return root, name
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return root, name
+	}
+	if root == "" {
+		root = cfg.Workspace.Root
+	}
+	if name == "" {
+		name = cfg.Workspace.Default
+	}
+	return root, name
+}
+
 // memoryCmd maintains a workspace's memory wiki: rebuild the INDEX from page
 // frontmatter, check [[wikilinks]], add/get pages.
 func memoryCmd(args []string) {
@@ -103,8 +141,9 @@ func memoryCmd(args []string) {
 	}
 	sub := args[0]
 	fs := flag.NewFlagSet("memory "+sub, flag.ExitOnError)
-	root := fs.String("root", workspace.DefaultRoot(), "directory holding workspaces")
-	wsName := fs.String("workspace", "default", "workspace name")
+	root := fs.String("root", "", "directory holding workspaces (default: [workspace] root from config, else ~/.agentd/workspaces)")
+	wsName := fs.String("workspace", "", "workspace name (default: [workspace] default from config, else \"default\")")
+	cfgPath := fs.String("config", "", "config.toml to resolve workspace root/default from (default: $AGENTD_CONFIG, else ~/.agentd/config.toml)")
 	slug := fs.String("slug", "", "page slug (add/get)")
 	title := fs.String("title", "", "page title (add)")
 	hook := fs.String("hook", "", "one-line hook shown in the INDEX (add)")
@@ -112,7 +151,8 @@ func memoryCmd(args []string) {
 	body := fs.String("body", "", "page body; reads stdin if empty (add)")
 	_ = fs.Parse(args[1:])
 
-	ws, err := workspace.Load(workspace.NewStore(*root, *wsName).Path(*wsName))
+	r, n := resolveWorkspaceTarget(*root, *wsName, *cfgPath)
+	ws, err := workspace.Load(workspace.NewStore(r, n).Path(n))
 	if err != nil {
 		log.Fatalf("memory: %v", err)
 	}

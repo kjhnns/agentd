@@ -459,6 +459,11 @@ migration; tg-bridge and its watchdogs are untouched).
   `launchctl kickstart gui/$(id -u)/com.joe_pa.agentd`.
 - **Workspace:** `~/agentd-workspace/main` (its own git repo). Deliberately
   NOT `~/clawd` — the live PA workspace is never shared with a parallel setup.
+  The `agentd memory` CLI resolves the workspace from `~/.agentd/config.toml`
+  (`[workspace] root`/`default`), so a bare `agentd memory index` works on
+  this Mac; the explicit form is
+  `agentd memory index -root /Users/johannes/agentd-workspace -workspace main`
+  (flags always win; `-config` / `$AGENTD_CONFIG` override the config path).
 - **Secrets:** in `pass` — `agentd/web-token` (the API bearer) and
   `agentd/telegram-token` (a dedicated bot, NOT the tg-bridge bot; two pollers
   on one token = getUpdates 409). Never in git; `config.toml` is gitignored.
