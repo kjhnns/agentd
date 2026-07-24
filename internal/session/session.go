@@ -98,6 +98,12 @@ type Manager struct {
 	// GitAutoCommit commits workspace changes after each completed turn (see
 	// workspace/git.go for the commit policy). Config [workspace] git_autocommit.
 	GitAutoCommit bool
+
+	// DefaultCwd/DefaultModel are the harness defaults the serve wiring passes
+	// to RouteInbound; kept here too so server-initiated session creation (e.g.
+	// Continue on a past session) starts with the same parameters.
+	DefaultCwd   string
+	DefaultModel string
 }
 
 // Policy is the session-lifecycle + context-reset tuning (mirrors config

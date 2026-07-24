@@ -586,3 +586,29 @@ func TestMarkdownRendererXSSGolden(t *testing.T) {
 		t.Fatalf("renderer golden cases failed under node: %v", err)
 	}
 }
+
+// TestUIPastSessionsServed: the served app carries the past-sessions browser
+// (listing fetch, read-only guard, and the Continue action).
+func TestUIPastSessionsServed(t *testing.T) {
+	ts, _ := newStack(t)
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/ui", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	page := string(body)
+	for _, want := range []string{
+		"Past sessions",
+		"/sessions/past",
+		"continuePast",
+		"/continue",
+		"read-only",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("served /ui missing %q", want)
+		}
+	}
+}

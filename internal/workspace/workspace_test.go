@@ -86,9 +86,9 @@ func TestComposeSystemPrompt(t *testing.T) {
 		t.Fatalf("ComposeSystemPrompt: %v", err)
 	}
 	for _, want := range []string{
-		"INSTRUCTION-MARKER",                        // instructions/AGENTS.md
+		"INSTRUCTION-MARKER", // instructions/AGENTS.md
 		"[Memory conventions](pages/memory-conventions.md)", // INDEX line
-		"HANDOFF-MARKER",                            // context.md
+		"HANDOFF-MARKER", // context.md
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("composed prompt missing %q", want)

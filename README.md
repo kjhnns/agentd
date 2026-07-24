@@ -77,7 +77,13 @@ scope. What is IN:
   `GET/POST /sessions`, `POST /sessions/:id/input`,
   `GET /sessions/:id/events` (WebSocket),
   `GET /sessions/:id/history` (conversation replay from the run-log, capped at
-  the last 50 turns; `?turns=N` narrows it), `DELETE /sessions/:id`,
+  the last 50 turns; `?turns=N` narrows it),
+  `GET /sessions/past` (run-log-derived listing of sessions no longer live:
+  id, label, first/last activity, turns, preview; most recent first, capped at
+  100, `?limit=N` narrows),
+  `POST /sessions/:id/continue` (start a NEW live session seeded with a compact
+  transcript of a past one; continue-as-new-session, the source id is not
+  resurrected), `DELETE /sessions/:id`,
   `POST /sessions/:id/interrupt`, `POST /sessions/:id/reset`. The web channel
   mounts `GET /ui`, the `/ws` WebSocket, and `POST /confirm/:token` on this same
   server via `(*Server).Mount`, behind the same bearer gate.
@@ -303,7 +309,11 @@ the bundled page. It is responsive (single-column on phones), theme-aware
 **What it shows.**
 
 - **Session list** — every session with its status, turn count, and live context
-  **pressure** bar (from `GET /sessions`, polled).
+  **pressure** bar (from `GET /sessions`, polled). Below it, a **Past sessions**
+  section (from `GET /sessions/past`): sessions reclaimed by the idle GC or lost
+  to a restart stay discoverable; clicking one shows its conversation read-only
+  (history replay, markdown + dedupe applied), and **Continue** resumes it as a
+  NEW seeded live session titled `continued:<source id>`.
 - **Conversation / event view** — the active session's normalized events streamed
   live over the WS (output, tool calls, results, errors). On page load / session
   select the prior conversation is backfilled from `GET /sessions/:id/history`

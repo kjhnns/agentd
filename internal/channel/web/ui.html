@@ -58,6 +58,11 @@
   .sess.active{background:var(--chip);border-color:var(--line)}
   .sess .t{font-weight:600;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .sess .m{font-size:11.5px;color:var(--muted);display:flex;gap:.4rem;align-items:center;margin-top:.15rem}
+  .sess.past{opacity:.78}
+  .sess.past .t{font-weight:500}
+  .sess .pv{font-size:11.5px;color:var(--muted);margin-top:.2rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cbtn{font-size:11px;padding:.1rem .45rem;border-radius:6px;margin-left:auto}
+  h2.pasthead{padding-top:.9rem}
   .pill{font-size:10.5px;padding:.05rem .4rem;border-radius:999px;background:var(--chip);border:1px solid var(--line)}
   .pill.idle{color:var(--muted)} .pill.thinking{color:var(--accent)} .pill.error{color:var(--err)}
   .bar{height:5px;border-radius:3px;background:var(--line);overflow:hidden;margin-top:.35rem}
@@ -198,7 +203,7 @@
   const urlToken = url.searchParams.get("token");
   if(urlToken){ url.searchParams.delete("token"); history.replaceState({}, "", url.toString()); }
 
-  const state = { sessions:[], active:null, transportOK:false, notifs:[], ws:null };
+  const state = { sessions:[], past:[], pastIds:{}, active:null, transportOK:false, notifs:[], ws:null };
 
   async function api(path, opts={}){
     const r = await fetch(path, Object.assign({credentials:"same-origin",headers:{"Content-Type":"application/json"}}, opts));
@@ -256,11 +261,15 @@
   function renderSessions(){
     const list = $("#sesslist"); if(!list) return;
     $("#tdot").className = "dot "+(state.transportOK?"up":"down");
-    if(!state.sessions.length){ list.replaceChildren(h("div",{class:"empty"},"No sessions yet.")); return; }
-    list.replaceChildren(...state.sessions.map(s=>{
+    if(!state.sessions.length && !state.past.length){ list.replaceChildren(h("div",{class:"empty"},"No sessions yet.")); return; }
+    const rows = state.sessions.map(s=>{
       const st = s.status||"idle";
+      // A continuation carries its source in the title ("continued:<id>");
+      // show a friendly label that still links back to the source id.
+      const title = (s.title||"").indexOf("continued:")===0
+        ? "continued from "+s.title.slice(10,18)+"…" : (s.title||s.id);
       return h("div",{class:"sess"+(s.id===state.active?" active":""),onclick:()=>{state.active=s.id;renderSessions();renderConv();loadHistory(s.id);}},
-        h("div",{class:"t"}, esc(s.title||s.id)),
+        h("div",{class:"t"}, esc(title)),
         h("div",{class:"m"},
           h("span",{class:"pill "+st}, st),
           h("span",{}, "turns "+(s.turns||0)),
@@ -268,7 +277,42 @@
         ),
         h("div",{class:"bar"}, h("i",{style:"width:"+fmtPct(s.pressure)}))
       );
-    }));
+    });
+    if(state.past.length){
+      rows.push(h("h2",{class:"pasthead"},"Past sessions"));
+      for(const p of state.past){
+        rows.push(h("div",{class:"sess past"+(p.id===state.active?" active":""),
+            onclick:()=>{state.active=p.id;renderSessions();renderConv();loadHistory(p.id);}},
+          h("div",{class:"t"}, esc(p.title||p.id)),
+          h("div",{class:"m"},
+            h("span",{}, p.last_ts? new Date(p.last_ts).toLocaleString():""),
+            h("span",{}, "turns "+(p.turns||0)),
+            h("button",{class:"cbtn",onclick:e=>{e.stopPropagation();continuePast(p.id);}},"Continue")
+          ),
+          p.preview? h("div",{class:"pv"}, esc(p.preview)) : null
+        ));
+      }
+    }
+    list.replaceChildren(...rows);
+  }
+
+  // Past sessions: no longer live (idle-GC or daemon restart) but preserved in
+  // the run-log. Read-only in the conversation pane (via the history endpoint);
+  // "Continue" resumes one as a NEW seeded live session.
+  async function loadPast(){
+    try{
+      const r = await api("/sessions/past");
+      state.past = (await r.json())||[];
+      state.pastIds = {}; for(const p of state.past) state.pastIds[p.id]=true;
+      renderSessions();
+    }catch(e){ if(e&&e.unauth) renderLogin(); }
+  }
+  async function continuePast(id){
+    try{
+      const r = await api("/sessions/"+encodeURIComponent(id)+"/continue",{method:"POST",body:"{}"});
+      const j = await r.json();
+      if(j && j.id){ state.active=j.id; await refreshSessions(); await loadPast(); renderConv(); }
+    }catch(e){ if(e&&e.unauth) renderLogin(); }
   }
 
   // Per-session event log kept client-side, keyed by session id.
@@ -375,10 +419,22 @@
 
   function send(){
     const ta = $("#input"); const text = ta.value.trim(); if(!text) return;
+    if(state.active && state.pastIds[state.active]){
+      state.notifs.unshift({source:"web", level:"info", ts:new Date().toISOString(),
+        text:"Past session is read-only. Use Continue to resume it as a new session."});
+      renderNotifs(); return;
+    }
     ta.value="";
     // Echo my message locally under the active (or soon-to-be web) session.
     pushLocal(state.active||"", {_me:true,text});
-    if(state.ws && state.ws.readyState===1){ state.ws.send(JSON.stringify({type:"input",text})); }
+    // A selected LIVE session gets the turn directly (so continued sessions are
+    // addressable); with nothing selected, the WS input path lazily creates the
+    // warm web session via RouteInbound as before.
+    const live = state.sessions.some(s=>s.id===state.active);
+    if(live){
+      api("/sessions/"+encodeURIComponent(state.active)+"/input",{method:"POST",body:JSON.stringify({text})})
+        .catch(e=>{ if(e&&e.unauth) renderLogin(); });
+    } else if(state.ws && state.ws.readyState===1){ state.ws.send(JSON.stringify({type:"input",text})); }
   }
 
   function connectWS(){
@@ -399,8 +455,10 @@
     try{ await api("/health"); }catch(e){ if(e&&e.unauth){ renderLogin(); return; } }
     renderShell();
     await refreshSessions();
+    loadPast();
     connectWS();
     setInterval(refreshSessions, 5000);
+    setInterval(loadPast, 30000); // past list changes rarely (GC/restart); cheap poll
   }
   boot();
 })();

@@ -441,6 +441,10 @@ func serve(args []string) {
 	}
 	adapter := claudecode.New("claude").WithContextWindow(cfg.Session.ContextWindow)
 	mgr := session.NewManager(adapter, bus, rl)
+	mgr.DefaultModel = model
+	if len(cfg.Harness) > 0 {
+		mgr.DefaultCwd = cfg.Harness[0].Cwd
+	}
 	if len(cfg.Harness) > 0 {
 		mgr.SkipPermissions = cfg.Harness[0].SkipPermissions
 	}

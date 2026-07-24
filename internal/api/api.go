@@ -46,7 +46,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) routes() {
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/sessions", s.handleSessions)        // GET list, POST create
-	s.mux.HandleFunc("/sessions/", s.handleSessionSubpath) // /:id, /:id/input, /:id/events, /:id/history, /:id/interrupt
+	s.mux.HandleFunc("/sessions/", s.handleSessionSubpath) // /past, /:id, /:id/input, /:id/events, /:id/history, /:id/continue, /:id/interrupt
 	s.mux.HandleFunc("/jobs", s.handleJobs)                // GET list
 	s.mux.HandleFunc("/jobs/", s.handleJobSubpath)         // /:name/run (POST), /:name/runs (GET)
 	s.mux.HandleFunc("/hooks/", s.handleHook)              // POST /hooks/:job (webhook trigger)
@@ -152,6 +152,10 @@ func (s *Server) handleSessionSubpath(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 2 {
 		sub = parts[1]
 	}
+	if id == "past" && sub == "" {
+		s.handlePastSessions(w, r)
+		return
+	}
 	switch sub {
 	case "":
 		if r.Method == http.MethodDelete {
@@ -193,9 +197,54 @@ func (s *Server) handleSessionSubpath(w http.ResponseWriter, r *http.Request) {
 		s.handleEvents(w, r, id)
 	case "history":
 		s.handleHistory(w, r, id)
+	case "continue":
+		s.handleContinue(w, r, id)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
+}
+
+// handlePastSessions lists sessions derivable from the run-log that are no
+// longer live (idle-GC reclaimed or pre-restart), most recent first, capped at
+// session.PastSessionsMaxList (?limit=N narrows): GET /sessions/past.
+func (s *Server) handlePastSessions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	list, err := s.mgr.PastSessions(limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// handleContinue starts a NEW live session seeded with a compact rendering of
+// a past session's conversation (POST /sessions/:id/continue). This is
+// continue-as-new-session: the source id is not resurrected (attach-survives-
+// restart is a reserved future design); the new session is titled
+// "continued:<source id>" and its first turn (running in the background when
+// this returns) delivers the transcript to the model.
+func (s *Server) handleContinue(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sess, err := s.mgr.Continue(r.Context(), id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{
+		"id": sess.ID, "source": id, "title": sess.Title, "status": "continuing",
+	})
 }
 
 // handleHistory replays a session's prior conversation from the durable
