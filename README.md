@@ -429,6 +429,34 @@ curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer change-me-bea
   http://127.0.0.1:8787/ui                                                                          # 200
 ```
 
+## Ops note: how this runs on Joe's Mac (2026-07-24)
+
+Deployed IN PARALLEL with the legacy tg-bridge stack (coexistence, not
+migration; tg-bridge and its watchdogs are untouched).
+
+- **Port:** `127.0.0.1:8788`. NOT the example's 8787 — that port is taken by
+  the clawd monitoring detail-dashboard on this machine.
+- **Runtime home:** `~/.agentd/` — binary at `~/.agentd/bin/agentd`, real
+  config at `~/.agentd/config.toml` (chmod 600), state (run-log, scheduler
+  JSONL) under `~/.agentd/state/`. The repo checkout in `~/Documents/agentd`
+  is source only; rebuild with `go build -o agentd ./cmd/agentd` and copy the
+  binary to `~/.agentd/bin/` to deploy.
+- **LaunchAgent:** label `com.joe_pa.agentd`, plist
+  `~/Library/LaunchAgents/com.joe_pa.agentd.plist`, `KeepAlive true`, stdout +
+  stderr to `/Users/johannes/clawd/logs/agentd.log`. Manage with
+  `launchctl bootstrap|bootout gui/$(id -u) ...` and
+  `launchctl kickstart gui/$(id -u)/com.joe_pa.agentd`.
+- **Workspace:** `~/agentd-workspace/main` (its own git repo). Deliberately
+  NOT `~/clawd` — the live PA workspace is never shared with a parallel setup.
+- **Secrets:** in `pass` — `agentd/web-token` (the API bearer) and
+  `agentd/telegram-token` (a dedicated bot, NOT the tg-bridge bot; two pollers
+  on one token = getUpdates 409). Never in git; `config.toml` is gitignored.
+- **Learning (macOS TCC):** launching the daemon from `~/Documents` via
+  launchd WEDGES AT EXEC — the background process hangs inside dyld's `open()`
+  of the binary (TCC-protected folder, kernel-side hang, not an error). Run
+  launchd-managed binaries and their configs from a non-TCC path such as
+  `~/.agentd/`; this is why the runtime home above exists.
+
 ## Design doc
 
 The full architecture, the five documented failure classes it fixes, the migration
