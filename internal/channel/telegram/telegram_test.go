@@ -41,26 +41,8 @@ func TestAllowlistEnforcement(t *testing.T) {
 	}
 }
 
-func msgFrom(chatID int64, text string) *struct {
-	MessageID int64 `json:"message_id"`
-	Chat      struct {
-		ID int64 `json:"id"`
-	} `json:"chat"`
-	Text           string `json:"text"`
-	ReplyToMessage *struct {
-		MessageID int64 `json:"message_id"`
-	} `json:"reply_to_message"`
-} {
-	m := &struct {
-		MessageID int64 `json:"message_id"`
-		Chat      struct {
-			ID int64 `json:"id"`
-		} `json:"chat"`
-		Text           string `json:"text"`
-		ReplyToMessage *struct {
-			MessageID int64 `json:"message_id"`
-		} `json:"reply_to_message"`
-	}{Text: text}
+func msgFrom(chatID int64, text string) *tgMessage {
+	m := &tgMessage{Text: text}
 	m.Chat.ID = chatID
 	return m
 }

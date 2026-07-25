@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/kjhnns/agentd/internal/channel"
 	"github.com/kjhnns/agentd/internal/eventbus"
 	"github.com/kjhnns/agentd/internal/harness"
+	"github.com/kjhnns/agentd/internal/media"
 	"github.com/kjhnns/agentd/internal/runlog"
 	"github.com/kjhnns/agentd/internal/workspace"
 )
@@ -427,6 +429,35 @@ func (m *Manager) Teardown(id string) error {
 	return err
 }
 
+// RenderInbound builds the canonical turn text from an inbound message's Text
+// plus its media artifact references. This is THE session-layer injection point
+// for multimodal input (channel-agnostic by design): every channel's artifacts
+// render identically, and adapters never pre-bake these markers themselves.
+//   - image:    a pointer to the saved file the agent Reads with its own tools
+//   - document: the same pointer, annotated with name/mime/size
+//   - audio:    the transcript inline (the file is already deleted on success)
+func RenderInbound(in channel.InboundMsg) string {
+	parts := make([]string, 0, 1+len(in.Media))
+	if t := strings.TrimSpace(in.Text); t != "" {
+		parts = append(parts, t)
+	}
+	for _, a := range in.Media {
+		switch a.Kind {
+		case media.KindImage:
+			parts = append(parts, fmt.Sprintf(
+				"[The user sent an image saved at %s. Use the Read tool to view it, then respond.]", a.Path))
+		case media.KindAudio:
+			parts = append(parts, fmt.Sprintf(
+				"[voice message, %ds, transcribed]: %s", a.DurationS, a.Transcript))
+		default: // document
+			parts = append(parts, fmt.Sprintf(
+				"[The user sent a document saved at %s (name: %s, type: %s, size: %d bytes). Use the Read tool to view it, then respond.]",
+				a.Path, a.Name, a.Mime, a.Size))
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
 // RouteInbound wires a channel inbound message to a session and sends the harness
 // result back through the channel. It reuses one session per chat id (created on
 // first message). This is the end-to-end path.
@@ -457,8 +488,9 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	defer m.bus.Unsubscribe(subID)
 
 	turnErr := make(chan error, 1)
+	turnText := RenderInbound(in)
 	go func() {
-		_, err := m.Send(ctx, id, in.Text)
+		_, err := m.Send(ctx, id, turnText)
 		turnErr <- err
 	}()
 

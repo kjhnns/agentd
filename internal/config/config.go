@@ -82,11 +82,35 @@ type Job struct {
 	Poll      time.Duration // file poll interval (default 10s)
 }
 
+// Media is the [media] table: the CORE multimodal media capability
+// (internal/media). Channel-agnostic by design; channels only acquire bytes.
+type Media struct {
+	Enabled      bool          // default true; false parks all media handling
+	WhisperKey   string        // OpenAI API key: literal or "env:VAR" (ResolveToken)
+	WhisperModel string        // default "whisper-1"
+	WhisperLang  string        // optional ISO-639-1 hint; "" = auto-detect
+	MaxFileMB    int           // per-file cap in MB (default 20)
+	Retention    time.Duration // media files older than this are swept (default 168h)
+	Dir          string        // storage override; empty = <default workspace>/work/media
+}
+
+// DefaultMedia returns the built-in media settings applied when [media] is
+// absent or partial.
+func DefaultMedia() Media {
+	return Media{
+		Enabled:      true,
+		WhisperModel: "whisper-1",
+		MaxFileMB:    20,
+		Retention:    168 * time.Hour,
+	}
+}
+
 // Config is the whole parsed file.
 type Config struct {
 	Server    Server
 	Workspace Workspace
 	Session   Session
+	Media     Media
 	Harness   []Harness
 	Channel   []Channel
 	Job       []Job
@@ -131,6 +155,7 @@ func Parse(data []byte) (*Config, error) {
 		Server:    Server{Bind: "127.0.0.1:8787", StateDir: "state"},
 		Workspace: Workspace{GitAutocommit: true}, // Root/Default resolved by workspace.NewStore
 		Session:   DefaultSession(),
+		Media:     DefaultMedia(),
 	}
 	section := "" // "server" or "" (top-level)
 	var curHarness *Harness
@@ -283,6 +308,46 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 			cfg.Session.CheckpointTimeout = d
 		default:
 			return fmt.Errorf("unknown [session] key %q", key)
+		}
+	case "media":
+		switch key {
+		case "enabled":
+			b, err := asBool(raw)
+			if err != nil {
+				return fmt.Errorf("enabled: %w", err)
+			}
+			cfg.Media.Enabled = b
+			return nil
+		case "max_file_mb":
+			n, err := asInt(raw)
+			if err != nil {
+				return fmt.Errorf("max_file_mb: %w", err)
+			}
+			cfg.Media.MaxFileMB = int(n)
+			return nil
+		case "retention":
+			d, err := asDuration(raw)
+			if err != nil {
+				return fmt.Errorf("retention: %w", err)
+			}
+			cfg.Media.Retention = d
+			return nil
+		}
+		s, err := asString(raw)
+		if err != nil {
+			return err
+		}
+		switch key {
+		case "whisper_key":
+			cfg.Media.WhisperKey = s
+		case "whisper_model":
+			cfg.Media.WhisperModel = s
+		case "whisper_lang":
+			cfg.Media.WhisperLang = s
+		case "media_dir":
+			cfg.Media.Dir = s
+		default:
+			return fmt.Errorf("unknown [media] key %q", key)
 		}
 	case "harness":
 		if key == "skip_permissions" {

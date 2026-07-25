@@ -34,6 +34,7 @@ import (
 	"github.com/kjhnns/agentd/internal/eventbus"
 	"github.com/kjhnns/agentd/internal/harness"
 	"github.com/kjhnns/agentd/internal/harness/claudecode"
+	"github.com/kjhnns/agentd/internal/media"
 	"github.com/kjhnns/agentd/internal/notify"
 	"github.com/kjhnns/agentd/internal/runlog"
 	"github.com/kjhnns/agentd/internal/scheduler"
@@ -478,6 +479,46 @@ func serve(args []string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Media: the CORE multimodal capability (internal/media). Storage defaults
+	// to <default workspace>/work/media (gitignored inside the workspace repo so
+	// autocommit never sweeps binaries into history); voice transcription is
+	// wired when a whisper key resolves, otherwise audio ingest fails typed and
+	// the channel apologizes. Channels only ACQUIRE bytes; rendering into turn
+	// text happens once, in session.RenderInbound.
+	var mediaSvc *media.Service
+	if cfg.Media.Enabled {
+		mediaDir := cfg.Media.Dir
+		if mediaDir == "" {
+			ws, err := mgr.Workspaces.Ensure("")
+			if err != nil {
+				log.Printf("agentd: media disabled: cannot resolve default workspace: %v", err)
+			} else {
+				mediaDir = filepath.Join(ws.WorkDir(), "media")
+				if err := media.EnsureGitignoreLine(ws.Root, "work/media/"); err != nil {
+					log.Printf("agentd: could not gitignore work/media/ in workspace %s: %v", ws.Name, err)
+				}
+			}
+		}
+		if mediaDir != "" {
+			var tr media.Transcriber
+			if key := config.ResolveToken(cfg.Media.WhisperKey); key != "" {
+				tr = media.NewWhisper(key, cfg.Media.WhisperModel, cfg.Media.WhisperLang)
+			} else {
+				log.Printf("agentd: media enabled but whisper_key empty; voice transcription disabled")
+			}
+			mediaSvc = &media.Service{
+				Dir:         mediaDir,
+				MaxBytes:    int64(cfg.Media.MaxFileMB) << 20,
+				Retention:   cfg.Media.Retention,
+				Transcriber: tr,
+				Log:         rl,
+			}
+			mediaSvc.StartSweeper(ctx)
+			log.Printf("agentd: media service at %s (cap %d MB, retention %s, whisper=%v)",
+				mediaDir, cfg.Media.MaxFileMB, cfg.Media.Retention, tr != nil)
+		}
+	}
+
 	// Session GC/sweeper: enforces idle_timeout (checkpoint-flush + reclaim) and
 	// recovers dead sessions on a ticker. Reset triggers (pressure/turns/
 	// wallclock) fire after each completed turn, in Manager.Send.
@@ -526,6 +567,7 @@ func serve(args []string) {
 	var transportUp atomic.Bool
 	srv := api.New(cfg.Server.APIBearer, mgr, bus, func() bool { return transportUp.Load() })
 	srv.AttachScheduler(sched)
+	srv.AttachMedia(mediaSvc)
 
 	cwd := ""
 	if len(cfg.Harness) > 0 {
@@ -548,6 +590,9 @@ func serve(args []string) {
 				continue
 			}
 			tg = telegram.New(token, c.Allow)
+			if mediaSvc != nil {
+				tg.WithMedia(mediaSvc)
+			}
 			if err := tg.Start(ctx); err != nil {
 				log.Printf("agentd: telegram start failed: %v", err)
 				continue

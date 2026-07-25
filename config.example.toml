@@ -39,6 +39,25 @@ gc_interval        = "1m"
 # starts fresh anyway (a wedged flush never strands the session).
 checkpoint_timeout = "120s"
 
+# Media: the CORE multimodal capability (internal/media), channel-agnostic by
+# design. Inbound voice / photos / documents from ANY channel are ingested here
+# (storage under <default workspace>/work/media/<source>/, gitignored in the
+# workspace repo), classified, size-capped, and audio is transcribed via the
+# OpenAI Whisper API during ingest (the transcript is the artifact; the audio
+# file is deleted on success, kept on failure). The SESSION layer renders
+# artifact markers into the turn text; channels only acquire bytes. A retention
+# sweeper deletes stored media after `retention`. Omit the block for defaults.
+[media]
+enabled       = true
+# OpenAI API key for Whisper: literal or "env:VAR" (same indirection as channel
+# tokens). Empty = voice stays wired but disabled (senders get a polite reply).
+whisper_key   = "env:OPENAI_API_KEY"
+whisper_model = "whisper-1"
+whisper_lang  = ""               # ISO-639-1 hint (e.g. "de"); empty = auto-detect
+max_file_mb   = 20               # per-file cap (Telegram's Bot API caps downloads at 20 MB anyway)
+retention     = "168h"           # media older than this is swept (transcripts live in the session, not here)
+# media_dir   = ""               # storage override; empty = <default workspace>/work/media
+
 # One harness entry. Only "claude-code" is implemented in this scaffold.
 # A second adapter (e.g. codex) is a drop-in later; the interface is ready.
 [[harness]]

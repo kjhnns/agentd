@@ -198,3 +198,62 @@ checkpoint_timeout = "90s"
 		t.Fatalf("session defaults not applied: %+v", def.Session)
 	}
 }
+
+func TestParseMediaBlockDefaultsAndOverrides(t *testing.T) {
+	// No [media] block: full defaults.
+	cfg, err := Parse([]byte("[server]\nbind = \"127.0.0.1:1\"\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !cfg.Media.Enabled || cfg.Media.WhisperModel != "whisper-1" ||
+		cfg.Media.MaxFileMB != 20 || cfg.Media.Retention != 168*time.Hour ||
+		cfg.Media.WhisperLang != "" || cfg.Media.Dir != "" {
+		t.Errorf("media defaults wrong: %+v", cfg.Media)
+	}
+
+	// Explicit block round-trips every key.
+	src := `
+[media]
+enabled       = true
+whisper_key   = "env:OPENAI_API_KEY"
+whisper_model = "whisper-1"
+whisper_lang  = "de"
+max_file_mb   = 15
+retention     = "72h"
+media_dir     = "/tmp/agentd-media"
+`
+	cfg, err = Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	m := cfg.Media
+	if m.WhisperKey != "env:OPENAI_API_KEY" || m.WhisperLang != "de" ||
+		m.MaxFileMB != 15 || m.Retention != 72*time.Hour || m.Dir != "/tmp/agentd-media" {
+		t.Errorf("media = %+v", m)
+	}
+
+	// whisper_key supports the same env: indirection as channel tokens.
+	os.Setenv("AGENTD_TEST_WHISPER", "sk-live-123")
+	defer os.Unsetenv("AGENTD_TEST_WHISPER")
+	if got := ResolveToken("env:AGENTD_TEST_WHISPER"); got != "sk-live-123" {
+		t.Errorf("ResolveToken = %q", got)
+	}
+	if got := ResolveToken("sk-literal"); got != "sk-literal" {
+		t.Errorf("literal ResolveToken = %q", got)
+	}
+
+	// Strict key switch: unknown [media] key is rejected.
+	if _, err := Parse([]byte("[media]\nbogus = \"x\"\n")); err == nil {
+		t.Error("expected error for unknown [media] key")
+	}
+}
+
+func TestParseMediaEnabledFalse(t *testing.T) {
+	cfg, err := Parse([]byte("[media]\nenabled = false\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Media.Enabled {
+		t.Error("enabled = true, want false")
+	}
+}

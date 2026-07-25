@@ -237,10 +237,15 @@
       ),
       h("div",{class:"wrap"},
         h("div",{class:"col sessions"}, h("h2",{},"Sessions"), h("div",{class:"scroll",id:"sesslist"})),
-        h("div",{class:"col conv-col"},
+        h("div",{class:"col conv-col",
+            ondragover:e=>{ e.preventDefault(); },
+            ondrop:e=>{ e.preventDefault(); const f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0]; if(f) uploadFile(f); }},
           h("div",{class:"conv",id:"conv"}, h("div",{class:"empty"},"Pick or start a session, then type below.")),
           h("div",{class:"composer"},
-            h("textarea",{id:"input",placeholder:"Message the agent…  (Enter to send)",
+            h("input",{id:"file",type:"file",style:"display:none",
+              onchange:e=>{ const f=e.target.files&&e.target.files[0]; if(f) uploadFile(f); e.target.value=""; }}),
+            h("button",{title:"Attach a file (image, audio, document)",onclick:()=>$("#file").click()},"\u{1F4CE}"),
+            h("textarea",{id:"input",placeholder:"Message the agent…  (Enter to send, drop a file to attach)",
               onkeydown:e=>{ if(e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); send(); } }}),
             h("button",{class:"primary",onclick:send},"Send")
           )
@@ -435,6 +440,39 @@
       api("/sessions/"+encodeURIComponent(state.active)+"/input",{method:"POST",body:JSON.stringify({text})})
         .catch(e=>{ if(e&&e.unauth) renderLogin(); });
     } else if(state.ws && state.ws.readyState===1){ state.ws.send(JSON.stringify({type:"input",text})); }
+  }
+
+  // Media upload: POST the file (multipart, with the composer text if any) to
+  // /sessions/:id/media on the LIVE active session, creating one first if
+  // needed. The server ingests via the core media service and routes the
+  // artifact as an ordinary turn; the reply streams back over the WS.
+  async function uploadFile(f){
+    try{
+      let sid = state.active;
+      const live = state.sessions.some(s=>s.id===sid);
+      if(!live){
+        const r = await api("/sessions",{method:"POST",body:JSON.stringify({title:"web session"})});
+        const j = await r.json(); sid = j.id; state.active = sid; await refreshSessions();
+      }
+      const ta = $("#input"); const text = ta.value.trim(); ta.value = "";
+      pushLocal(sid, {_me:true, text:(text? text+"\n":"")+"\u{1F4CE} "+f.name+" ("+Math.round(f.size/1024)+" KB)"});
+      const fd = new FormData();
+      fd.append("file", f, f.name);
+      if(text) fd.append("text", text);
+      const resp = await fetch("/sessions/"+encodeURIComponent(sid)+"/media",{
+        method:"POST", body:fd, credentials:"same-origin"});
+      if(resp.status===401){ renderLogin(); return; }
+      if(!resp.ok){
+        const msg = (await resp.text()).slice(0,300);
+        state.notifs.unshift({source:"media", level:"issue", ts:new Date().toISOString(),
+          text:"Upload of "+f.name+" failed ("+resp.status+"): "+msg});
+        renderNotifs();
+      }
+    }catch(e){
+      state.notifs.unshift({source:"media", level:"issue", ts:new Date().toISOString(),
+        text:"Upload of "+f.name+" failed: "+e});
+      renderNotifs();
+    }
   }
 
   function connectWS(){

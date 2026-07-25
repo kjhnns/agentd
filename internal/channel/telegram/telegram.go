@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,8 +20,13 @@ import (
 	"time"
 
 	"github.com/kjhnns/agentd/internal/channel"
+	"github.com/kjhnns/agentd/internal/media"
 	"github.com/kjhnns/agentd/internal/notify"
 )
+
+// botAPIMaxDownload is the Bot API's own getFile ceiling: bots cannot download
+// files over 20 MB regardless of our configured cap.
+const botAPIMaxDownload = 20 << 20
 
 // Adapter is the Telegram channel adapter.
 type Adapter struct {
@@ -30,6 +36,7 @@ type Adapter struct {
 	client  *http.Client
 	inbound chan channel.InboundMsg
 	offset  int64
+	media   *media.Service // nil = media handling disabled (polite decline)
 }
 
 // New builds a Telegram adapter. allow is the chat-id allowlist (server-enforced).
@@ -45,6 +52,14 @@ func New(token string, allow []string) *Adapter {
 		client:  &http.Client{Timeout: 65 * time.Second},
 		inbound: make(chan channel.InboundMsg, 64),
 	}
+}
+
+// WithMedia wires the core media service; the adapter then ACQUIRES voice/
+// photo/document payloads (getFile + streamed download) and hands them to
+// media.Ingest. Without it, media messages get a polite decline.
+func (a *Adapter) WithMedia(svc *media.Service) *Adapter {
+	a.media = svc
+	return a
 }
 
 func (a *Adapter) Name() string        { return "telegram" }
@@ -99,17 +114,57 @@ func (a *Adapter) pollLoop(ctx context.Context) {
 
 // tgUpdate is the subset of a Telegram Update we consume.
 type tgUpdate struct {
-	UpdateID int64 `json:"update_id"`
-	Message  *struct {
+	UpdateID int64      `json:"update_id"`
+	Message  *tgMessage `json:"message"`
+}
+
+// tgMessage is the subset of a Telegram Message we consume: text plus the
+// supported media kinds (voice / photo / document with optional caption) and
+// presence-only markers for the unsupported kinds we politely decline.
+type tgMessage struct {
+	MessageID int64 `json:"message_id"`
+	Chat      struct {
+		ID int64 `json:"id"`
+	} `json:"chat"`
+	Text           string        `json:"text"`
+	Caption        string        `json:"caption"`
+	Voice          *tgVoice      `json:"voice"`
+	Photo          []tgPhotoSize `json:"photo"`
+	Document       *tgDocument   `json:"document"`
+	Video          *tgFileRef    `json:"video"`
+	VideoNote      *tgFileRef    `json:"video_note"`
+	Sticker        *tgFileRef    `json:"sticker"`
+	Audio          *tgFileRef    `json:"audio"`
+	Animation      *tgFileRef    `json:"animation"`
+	ReplyToMessage *struct {
 		MessageID int64 `json:"message_id"`
-		Chat      struct {
-			ID int64 `json:"id"`
-		} `json:"chat"`
-		Text           string `json:"text"`
-		ReplyToMessage *struct {
-			MessageID int64 `json:"message_id"`
-		} `json:"reply_to_message"`
-	} `json:"message"`
+	} `json:"reply_to_message"`
+}
+
+type tgVoice struct {
+	FileID   string `json:"file_id"`
+	Duration int    `json:"duration"`
+	MimeType string `json:"mime_type"`
+	FileSize int64  `json:"file_size"`
+}
+
+type tgPhotoSize struct {
+	FileID   string `json:"file_id"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+	FileSize int64  `json:"file_size"`
+}
+
+type tgDocument struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	MimeType string `json:"mime_type"`
+	FileSize int64  `json:"file_size"`
+}
+
+// tgFileRef marks the presence of an unsupported attachment kind.
+type tgFileRef struct {
+	FileID string `json:"file_id"`
 }
 
 func (a *Adapter) getUpdates(ctx context.Context) ([]tgUpdate, error) {
@@ -143,12 +198,14 @@ func (a *Adapter) getUpdates(ctx context.Context) ([]tgUpdate, error) {
 	return out.Result, nil
 }
 
-// handleUpdate advances the offset, enforces the allowlist, and emits inbound.
+// handleUpdate advances the offset, enforces the allowlist, and dispatches the
+// message. Media handling (getFile + download + ingest + transcription) runs in
+// a GOROUTINE so a slow Whisper call never stalls the poll loop.
 func (a *Adapter) handleUpdate(u tgUpdate) {
 	if u.UpdateID >= a.offset {
 		a.offset = u.UpdateID + 1
 	}
-	if u.Message == nil || u.Message.Text == "" {
+	if u.Message == nil {
 		return
 	}
 	chatID := strconv.FormatInt(u.Message.Chat.ID, 10)
@@ -156,19 +213,183 @@ func (a *Adapter) handleUpdate(u tgUpdate) {
 		log.Printf("telegram: dropping message from non-allowlisted chat %s", chatID)
 		return
 	}
+	m := u.Message
+	switch {
+	case m.Voice != nil, len(m.Photo) > 0, m.Document != nil:
+		go a.processMedia(context.Background(), m, chatID)
+	case m.Video != nil, m.VideoNote != nil, m.Sticker != nil, m.Audio != nil, m.Animation != nil:
+		// Unsupported kinds get a polite one-line decline, never silence (the
+		// old code dropped every non-text message on the floor).
+		go a.replyText(chatID, "Sorry, I can only handle text, voice messages, photos, and documents right now.")
+	case m.Text != "":
+		a.emitInbound(m, chatID, m.Text, nil)
+	}
+}
+
+// emitInbound builds and queues the normalized InboundMsg.
+func (a *Adapter) emitInbound(m *tgMessage, chatID, text string, art *media.Artifact) {
 	msg := channel.InboundMsg{
 		Channel: "telegram",
 		UserID:  chatID,
-		Text:    u.Message.Text,
+		Text:    text,
 	}
-	if u.Message.ReplyToMessage != nil {
-		msg.ReplyTo = strconv.FormatInt(u.Message.ReplyToMessage.MessageID, 10)
+	if art != nil {
+		msg.Media = []media.Artifact{*art}
+	}
+	if m.ReplyToMessage != nil {
+		msg.ReplyTo = strconv.FormatInt(m.ReplyToMessage.MessageID, 10)
 	}
 	select {
 	case a.inbound <- msg:
 	default:
 		log.Printf("telegram: inbound buffer full, dropping message from %s", chatID)
 	}
+}
+
+// replyText sends a short best-effort service reply (declines, failures).
+func (a *Adapter) replyText(chatID, text string) {
+	if _, err := a.Send(context.Background(), channel.OutboundMsg{ChatID: chatID, Text: text}); err != nil {
+		log.Printf("telegram: service reply to %s failed: %v", chatID, err)
+	}
+}
+
+// processMedia is ACQUISITION ONLY (design: media is a core capability;
+// channels just fetch bytes): resolve the file reference, stream-download it
+// with the size cap, hand it to media.Ingest, and emit the artifact on the
+// inbound channel with the caption as the text. Every failure produces a short
+// reply to the sender; silence is never an outcome.
+func (a *Adapter) processMedia(ctx context.Context, m *tgMessage, chatID string) {
+	if a.media == nil {
+		a.replyText(chatID, "Sorry, media handling is not enabled on this bot yet.")
+		return
+	}
+	var (
+		fileID   string
+		filename string
+		mimeType string
+		declared int64
+		duration int
+	)
+	switch {
+	case m.Voice != nil:
+		fileID = m.Voice.FileID
+		filename = fmt.Sprintf("voice-%d.oga", m.MessageID)
+		mimeType = m.Voice.MimeType
+		if mimeType == "" {
+			mimeType = "audio/ogg"
+		}
+		declared = m.Voice.FileSize
+		duration = m.Voice.Duration
+	case len(m.Photo) > 0:
+		largest := m.Photo[0]
+		for _, p := range m.Photo[1:] {
+			if p.FileSize > largest.FileSize ||
+				(p.FileSize == largest.FileSize && p.Width*p.Height > largest.Width*largest.Height) {
+				largest = p
+			}
+		}
+		fileID = largest.FileID
+		filename = fmt.Sprintf("photo-%d.jpg", m.MessageID)
+		mimeType = "image/jpeg"
+		declared = largest.FileSize
+	case m.Document != nil:
+		fileID = m.Document.FileID
+		filename = m.Document.FileName
+		if filename == "" {
+			filename = fmt.Sprintf("document-%d", m.MessageID)
+		}
+		mimeType = m.Document.MimeType
+		declared = m.Document.FileSize
+	default:
+		return
+	}
+
+	cap := a.media.MaxBytes
+	if cap <= 0 || cap > botAPIMaxDownload {
+		cap = botAPIMaxDownload // Bot API hard limit
+	}
+	if declared > cap {
+		a.replyText(chatID, fmt.Sprintf("Sorry, that file is too large for me (limit %d MB).", cap>>20))
+		return
+	}
+
+	body, err := a.downloadFile(ctx, fileID)
+	if err != nil {
+		log.Printf("telegram: media download for chat %s failed: %v", chatID, err)
+		a.replyText(chatID, "Sorry, I couldn't download that file from Telegram. Please try again.")
+		return
+	}
+	defer body.Close()
+
+	art, err := a.media.Ingest(ctx, media.Request{
+		Reader:    io.LimitReader(body, cap+1),
+		Filename:  filename,
+		Mime:      mimeType,
+		Source:    "telegram",
+		ChatLabel: chatID,
+		DurationS: duration,
+	})
+	if err != nil {
+		log.Printf("telegram: media ingest for chat %s failed: %v", chatID, err)
+		switch {
+		case errors.Is(err, media.ErrTooLarge):
+			a.replyText(chatID, fmt.Sprintf("Sorry, that file is too large for me (limit %d MB).", cap>>20))
+		case errors.Is(err, media.ErrUnsupported):
+			a.replyText(chatID, "Sorry, I can't process that file type.")
+		case errors.Is(err, media.ErrTranscribe):
+			a.replyText(chatID, "Sorry, I couldn't transcribe that voice message. I kept the audio; please try again or type it out.")
+		default:
+			a.replyText(chatID, "Sorry, something went wrong handling that file.")
+		}
+		return
+	}
+	a.emitInbound(m, chatID, m.Caption, &art)
+}
+
+// downloadFile resolves a file_id via getFile and opens a streamed download.
+func (a *Adapter) downloadFile(ctx context.Context, fileID string) (io.ReadCloser, error) {
+	q := url.Values{}
+	q.Set("file_id", fileID)
+	endpoint := fmt.Sprintf("%s/bot%s/getFile?%s", a.base, a.token, q.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("getFile HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var out struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			FilePath string `json:"file_path"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, err
+	}
+	if !out.OK || out.Result.FilePath == "" {
+		return nil, fmt.Errorf("getFile not ok: %s", string(body))
+	}
+	dl := fmt.Sprintf("%s/file/bot%s/%s", a.base, a.token, out.Result.FilePath)
+	dreq, err := http.NewRequestWithContext(ctx, http.MethodGet, dl, nil)
+	if err != nil {
+		return nil, err
+	}
+	dresp, err := a.client.Do(dreq)
+	if err != nil {
+		return nil, err
+	}
+	if dresp.StatusCode != http.StatusOK {
+		dresp.Body.Close()
+		return nil, fmt.Errorf("file download HTTP %d", dresp.StatusCode)
+	}
+	return dresp.Body, nil
 }
 
 // Send posts text via the Bot API sendMessage and returns the message id.

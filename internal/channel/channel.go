@@ -6,15 +6,23 @@
 // five failure classes in design section 2.
 package channel
 
-import "context"
+import (
+	"context"
 
-// InboundMsg is a normalized inbound message from any channel.
+	"github.com/kjhnns/agentd/internal/media"
+)
+
+// InboundMsg is a normalized inbound message from any channel. Media carries
+// artifact references produced by the core media service (media.Ingest); the
+// SESSION layer renders them into the canonical turn text
+// (session.RenderInbound). Adapters do acquisition only and MUST NOT pre-bake
+// marker text into Text.
 type InboundMsg struct {
-	Channel string   `json:"channel"`  // "telegram", ...
-	UserID  string   `json:"user_id"`  // chat id / user id (allowlist key)
-	Text    string   `json:"text"`     // message text (UNTRUSTED input)
-	Media   []string `json:"media"`    // media refs (paths/urls); may be empty
-	ReplyTo string   `json:"reply_to"` // id of the message being replied to
+	Channel string           `json:"channel"`  // "telegram", ...
+	UserID  string           `json:"user_id"`  // chat id / user id (allowlist key)
+	Text    string           `json:"text"`     // message text / caption (UNTRUSTED input)
+	Media   []media.Artifact `json:"media"`    // ingested artifacts; may be empty
+	ReplyTo string           `json:"reply_to"` // id of the message being replied to
 }
 
 // OutboundMsg is a normalized outbound message.

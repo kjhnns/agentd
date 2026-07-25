@@ -55,9 +55,12 @@ func (w *Workspace) IsGitRepo() bool {
 
 // gitignore keeps transient noise out of history while TRACKING everything
 // that matters: instructions/, memory/, context.md, and working files.
+// work/media/ holds ingested media binaries (internal/media) which are
+// retention-swept, not versioned.
 const starterGitignore = `.DS_Store
 *.tmp
 *.swp
+work/media/
 `
 
 // GitInit initializes version control for the workspace: git init (if not

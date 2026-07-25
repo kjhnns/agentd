@@ -7,12 +7,15 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/kjhnns/agentd/internal/channel"
 	"github.com/kjhnns/agentd/internal/eventbus"
+	"github.com/kjhnns/agentd/internal/media"
 	"github.com/kjhnns/agentd/internal/scheduler"
 	"github.com/kjhnns/agentd/internal/session"
 )
@@ -28,6 +31,7 @@ type Server struct {
 	bus       *eventbus.Bus
 	transport TransportChecker
 	sched     *scheduler.Scheduler
+	media     *media.Service
 	mux       *http.ServeMux
 }
 
@@ -46,7 +50,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) routes() {
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/sessions", s.handleSessions)        // GET list, POST create
-	s.mux.HandleFunc("/sessions/", s.handleSessionSubpath) // /past, /:id, /:id/input, /:id/events, /:id/history, /:id/continue, /:id/interrupt
+	s.mux.HandleFunc("/sessions/", s.handleSessionSubpath) // /past, /:id, /:id/input, /:id/media, /:id/events, /:id/history, /:id/continue, /:id/interrupt
 	s.mux.HandleFunc("/jobs", s.handleJobs)                // GET list
 	s.mux.HandleFunc("/jobs/", s.handleJobSubpath)         // /:name/run (POST), /:name/runs (GET)
 	s.mux.HandleFunc("/hooks/", s.handleHook)              // POST /hooks/:job (webhook trigger)
@@ -56,6 +60,10 @@ func (s *Server) routes() {
 // /jobs/:name/run, GET /jobs/:name/runs, POST /hooks/:job). Without it those
 // routes answer 503. All routes share the API bearer gate.
 func (s *Server) AttachScheduler(sched *scheduler.Scheduler) { s.sched = sched }
+
+// AttachMedia wires the core media service so POST /sessions/:id/media works.
+// Without it (or with nil) the route answers 503.
+func (s *Server) AttachMedia(svc *media.Service) { s.media = svc }
 
 // Mount registers an extra handler on the shared mux so a channel (e.g. the web
 // UI) is served by the ONE HTTP server behind the SAME bearer gate, on no second
@@ -199,9 +207,70 @@ func (s *Server) handleSessionSubpath(w http.ResponseWriter, r *http.Request) {
 		s.handleHistory(w, r, id)
 	case "continue":
 		s.handleContinue(w, r, id)
+	case "media":
+		s.handleMediaUpload(w, r, id)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
+}
+
+// handleMediaUpload accepts a multipart upload (field "file", optional field
+// "text") for a LIVE session: POST /sessions/:id/media. The bytes go through
+// the SAME core media.Ingest as any channel, then the artifact is rendered by
+// the session layer (session.RenderInbound) and routed as one ordinary turn
+// into the session. The response returns after the turn completes (mirroring
+// /input); the turn's events also stream over the WS as usual.
+func (s *Server) handleMediaUpload(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.media == nil {
+		http.Error(w, "media not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if _, ok := s.mgr.Get(id); !ok {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+	file, hdr, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "missing multipart field \"file\"", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	art, err := s.media.Ingest(r.Context(), media.Request{
+		Reader:    file,
+		Filename:  hdr.Filename,
+		Mime:      hdr.Header.Get("Content-Type"),
+		Source:    "web",
+		ChatLabel: id,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, media.ErrTooLarge):
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+		case errors.Is(err, media.ErrUnsupported):
+			http.Error(w, err.Error(), http.StatusUnsupportedMediaType)
+		case errors.Is(err, media.ErrTranscribe):
+			http.Error(w, err.Error(), http.StatusBadGateway)
+		default:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	text := session.RenderInbound(channel.InboundMsg{
+		Channel: "web",
+		Text:    r.FormValue("text"),
+		Media:   []media.Artifact{art},
+	})
+	if _, err := s.mgr.Send(r.Context(), id, text); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "routed", "id": id, "artifact": art})
 }
 
 // handlePastSessions lists sessions derivable from the run-log that are no

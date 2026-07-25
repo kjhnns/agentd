@@ -378,6 +378,66 @@ What is DEFERRED (explicit non-goals here, separate go/no-go decisions later):
   Workspace section); the server composing/injecting is built, the server
   WRITING memory from transcripts is not.
 
+## Multimodal media: voice, photos, documents (internal/media)
+
+Media is a **CORE agentd capability, not a channel feature**. One service
+(`internal/media`) owns ingestion for every channel; channel adapters do
+**acquisition only** (download bytes from their provider and hand a Reader to
+`media.Ingest`). The session layer renders artifact references into the
+canonical turn text in exactly one place (`session.RenderInbound`), so a photo
+sent over Telegram and a photo uploaded in the web UI produce the identical
+turn for the model. Adapters never pre-bake marker text.
+
+**The pipeline.**
+
+- **Ingest** — `media.Ingest(ctx, Request{Reader, Filename, Mime, Source, ...})`
+  streams the bytes to `<default workspace>/work/media/<source>/` (override with
+  `media_dir`), enforces the `max_file_mb` cap, classifies the artifact
+  (`image` | `audio` | `document`; video is explicitly out of scope), and
+  returns an `Artifact{ID, Path, Kind, Mime, Size, Transcript, ...}`. Failures
+  are TYPED (`ErrTooLarge` / `ErrUnsupported` / `ErrTranscribe`) so channels can
+  reply politely instead of going silent. `work/media/` is gitignored inside the
+  workspace repo so autocommit never versions binaries.
+- **Voice** — audio is transcribed DURING ingest by a minimal, stdlib-only
+  OpenAI Whisper client (`whisper-1`, `response_format=verbose_json`, language
+  auto-detect unless `whisper_lang` is set, 300s timeout). Telegram opus `.oga`
+  posts directly, no ffmpeg. On success the audio file is DELETED — the
+  transcript is the artifact; on failure the file is kept. No `whisper_key` =
+  voice is wired but disabled (typed failure, polite reply).
+- **Session injection** — `RenderInbound` appends, per artifact:
+  images -> `[The user sent an image saved at <path>. Use the Read tool to view
+  it, then respond.]`; documents -> the same pointer annotated with
+  name/mime/size; audio -> `[voice message, <N>s, transcribed]: <transcript>`.
+- **Telegram** — the adapter consumes `voice` / `photo` (largest size) /
+  `document` (+ `caption`), pre-checks the declared size against
+  min(`max_file_mb`, 20 MB Bot API limit), then `getFile` + streamed download ->
+  `Ingest` -> normalized `InboundMsg{Text: caption, Media: [artifact]}`. Each
+  media message is handled in its own goroutine so a slow transcription never
+  stalls the poll loop. Unsupported kinds (video / sticker / audio-file /
+  animation) get a one-line decline; every failure produces a short reply —
+  silence is never an outcome (the old adapter silently dropped all non-text).
+- **Web** — the composer has an attach button (and drag-drop); the file POSTs to
+  `POST /sessions/:id/media` (multipart `file` + optional `text`, same bearer /
+  cookie gate as everything else), goes through the SAME `media.Ingest`, and is
+  routed as an ordinary turn into that session.
+- **Retention** — a sweeper deletes stored media older than `retention`
+  (default 168h). Media events (ingested / transcribed / failed / swept, with
+  byte counts) are recorded in the run-log.
+- **Out of scope (parked):** outbound media sends (`SupportsMedia()` stays
+  false), video/sticker processing, PDF text extraction.
+
+```
+POST /sessions/:id/media  # multipart upload (field "file", optional "text"):
+                          # ingest -> render marker -> route one turn; returns
+                          # {status, artifact} after the turn completes.
+                          # 413 too large, 415 unsupported, 502 transcribe-failed,
+                          # 503 media disabled, 404 unknown session, 401 no bearer.
+```
+
+Configured by the single `[media]` block (`config.example.toml`): `enabled`,
+`whisper_key` (literal or `env:VAR`), `whisper_model`, `whisper_lang`,
+`max_file_mb`, `retention`, `media_dir`.
+
 ## What is actually proven vs stubbed
 
 - **Proven working:** the Claude Code PERSISTENT streaming vertical. A live gated
@@ -474,9 +534,11 @@ migration; tg-bridge and its watchdogs are untouched).
   this Mac; the explicit form is
   `agentd memory index -root /Users/johannes/agentd-workspace -workspace main`
   (flags always win; `-config` / `$AGENTD_CONFIG` override the config path).
-- **Secrets:** in `pass` — `agentd/web-token` (the API bearer) and
+- **Secrets:** in `pass` — `agentd/web-token` (the API bearer),
   `agentd/telegram-token` (a dedicated bot, NOT the tg-bridge bot; two pollers
-  on one token = getUpdates 409). Never in git; `config.toml` is gitignored.
+  on one token = getUpdates 409), and `openai/api-key` (the `[media]`
+  `whisper_key` for voice transcription). All placed as literals in the
+  chmod-600 `~/.agentd/config.toml`. Never in git; `config.toml` is gitignored.
 - **Learning (macOS TCC):** launching the daemon from `~/Documents` via
   launchd WEDGES AT EXEC — the background process hangs inside dyld's `open()`
   of the binary (TCC-protected folder, kernel-side hang, not an error). Run
