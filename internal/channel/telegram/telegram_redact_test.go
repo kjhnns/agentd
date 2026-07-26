@@ -7,11 +7,40 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/kjhnns/agentd/internal/channel"
 )
+
+// syncBuf is a concurrency-safe log sink. log.SetOutput hands the writer to
+// whichever goroutine calls log.Printf (here: pollLoop), so the test goroutine
+// cannot touch a bare bytes.Buffer without racing it. Every read and write goes
+// through the same mutex.
+type syncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// Contains reports whether the sink has seen sub yet, under the same lock.
+func (b *syncBuf) Contains(sub string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.Contains(b.buf.String(), sub)
+}
 
 // testToken has the real Bot API shape (<botid>:<secret>) so a substring match
 // is meaningful. The secret half is what must never survive into a log or error.
@@ -61,9 +90,9 @@ func TestGetUpdatesTransportErrorIsRedacted(t *testing.T) {
 // "telegram: getUpdates error: ..." in pollLoop is what wrote the token to
 // logs/agentd.log during the 502/timeout storms.
 func TestPollLoopLogLineIsRedacted(t *testing.T) {
-	var buf bytes.Buffer
+	buf := &syncBuf{}
 	orig := log.Writer()
-	log.SetOutput(&buf)
+	log.SetOutput(buf)
 	defer log.SetOutput(orig)
 
 	a := newDeadAdapter()
@@ -71,14 +100,15 @@ func TestPollLoopLogLineIsRedacted(t *testing.T) {
 	done := make(chan struct{})
 	go func() { a.pollLoop(ctx); close(done) }()
 
-	// Wait for at least one error line, then stop the loop.
+	// Wait deterministically for the line we care about, polling under the
+	// sink's lock, then stop the loop and join it before asserting.
 	deadline := time.After(10 * time.Second)
-	for buf.Len() == 0 {
+	for !buf.Contains("getUpdates error") {
 		select {
 		case <-deadline:
 			cancel()
 			<-done
-			t.Fatal("pollLoop never logged an error")
+			t.Fatalf("pollLoop never logged a getUpdates error, got: %s", buf.String())
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
