@@ -478,6 +478,139 @@ Mechanics and guarantees:
   `reactions = false` parks the whole chain (receipt included). Channels that
   cannot react (web) implement `Ack` as a no-op.
 
+## WhatsApp channel (`internal/channel/whatsapp`)
+
+The WhatsApp adapter opens **no WhatsApp connection of its own and needs no QR
+pairing**. It drives the already-paired [`wacli`](https://wacli.sh) session
+(whatsmeow, store at `~/.wacli`) as a serialized subprocess.
+
+Why not link whatsmeow directly, which would be the natural fit for a Go server:
+
+- The account already has exactly one linked device, owned by `wacli`. A second
+  whatsmeow client on the **same device credentials is a takeover, not a second
+  reader**: WhatsApp replies `connectionReplaced` (440) and the two clients
+  knock each other offline in a loop. Reusing the one authenticated session is
+  the only safe option, and it needs nothing from the user.
+- agentd is a pure-stdlib single static binary (design 3.11). `go.mau.fi/whatsmeow`
+  would drag in protobuf, libsignal and a cgo SQLite driver, which is a much
+  bigger decision than one channel.
+
+**The lock constraint shapes the design.** `wacli` guards that single session
+with an *exclusive store lock*, so exactly one invocation may run at a time.
+Inbound is therefore a cursor poll of wacli's **local DB** (`wacli messages list
+--json --from-them --asc --after <cursor>`), which is a read and does not
+contend, rather than `wacli sync --follow --webhook`: follow-mode holds the lock
+and the WhatsApp connection for its entire lifetime, which would starve every
+outbound send. Every invocation goes through one mutex plus `--lock-wait`.
+
+| Concern | How |
+| --- | --- |
+| inbound | cursor poll, `poll` interval (default 20s); dedup by message id over a 60s window; `fromMe` never becomes a turn |
+| access | DM and group policies are **independent**, each `open` / `allowlist` / `locked` (default `allowlist`), ported from Camila's `access.json` model. `allow` is the DM list and doubles as the **owner set** |
+| groups | supported. `UserID` is the group JID (session key), `Sender` is the participant JID, so a group thread keeps one session while still attributing each turn |
+| read-only groups | `readonly_groups` deliver inbound but refuse every visible action: no reply, no reaction, no blue ticks. Membership there alone is enough to deliver, and if a group is in both lists read-only wins |
+| media | voice notes, images and documents go through `wacli media download` then `media.Ingest` with `Source: "whatsapp"`, identical treatment to Telegram. No marker text baked here; `session.RenderInbound` owns that |
+| outbound | `wacli send text --json`; the returned id is the acceptance artifact. `Send` refuses any chat the policy does not permit. Visible actions are throttled to 1/s (WhatsApp bans on bursts) |
+| reactions | native, via `wacli send react`. One reaction per message per sender and a new one **replaces** the previous, so the 👀 → ⚡ → 👍 / 😱 / 🤔 chain reads as one changing marker exactly like Telegram. Group reactions pass `--sender` |
+| read receipts | `wacli chats mark-read`, the equivalent of Baileys `readMessages`. Queued on the **same ordered worker** as the reactions so the two receipts stay consistent |
+| quote / reply-to | resolved, see below |
+| health | the channel detects going **deaf**, see below |
+| credentials | none in config. Auth *is* the existing wacli store; the only paths configured are `bin` and optionally `store` |
+
+Config keys on the `[[channel]]` block: `kind = "whatsapp"`, `bin`, `store`,
+`allow`, `policy_dm`, `policy_group`, `allow_groups`, `readonly_groups`, `poll`,
+`sync`, `reactions`, `read_receipts`, `stale_after`, `enabled`.
+
+### The @lid trap (read this before enabling)
+
+`allow` entries are matched by digits, so one entry covers the bare number, the
+phone JID and a device-suffixed JID. It does **NOT** cover the peer's `@lid`
+JID, because a real `@lid` has **completely different digits** from the phone
+number. WhatsApp routes some replies over `@lid`, so an allowlist with only the
+phone number silently drops them, and the first symptom is the agent ignoring
+Joe's own messages.
+
+List both forms per person. Find the `@lid` with:
+
+```
+sqlite3 ~/.wacli/session.db 'select * from whatsmeow_lid_map'
+```
+
+The adapter logs a startup WARNING naming every `allow` entry that has no
+`@lid` counterpart.
+
+### Quote / reply-to threading
+
+`wacli messages list --json` omits the quoted fields entirely, which is why
+`ReplyTo` was empty in the first cut. The data does exist: the local DB carries
+`messages.quoted_msg_id` and `messages.quoted_sender_jid` (confirmed populated
+against a real store), and **`wacli messages show --json` exposes them**, in
+snake_case rather than the PascalCase the other commands use. The adapter
+therefore does one extra `messages show` lookup per delivered message to
+populate `InboundMsg.ReplyTo`. That is a local read, so it does not contend on
+the store lock, and a failed lookup logs and moves on rather than dropping the
+turn: threading is a nice-to-have, the message is not.
+
+### Detecting a channel that has gone deaf
+
+A successful poll that returns nothing is **ambiguous**: either nobody messaged
+us, or whatever refreshes wacli's local DB has died and the channel will now sit
+quiet forever. That exact ambiguity is the classic silent-death failure mode; a
+sibling service in this operator's fleet stayed blind for six days on it. The adapter disambiguates it by asking, on every successful poll,
+how old the newest message in the store is across all chats and both directions.
+If the syncer is alive that number stays bounded; if it died it grows without
+limit. Past `stale_after` (default 3h) the channel reports `Health.OK = false`
+and fires `OnUnhealthy` once per transition, which the server turns into a
+notify-hub issue. Repeated poll failures (3 in a row) also flip it unhealthy.
+
+### Operational note: the wacli store lock
+
+`wacli` guards its single WhatsApp session with an **exclusive store lock**, so
+exactly one wacli invocation touches a given store at a time. Three consequences
+an operator should know before enabling this channel:
+
+1. **Inbound is a poll, not a stream, on purpose.** `wacli sync --follow
+   --webhook` would be the obvious live-push design and it does exist, but
+   follow-mode holds the lock and the WhatsApp connection for its entire
+   lifetime, which starves every outbound send. Local reads (`messages list`,
+   `messages show`) do **not** contend, so the adapter polls the local DB and
+   keeps the lock free for sends and reactions.
+2. **`sync = false` is the safe default.** With it, the adapter only *reads*
+   wacli's local DB and never syncs, so it coexists with whatever else already
+   keeps that store fresh. Inbound latency is then bounded by that other job's
+   cadence plus `poll`. If a host runs, say, a `wacli sync --once` from cron or
+   launchd every 60 seconds, worst-case inbound latency is roughly 60s + `poll`.
+3. **`sync = true` buys latency and demands exclusivity.** The adapter then runs
+   `wacli sync --once` itself each tick, cutting inbound latency to about
+   `poll`. Only turn it on if **nothing else syncs that store**. Two syncers do
+   not degrade gracefully: they fight over the lock and both lose, with the
+   loser reporting `store is locked (another wacli is running?)`. Retiring the
+   other syncer first is the operator's call, and this repo does not make it.
+
+Whatever the choice, a store that stops being refreshed is the dangerous case,
+because a channel with a dead syncer looks exactly like a quiet one. That is
+what `stale_after` and the health check below exist to catch.
+
+### Prompt-injection posture
+
+This channel has **no in-band control plane by construction**. There is no
+pairing flow, no allowlist command and no approval message: access comes from
+the config file, and nothing an inbound message says can change it. That
+structurally removes the target Camila's Baileys channel had to defend with
+prose in its MCP instructions. On top of that:
+
+- A **non-owner in a group is a bystander**. Their message is delivered, because
+  that is the point of being in a group, but it draws no visible response from
+  us: no blue ticks and no lifecycle reaction on a stranger's message.
+- Every visible action re-checks the policy from config at call time, so a turn
+  cannot be talked into replying somewhere it should not.
+- Text matching approval / allowlist-change phrasing is logged as a security
+  note. That is a **detector for visibility, not the defence**; the defence is
+  that there is nothing in-band to escalate to.
+
+Out of scope, same as Telegram: outbound media (`SupportsMedia()` stays false),
+video, gif and sticker processing (these get a one-line decline, never silence).
+
 ## What is actually proven vs stubbed
 
 - **Proven working:** the Claude Code PERSISTENT streaming vertical. A live gated

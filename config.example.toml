@@ -92,6 +92,67 @@ policy  = "dm-only"
 # never fatal to the turn. Default true; set false for no reactions at all.
 reactions = true
 
+# The WHATSAPP channel. It does NOT open its own WhatsApp connection and needs
+# NO QR pairing: it drives the already-paired `wacli` session (whatsmeow, store
+# at ~/.wacli). A second whatsmeow client on the same device credentials is a
+# TAKEOVER, not a second reader (WhatsApp answers connectionReplaced/440 and the
+# two clients knock each other offline), so reusing the one session is the only
+# safe option. There is no token: auth IS the existing wacli store.
+#
+# LOCK CONSTRAINT: wacli guards that session with an EXCLUSIVE store lock, so
+# only one wacli invocation runs at a time. That is why inbound is a cursor poll
+# of wacli's local DB (a lock-free READ) and not `wacli sync --follow`, which
+# would hold the lock and the connection forever and starve outbound sends.
+[[channel]]
+kind      = "whatsapp"
+enabled   = false                              # opt in deliberately: wide-open inbound surface
+bin       = "wacli"                            # 0.11.1+ required; pin an absolute path if PATH may hold an older copy
+# store   = "~/.wacli"                         # omit to use wacli's own default store dir
+
+# ACCESS. `allow` is the DM allowlist AND the owner set: only these peers can
+# make the agent act. LIST BOTH JID FORMS FOR EACH PERSON. A real @lid JID has
+# DIFFERENT DIGITS from the phone JID, so listing the phone number does NOT
+# cover the @lid, and WhatsApp routes some replies over @lid. Missing it means
+# your own replies are silently dropped. Find yours with:
+#   sqlite3 ~/.wacli/session.db 'select * from whatsmeow_lid_map'
+# The channel logs a startup WARNING for any entry with no @lid counterpart.
+# Two entries, ONE person: the phone JID and that same person's @lid, whose
+# digits are unrelated to the phone number. (Arrays must stay on one line: the
+# config parser is line-based.)
+allow     = [ "41791234567@s.whatsapp.net", "188884444777@lid" ]
+
+# DM and group policies are INDEPENDENT: open | allowlist | locked.
+# Locking groups does not close DMs, and vice versa.
+policy_dm    = "allowlist"
+policy_group = "allowlist"
+# Groups the agent may read AND answer in.
+allow_groups    = []
+# Groups the agent reads but NEVER speaks in. Membership here alone is enough
+# to deliver; if a group is in both lists, read-only wins.
+readonly_groups = []
+
+poll      = "20s"                              # inbound poll interval
+# sync=true makes this channel refresh wacli's local DB itself, which cuts
+# inbound latency to the poll interval. Only enable it when NOTHING ELSE runs
+# `wacli sync` on the same store: wacli takes an EXCLUSIVE store lock, so two
+# syncers fight over it and both lose. If some other job (a cron or launchd
+# `wacli sync --once`) already keeps the store fresh, leave this false and
+# inbound latency is bounded by that job's cadence instead. See the README
+# section "Operational note: the wacli store lock".
+sync      = false
+# Blue ticks on delivered messages (wacli chats mark-read, the equivalent of
+# Baileys readMessages). Suppressed in read-only chats and for group bystanders.
+read_receipts = true
+# How old wacli's newest stored message may get before the channel reports
+# itself DEAF rather than merely quiet. Whatever refreshes the store can die,
+# and a dead syncer looks exactly like a quiet chat unless something checks.
+stale_after = "3h"
+# Emoji progress feedback, same lifecycle chain as Telegram. WhatsApp allows one
+# reaction per message per sender and a new one REPLACES the previous, so the
+# chain reads as one changing marker. Unlike Telegram there is no fixed emoji
+# whitelist, so all five glyphs go through natively.
+reactions = true
+
 # The WEB channel: a self-contained local UI served by the SAME server (no 2nd
 # port) at /ui, and the reference ChannelAdapter the future wrist/phone app is a
 # client of. It shows the session list (status + context pressure), a live event

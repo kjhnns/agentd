@@ -30,6 +30,7 @@ import (
 	"github.com/kjhnns/agentd/internal/api"
 	"github.com/kjhnns/agentd/internal/channel/telegram"
 	"github.com/kjhnns/agentd/internal/channel/web"
+	"github.com/kjhnns/agentd/internal/channel/whatsapp"
 	"github.com/kjhnns/agentd/internal/config"
 	"github.com/kjhnns/agentd/internal/eventbus"
 	"github.com/kjhnns/agentd/internal/harness"
@@ -620,6 +621,60 @@ func serve(args []string) {
 					}()
 				}
 			}(tg)
+
+		case "whatsapp":
+			// Drives the ALREADY-PAIRED wacli session; no QR, no second
+			// WhatsApp connection. See internal/channel/whatsapp for why.
+			pdm, err := whatsapp.ParsePolicy(c.PolicyDM)
+			if err != nil {
+				log.Printf("agentd: whatsapp channel: %v; channel NOT started", err)
+				continue
+			}
+			pgrp, err := whatsapp.ParsePolicy(c.PolicyGroup)
+			if err != nil {
+				log.Printf("agentd: whatsapp channel: %v; channel NOT started", err)
+				continue
+			}
+			waCh := whatsapp.New(c.Bin, c.Allow).
+				WithReactions(c.Reactions).
+				WithReadReceipts(c.ReadReceipts).
+				WithStore(c.Store).
+				WithPoll(c.Poll).
+				WithOwnSync(c.Sync).
+				WithPolicies(pdm, pgrp).
+				WithAllowGroups(c.AllowGroups).
+				WithReadonlyGroups(c.ReadonlyGroups).
+				WithStaleAfter(c.StaleAfter)
+			// A channel that has gone deaf must be visible, not silently quiet.
+			waCh.WithOnUnhealthy(func(h whatsapp.Health) {
+				hub.Dispatch(notify.Notification{
+					Level:  notify.LevelIssue,
+					Source: "whatsapp",
+					Text:   "WhatsApp channel unhealthy: " + h.Reason,
+				})
+			})
+			if mediaSvc != nil {
+				waCh.WithMedia(mediaSvc)
+			}
+			if err := waCh.Start(ctx); err != nil {
+				log.Printf("agentd: whatsapp start failed: %v", err)
+				continue
+			}
+			transportUp.Store(true)
+			log.Printf("agentd: whatsapp channel started (allow=%v, groups=%v, readonly=%v, dm=%s, group=%s, reactions=%v, receipts=%v, sync=%v)",
+				c.Allow, c.AllowGroups, c.ReadonlyGroups, pdm, pgrp, c.Reactions, c.ReadReceipts, c.Sync)
+
+			sessionForWA := map[string]string{}
+			go func(ch *whatsapp.Adapter) {
+				for in := range ch.Inbound() {
+					in := in
+					go func() {
+						if err := mgr.RouteInbound(ctx, ch, in, sessionForWA, cwd, model); err != nil {
+							log.Printf("agentd: whatsapp route inbound error: %v", err)
+						}
+					}()
+				}
+			}(waCh)
 
 		case "web":
 			webCh := web.New(bus, c.Title)

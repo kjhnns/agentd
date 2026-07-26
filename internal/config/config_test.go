@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -148,6 +149,113 @@ reactions = false
 	}
 }
 
+func TestParseWhatsAppChannel(t *testing.T) {
+	cfg, err := Parse([]byte(`
+[[channel]]
+kind      = "whatsapp"
+bin       = "/Users/johannes/bin/wacli"
+store     = "/Users/johannes/.wacli"
+allow     = [ "41791234567@s.whatsapp.net", "120363000000@g.us" ]
+poll      = "15s"
+sync      = true
+reactions = false
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.Channel) != 1 {
+		t.Fatalf("channels = %d, want 1", len(cfg.Channel))
+	}
+	c := cfg.Channel[0]
+	if c.Kind != "whatsapp" {
+		t.Errorf("kind = %q", c.Kind)
+	}
+	if c.Bin != "/Users/johannes/bin/wacli" {
+		t.Errorf("bin = %q", c.Bin)
+	}
+	if c.Store != "/Users/johannes/.wacli" {
+		t.Errorf("store = %q", c.Store)
+	}
+	if c.Poll != 15*time.Second {
+		t.Errorf("poll = %v, want 15s", c.Poll)
+	}
+	if !c.Sync {
+		t.Error("sync = false, want true")
+	}
+	if c.Reactions {
+		t.Error("reactions = true, want false")
+	}
+	if len(c.Allow) != 2 || c.Allow[1] != "120363000000@g.us" {
+		t.Errorf("allow = %v", c.Allow)
+	}
+	// The whatsapp channel carries NO token: auth is the existing wacli store.
+	if c.Token != "" {
+		t.Errorf("token = %q, want empty", c.Token)
+	}
+	// Defaults when the keys are absent.
+	cfg2, err := Parse([]byte("[[channel]]\nkind = \"whatsapp\"\n"))
+	if err != nil {
+		t.Fatalf("Parse defaults: %v", err)
+	}
+	if cfg2.Channel[0].Sync {
+		t.Error("sync must default false so it does not fight an external syncer")
+	}
+	if cfg2.Channel[0].Poll != 0 {
+		t.Error("poll must default to zero so the adapter picks its own default")
+	}
+	if !cfg2.Channel[0].Reactions {
+		t.Error("reactions should default true")
+	}
+	if !cfg2.Channel[0].ReadReceipts {
+		t.Error("read_receipts should default true")
+	}
+}
+
+func TestParseWhatsAppAccessModel(t *testing.T) {
+	cfg, err := Parse([]byte(`
+[[channel]]
+kind            = "whatsapp"
+allow           = [ "41791234567@s.whatsapp.net", "188884444777@lid" ]
+policy_dm       = "allowlist"
+policy_group    = "locked"
+allow_groups    = [ "120363000000@g.us" ]
+readonly_groups = [ "120363111111@g.us", "120363222222@g.us" ]
+read_receipts   = false
+stale_after     = "45m"
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	c := cfg.Channel[0]
+	if c.PolicyDM != "allowlist" || c.PolicyGroup != "locked" {
+		t.Errorf("policies = %q/%q", c.PolicyDM, c.PolicyGroup)
+	}
+	if len(c.AllowGroups) != 1 || c.AllowGroups[0] != "120363000000@g.us" {
+		t.Errorf("allow_groups = %v", c.AllowGroups)
+	}
+	if len(c.ReadonlyGroups) != 2 {
+		t.Errorf("readonly_groups = %v", c.ReadonlyGroups)
+	}
+	if c.ReadReceipts {
+		t.Error("read_receipts = true, want false")
+	}
+	if c.StaleAfter != 45*time.Minute {
+		t.Errorf("stale_after = %v, want 45m", c.StaleAfter)
+	}
+	// The config example documents BOTH JID forms for one peer, because a real
+	// @lid has different digits from the phone JID.
+	if len(c.Allow) != 2 {
+		t.Fatalf("allow = %v", c.Allow)
+	}
+	if !strings.HasSuffix(c.Allow[1], "@lid") {
+		t.Errorf("second allow entry should be the @lid form, got %q", c.Allow[1])
+	}
+	// Strict keys still apply to the new surface.
+	if _, err := Parse([]byte("[[channel]]\nkind = \"whatsapp\"\npolicy_dms = \"open\"\n")); err == nil {
+		t.Error("expected an unknown whatsapp channel key to be rejected")
+	}
+}
+
 func TestParseWorkspaceTable(t *testing.T) {
 	cfg, err := Parse([]byte(`
 [workspace]
@@ -288,5 +396,43 @@ func TestParseMediaEnabledFalse(t *testing.T) {
 	}
 	if cfg.Media.Enabled {
 		t.Error("enabled = true, want false")
+	}
+}
+
+// TestShippedExampleParses guards against the documentation and the strict-key
+// parser drifting apart: config.example.toml is what a user copies, so a key
+// documented there that the parser rejects is a broken first run.
+func TestShippedExampleParses(t *testing.T) {
+	b, err := os.ReadFile("../../config.example.toml")
+	if err != nil {
+		t.Skipf("example config not readable: %v", err)
+	}
+	cfg, err := Parse(b)
+	if err != nil {
+		t.Fatalf("config.example.toml does not parse: %v", err)
+	}
+	var wa *Channel
+	for i := range cfg.Channel {
+		if cfg.Channel[i].Kind == "whatsapp" {
+			wa = &cfg.Channel[i]
+		}
+	}
+	if wa == nil {
+		t.Fatal("the example should document a whatsapp channel")
+	}
+	// It must ship DISABLED: WhatsApp is a wide-open inbound surface and
+	// enabling it is a deliberate act.
+	if wa.Enabled {
+		t.Error("the whatsapp channel must ship disabled in the example")
+	}
+	// It must demonstrate BOTH JID forms, or users will hit the @lid trap.
+	var sawLid bool
+	for _, a := range wa.Allow {
+		if strings.HasSuffix(a, "@lid") {
+			sawLid = true
+		}
+	}
+	if !sawLid {
+		t.Error("the example allow list must show an @lid entry alongside the phone JID")
 	}
 }
