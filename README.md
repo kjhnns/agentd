@@ -528,7 +528,7 @@ phone JID and a device-suffixed JID. It does **NOT** cover the peer's `@lid`
 JID, because a real `@lid` has **completely different digits** from the phone
 number. WhatsApp routes some replies over `@lid`, so an allowlist with only the
 phone number silently drops them, and the first symptom is the agent ignoring
-Joe's own messages.
+the operator's own messages.
 
 List both forms per person. Find the `@lid` with:
 
