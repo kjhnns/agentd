@@ -587,7 +587,14 @@ func serve(args []string) {
 		case "telegram":
 			token := config.ResolveToken(c.Token)
 			if token == "" {
-				log.Printf("agentd: telegram channel configured but token empty (%s); channel NOT started", c.Token)
+				// Log only the REFERENCE, never a literal: an "env:FOO" ref is a
+				// var name (safe and the useful debug detail), anything else could
+				// be a credential and is described instead of printed.
+				ref := "<literal>"
+				if strings.HasPrefix(c.Token, "env:") || c.Token == "" {
+					ref = c.Token
+				}
+				log.Printf("agentd: telegram channel configured but token empty (ref %q); channel NOT started", ref)
 				continue
 			}
 			tg = telegram.New(token, c.Allow).WithReactions(c.Reactions)

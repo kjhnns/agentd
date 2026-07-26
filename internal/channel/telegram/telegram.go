@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -116,7 +117,9 @@ func (a *Adapter) pollLoop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("telegram: getUpdates error: %v (backoff %s)", err, backoff)
+			// Second belt: getUpdates already redacts, but this is the one line
+			// that historically printed a *url.Error carrying the token.
+			log.Printf("telegram: getUpdates error: %s (backoff %s)", a.redact(err.Error()), backoff)
 			select {
 			case <-ctx.Done():
 				return
@@ -193,6 +196,43 @@ type tgFileRef struct {
 	FileID string `json:"file_id"`
 }
 
+// redact scrubs the bot token out of s. The Bot API carries the token in the
+// URL PATH (https://api.telegram.org/bot<TOKEN>/getUpdates), and net/http
+// returns *url.Error values that embed the full request URL, so every transport
+// error from this package is a credential leak unless it passes through here.
+// Replacing just the token leaves the shape readable as "bot<redacted>".
+func (a *Adapter) redact(s string) string {
+	if a.token == "" {
+		return s // guard: ReplaceAll with an empty needle injects between every rune
+	}
+	return strings.ReplaceAll(s, a.token, "<redacted>")
+}
+
+// redactedError carries a token-scrubbed message while keeping the original
+// error reachable for errors.Is/As. Only the scrubbed message is ever
+// formatted, so the token cannot re-enter a log via %v, %s or %w.
+type redactedError struct {
+	msg string
+	err error
+}
+
+func (e *redactedError) Error() string { return e.msg }
+func (e *redactedError) Unwrap() error { return e.err }
+
+// redactErr is the single scrubbing boundary for errors leaving this adapter.
+// Wrap EVERY error that came from http.NewRequest* or http.Client.Do with it.
+func (a *Adapter) redactErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	clean := a.redact(msg)
+	if clean == msg {
+		return err
+	}
+	return &redactedError{msg: clean, err: err}
+}
+
 func (a *Adapter) getUpdates(ctx context.Context) ([]tgUpdate, error) {
 	q := url.Values{}
 	q.Set("timeout", "50")
@@ -200,11 +240,11 @@ func (a *Adapter) getUpdates(ctx context.Context) ([]tgUpdate, error) {
 	endpoint := fmt.Sprintf("%s/bot%s/getUpdates?%s", a.base, a.token, q.Encode())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, err
+		return nil, a.redactErr(err)
 	}
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, a.redactErr(err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -284,7 +324,7 @@ func (a *Adapter) emitInbound(m *tgMessage, chatID, text string, art *media.Arti
 // replyText sends a short best-effort service reply (declines, failures).
 func (a *Adapter) replyText(chatID, text string) {
 	if _, err := a.Send(context.Background(), channel.OutboundMsg{ChatID: chatID, Text: text}); err != nil {
-		log.Printf("telegram: service reply to %s failed: %v", chatID, err)
+		log.Printf("telegram: service reply to %s failed: %s", chatID, a.redact(err.Error()))
 	}
 }
 
@@ -350,7 +390,7 @@ func (a *Adapter) processMedia(ctx context.Context, m *tgMessage, chatID string)
 
 	body, err := a.downloadFile(ctx, fileID)
 	if err != nil {
-		log.Printf("telegram: media download for chat %s failed: %v", chatID, err)
+		log.Printf("telegram: media download for chat %s failed: %s", chatID, a.redact(err.Error()))
 		a.replyText(chatID, "Sorry, I couldn't download that file from Telegram. Please try again.")
 		return
 	}
@@ -388,11 +428,11 @@ func (a *Adapter) downloadFile(ctx context.Context, fileID string) (io.ReadClose
 	endpoint := fmt.Sprintf("%s/bot%s/getFile?%s", a.base, a.token, q.Encode())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, err
+		return nil, a.redactErr(err)
 	}
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, a.redactErr(err)
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
@@ -414,11 +454,11 @@ func (a *Adapter) downloadFile(ctx context.Context, fileID string) (io.ReadClose
 	dl := fmt.Sprintf("%s/file/bot%s/%s", a.base, a.token, out.Result.FilePath)
 	dreq, err := http.NewRequestWithContext(ctx, http.MethodGet, dl, nil)
 	if err != nil {
-		return nil, err
+		return nil, a.redactErr(err)
 	}
 	dresp, err := a.client.Do(dreq)
 	if err != nil {
-		return nil, err
+		return nil, a.redactErr(err)
 	}
 	if dresp.StatusCode != http.StatusOK {
 		dresp.Body.Close()
@@ -440,12 +480,12 @@ func (a *Adapter) Send(ctx context.Context, m channel.OutboundMsg) (channel.Send
 	endpoint := fmt.Sprintf("%s/bot%s/sendMessage", a.base, a.token)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return channel.SendReceipt{}, err
+		return channel.SendReceipt{}, a.redactErr(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return channel.SendReceipt{}, err
+		return channel.SendReceipt{}, a.redactErr(err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -509,7 +549,7 @@ func (a *Adapter) enqueueReaction(chatID string, msgID int64, emoji string) {
 func (a *Adapter) reactLoop() {
 	for r := range a.reactQ {
 		if err := a.setReaction(r.chatID, r.msgID, r.emoji); err != nil {
-			log.Printf("telegram: reaction %q on %s/%d failed: %v", r.emoji, r.chatID, r.msgID, err)
+			log.Printf("telegram: reaction %q on %s/%d failed: %s", r.emoji, r.chatID, r.msgID, a.redact(err.Error()))
 		}
 	}
 }
@@ -528,12 +568,12 @@ func (a *Adapter) setReaction(chatID string, msgID int64, emoji string) error {
 	endpoint := fmt.Sprintf("%s/bot%s/setMessageReaction", a.base, a.token)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return a.redactErr(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return err
+		return a.redactErr(err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
