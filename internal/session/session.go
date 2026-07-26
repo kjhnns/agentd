@@ -396,6 +396,114 @@ func (m *Manager) Send(ctx context.Context, id, text string) (*SendResult, error
 	return &SendResult{}, nil
 }
 
+// TurnOptions tunes ONE collected turn (SendAndCollect).
+type TurnOptions struct {
+	// Timeout bounds the whole turn. <=0 means "no bound beyond ctx", which is
+	// what a caller that already runs under a bounded context (the scheduler)
+	// wants. On expiry the collected reply is abandoned and the error wraps
+	// ErrTurnTimeout.
+	Timeout time.Duration
+	// OnEvent, when set, is called for EVERY bus event belonging to this
+	// session while the turn runs. It is the hook for interim feedback (a
+	// needs-input glyph on Telegram, a streamed line in the CLI) and must not
+	// block: it runs on the collect loop.
+	OnEvent func(eventbus.Event)
+}
+
+// SendAndCollect sends one user turn to a session and returns the turn's
+// USER-VISIBLE result text. It is the single implementation of the
+// subscribe-then-send-then-drain dance that every caller of Send needs (the
+// channel router, the scheduler runner, the HTTP /input endpoint): subscribing
+// BEFORE the send so the result event cannot be missed, mapping a blanked
+// result text back onto the turn's last streamed output (the harness blanks a
+// result that merely duplicates it, so there is one visible reply), and
+// draining briefly after Send returns because bus delivery can lag the call.
+//
+// The returned text is "" when the turn produced nothing; callers that must
+// say SOMETHING substitute their own placeholder.
+func (m *Manager) SendAndCollect(ctx context.Context, id, text string, opt TurnOptions) (string, error) {
+	if _, ok := m.Get(id); !ok {
+		return "", fmt.Errorf("session %s not found", id)
+	}
+
+	// Subscribe BEFORE sending so the turn's result event cannot be missed.
+	subID, events := m.bus.Subscribe()
+	defer m.bus.Unsubscribe(subID)
+
+	turnErr := make(chan error, 1)
+	go func() {
+		_, err := m.Send(ctx, id, text)
+		turnErr <- err
+	}()
+
+	var result, lastOutput string
+	gotResult := false
+	collect := func(e eventbus.Event) {
+		if e.SessionID != id {
+			return
+		}
+		if opt.OnEvent != nil {
+			opt.OnEvent(e)
+		}
+		switch e.Kind {
+		case eventbus.KindOutput:
+			lastOutput = e.Text
+		case eventbus.KindResult:
+			gotResult = true
+			if e.Text != "" {
+				result = e.Text
+			} else {
+				result = lastOutput
+			}
+		}
+	}
+
+	// A zero/negative Timeout means "no bound beyond ctx": a nil channel blocks
+	// forever in the select, which is exactly that.
+	var timeout <-chan time.Time
+	if opt.Timeout > 0 {
+		timeout = time.After(opt.Timeout)
+	}
+	for {
+		select {
+		case e := <-events:
+			collect(e)
+		case err := <-turnErr:
+			if err != nil {
+				return "", err
+			}
+			// Send returning can race the bus delivery of the turn's events;
+			// drain briefly until the result event lands so the reply is not
+			// built from a partial turn.
+			grace := time.After(resultGrace)
+			for !gotResult {
+				select {
+				case e := <-events:
+					collect(e)
+				case <-grace:
+					return result, nil
+				case <-ctx.Done():
+					return "", ctx.Err()
+				}
+			}
+			return result, nil
+		case <-timeout:
+			return "", fmt.Errorf("session %s turn timed out after %s: %w", id, opt.Timeout, ErrTurnTimeout)
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+}
+
+// resultGrace is how long SendAndCollect keeps draining the bus after Send
+// returned but before the turn's result event arrived.
+const resultGrace = 2 * time.Second
+
+// TurnTimeout exposes the configured per-turn budget (Policy.TurnTimeout, else
+// the built-in default) so callers outside this package (the HTTP API, the
+// CLI client) bound a turn with the SAME number the channels use.
+func (m *Manager) TurnTimeout() time.Duration { return m.Policy.turnTimeout() }
+
 // evalTriggers returns whether a context reset should fire after a completed
 // turn, and why. Order: hard backstops first (they protect proxy-only harnesses
 // and runaway sessions), then the pressure threshold. Caller holds turnMu.
@@ -580,73 +688,20 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	finalReaction := channel.ReactionError
 	defer func() { react(finalReaction) }()
 
-	// Collect the result by subscribing to the bus for this session's result event.
-	subID, events := m.bus.Subscribe()
-	defer m.bus.Unsubscribe(subID)
-
-	turnErr := make(chan error, 1)
-	turnText := RenderInbound(in)
-	go func() {
-		_, err := m.Send(ctx, id, turnText)
-		turnErr <- err
-	}()
-
-	// The harness blanks a result text that merely duplicates the turn's final
-	// streamed output (single user-visible reply on the bus); the reply is then
-	// that last output text.
-	var result, lastOutput string
-	gotResult := false
-	collectEv := func(e eventbus.Event) {
-		if e.SessionID != id {
-			return
-		}
-		switch e.Kind {
-		case eventbus.KindOutput:
-			lastOutput = e.Text
-		case eventbus.KindResult:
-			gotResult = true
-			if e.Text != "" {
-				result = e.Text
-			} else {
-				result = lastOutput
+	// One turn, collected by the shared SendAndCollect: the needs-input glyph is
+	// the only channel-specific piece, delivered through the event hook.
+	result, err := m.SendAndCollect(ctx, id, RenderInbound(in), TurnOptions{
+		Timeout: m.Policy.turnTimeout(),
+		OnEvent: func(e eventbus.Event) {
+			if e.Kind == eventbus.KindNeedsInput {
+				// Interim state: the agent is blocked on the user. The terminal
+				// done/error glyph still replaces it when the turn resolves.
+				react(channel.ReactionNeedsInput)
 			}
-		case eventbus.KindNeedsInput:
-			// Interim state: the agent is blocked on the user. The terminal
-			// done/error glyph still replaces it when the turn resolves.
-			react(channel.ReactionNeedsInput)
-		}
-	}
-	budget := m.Policy.turnTimeout()
-	timeout := time.After(budget)
-collect:
-	for {
-		select {
-		case e := <-events:
-			collectEv(e)
-		case err := <-turnErr:
-			if err != nil {
-				return err
-			}
-			// Send returning can race the bus delivery of the turn's events;
-			// drain briefly until the result event lands (same grace as the
-			// scheduler runner) so the reply is not built from a partial turn.
-			grace := time.After(2 * time.Second)
-			for !gotResult {
-				select {
-				case e := <-events:
-					collectEv(e)
-				case <-grace:
-					break collect
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			}
-			break collect
-		case <-timeout:
-			return fmt.Errorf("session %s turn timed out after %s: %w", id, budget, ErrTurnTimeout)
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		},
+	})
+	if err != nil {
+		return err
 	}
 	if result == "" {
 		result = "(no result)"

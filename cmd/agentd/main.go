@@ -6,6 +6,9 @@
 // Subcommands:
 //
 //	agentd serve   -config config.toml     run the daemon (default)
+//	agentd chat                            interactive REPL against the RUNNING daemon
+//	agentd run     "<prompt>"              one-shot turn for scripts (stdout + exit code)
+//	agentd sessions                        list the daemon's live sessions
 //	agentd smoke   -prompt "..."           one headless Claude Code turn, print
 //	                                        parsed normalized events (the vertical)
 package main
@@ -31,6 +34,7 @@ import (
 	"github.com/kjhnns/agentd/internal/channel/telegram"
 	"github.com/kjhnns/agentd/internal/channel/web"
 	"github.com/kjhnns/agentd/internal/channel/whatsapp"
+	"github.com/kjhnns/agentd/internal/cli"
 	"github.com/kjhnns/agentd/internal/config"
 	"github.com/kjhnns/agentd/internal/eventbus"
 	"github.com/kjhnns/agentd/internal/harness"
@@ -54,7 +58,13 @@ func main() {
 	case "smoke":
 		smoke(os.Args[2:])
 	case "chat":
-		chat(os.Args[2:])
+		os.Exit(cli.Chat(os.Args[2:], os.Stdout, os.Stderr, os.Stdin))
+	case "run":
+		os.Exit(cli.Run(os.Args[2:], os.Stdout, os.Stderr, os.Stdin))
+	case "sessions":
+		os.Exit(cli.Sessions(os.Args[2:], os.Stdout, os.Stderr))
+	case "demo-chat":
+		demoChat(os.Args[2:])
 	case "init-workspace":
 		initWorkspace(os.Args[2:])
 	case "memory":
@@ -62,10 +72,14 @@ func main() {
 	case "jobs":
 		jobsCmd(os.Args[2:])
 	case "-h", "--help", "help":
-		fmt.Println("usage: agentd [serve|smoke|chat|init-workspace|memory|jobs] [flags]")
+		fmt.Println("usage: agentd [serve|chat|run|sessions|smoke|init-workspace|memory|jobs] [flags]")
+		fmt.Println("  chat                               interactive REPL against the RUNNING daemon")
+		fmt.Println("  run \"<prompt>\"                     one-shot turn for scripts (answer on stdout)")
+		fmt.Println("  sessions                           list the daemon's live sessions")
 		fmt.Println("  init-workspace [name]              scaffold a workspace (default ~/.agentd/workspaces/<name>)")
 		fmt.Println("  memory index|links|add|get [...]   maintain a workspace's memory wiki")
 		fmt.Println("  jobs list|run <name>|runs <name>   inspect and fire scheduler jobs (talks to the running daemon)")
+		fmt.Println("  demo-chat                          offline 2-turn continuity demo (spawns its OWN claude)")
 	default:
 		serve(os.Args[1:])
 	}
@@ -357,10 +371,14 @@ func smoke(args []string) {
 	_ = enc.Encode(evs)
 }
 
-// chat demos a real 2-turn PERSISTENT exchange on ONE claude process, proving
-// continuity: turn 1 sets a codeword, turn 2 asks for it back.
-func chat(args []string) {
-	fs := flag.NewFlagSet("chat", flag.ExitOnError)
+// demoChat demos a real 2-turn PERSISTENT exchange on ONE claude process,
+// proving continuity: turn 1 sets a codeword, turn 2 asks for it back. It is a
+// harness-level DEMO that spawns its own claude and talks to no daemon; the
+// interactive client is `agentd chat` (internal/cli). It used to own the "chat"
+// name, which made the obvious command the one thing that was not a service
+// client.
+func demoChat(args []string) {
+	fs := flag.NewFlagSet("demo-chat", flag.ExitOnError)
 	bin := fs.String("claude", "claude", "claude binary")
 	skip := fs.Bool("skip-permissions", true, "pass --dangerously-skip-permissions")
 	_ = fs.Parse(args)
@@ -373,7 +391,7 @@ func chat(args []string) {
 		SessionID: "chat-demo", Cwd: os.TempDir(), SkipPermissions: *skip,
 	})
 	if err != nil {
-		log.Fatalf("chat start: %v", err)
+		log.Fatalf("demo-chat start: %v", err)
 	}
 	defer a.Teardown(h)
 
@@ -405,13 +423,13 @@ func chat(args []string) {
 	for i, t := range turns {
 		fmt.Printf("turn %d >>> %s\n", i+1, t)
 		if err := a.Send(ctx, h, harness.Input{Text: t}); err != nil {
-			log.Fatalf("chat turn %d: %v", i+1, err)
+			log.Fatalf("demo-chat turn %d: %v", i+1, err)
 		}
 		select {
 		case r := <-results:
 			fmt.Printf("turn %d <<< %s\n", i+1, r)
 		case <-time.After(120 * time.Second):
-			log.Fatalf("chat turn %d: no result", i+1)
+			log.Fatalf("demo-chat turn %d: no result", i+1)
 		}
 	}
 	fmt.Println("(both turns ran on the SAME process; turn 2 recalling the codeword proves continuity)")

@@ -266,11 +266,18 @@ func (s *Server) handleMediaUpload(w http.ResponseWriter, r *http.Request, id st
 		Text:    r.FormValue("text"),
 		Media:   []media.Artifact{art},
 	})
-	if _, err := s.mgr.Send(r.Context(), id, text); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	result, err := s.mgr.SendAndCollect(r.Context(), id, text, session.TurnOptions{
+		Timeout: s.mgr.TurnTimeout(),
+	})
+	if err != nil {
+		code := http.StatusInternalServerError
+		if errors.Is(err, session.ErrTurnTimeout) {
+			code = http.StatusGatewayTimeout
+		}
+		http.Error(w, err.Error(), code)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "routed", "id": id, "artifact": art})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "routed", "id": id, "artifact": art, "result": result})
 }
 
 // handlePastSessions lists sessions derivable from the run-log that are no
@@ -453,11 +460,26 @@ func (s *Server) handleInput(w http.ResponseWriter, r *http.Request, id string) 
 		http.Error(w, "bad body", http.StatusBadRequest)
 		return
 	}
-	if _, err := s.mgr.Send(r.Context(), id, body.Text); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if _, ok := s.mgr.Get(id); !ok {
+		http.Error(w, "session not found", http.StatusNotFound)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "sent", "id": id})
+	// Return the turn's ANSWER, not just an ack: a non-streaming client (the
+	// `agentd run` CLI, a script with curl) has no other way to read it, and the
+	// call already blocked for the whole turn. Streaming clients (the web UI)
+	// keep reading the same reply off the WS and ignore this field.
+	result, err := s.mgr.SendAndCollect(r.Context(), id, body.Text, session.TurnOptions{
+		Timeout: s.mgr.TurnTimeout(),
+	})
+	if err != nil {
+		code := http.StatusInternalServerError
+		if errors.Is(err, session.ErrTurnTimeout) {
+			code = http.StatusGatewayTimeout
+		}
+		http.Error(w, err.Error(), code)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "sent", "id": id, "result": result})
 }
 
 // handleEvents upgrades to WebSocket and streams normalized events for a session.

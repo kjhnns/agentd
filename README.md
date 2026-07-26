@@ -75,7 +75,8 @@ scope. What is IN:
 - **Local API** (`internal/api`): bearer-gated HTTP on `127.0.0.1`. `GET /health`
   returns BOTH `transport_ok` and per-session `agent_ok` as distinct signals (the
   lesson from failure class 2), plus per-session `pressure` + `pressure_source`.
-  `GET/POST /sessions`, `POST /sessions/:id/input`,
+  `GET/POST /sessions`, `POST /sessions/:id/input` (blocks for the turn and
+  returns its `result`, so a non-streaming client can read the answer),
   `GET /sessions/:id/events` (WebSocket),
   `GET /sessions/:id/history` (conversation replay from the run-log, capped at
   the last 50 turns; `?turns=N` narrows it),
@@ -379,6 +380,68 @@ What is DEFERRED (explicit non-goals here, separate go/no-go decisions later):
   Workspace section); the server composing/injecting is built, the server
   WRITING memory from transcripts is not.
 
+## CLI: talking to the agent from a terminal (internal/cli)
+
+`agentd chat` and `agentd run` are **clients of the running daemon**, not a
+channel. A terminal is not an inbound transport that has to be polled, so there
+is deliberately no `ChannelAdapter` with a `Start`/`Inbound` loop here: the CLI
+pushes a turn into an existing session over the SAME bearer-gated HTTP + WS API
+the web UI uses. Everything else comes for free and stays consistent with the
+other surfaces: sessions, history replay, past-session browsing, the workspace
+and its memory injection, context reset, the `[session] turn_timeout` budget,
+and the failure conventions. The CLI only decides WHICH session to attach to and
+how to render a turn in a terminal.
+
+```sh
+# interactive REPL against the running daemon (streams events over the WS):
+agentd chat
+
+# one-shot for scripts: the answer on stdout, meaningful exit code
+agentd run "what is on my calendar tomorrow"
+echo "summarize this" | agentd run
+agentd run -json -wait 90s "..."       # {"ok":true,"session":"...","result":"..."}
+agentd run -file screenshot.png "what is this"   # core media ingest
+agentd sessions                        # live sessions (find an id for -session)
+```
+
+**Session behaviour.** By default both commands attach to ONE persistent session
+titled `cli:$USER`, so context carries across separate invocations exactly like a
+Telegram chat does. `-new` starts a fresh one, `-session <id>` targets any live
+session (including a `telegram:<chat>` one). These sessions are ordinary
+sessions: they appear in `GET /sessions`, in `GET /sessions/past` once reclaimed,
+and their history is readable in the web UI. If the daemon's idle GC reclaimed
+the CLI session, the next invocation transparently opens a fresh one
+(re-hydrated from the workspace artifacts), the same reclaim contract the
+channels get.
+
+**Progress + interrupt.** The REPL shows the terminal analogue of the Telegram
+emoji chain: a `working` indicator with elapsed seconds, `needs input` when the
+agent blocks on the user, then `done` or `error`. Tool calls stream to stderr,
+answers to stdout. Ctrl-C interrupts the CURRENT TURN via
+`POST /sessions/:id/interrupt` and keeps the session alive; Ctrl-C at an idle
+prompt (or Ctrl-D, or `/exit`) quits. `/help` lists the slash commands
+(`/session`, `/new`, `/reset`, `/sessions`, `/exit`).
+
+**Exit codes** (the script contract): `0` success, `1` the turn failed, `2` the
+invocation was wrong, `3` the daemon is not reachable (a sentence saying so, not
+a raw dial error), `4` the turn outran `-wait`.
+
+**Config + auth.** Resolved exactly as `agentd jobs` does, `bind` + `api_bearer`
+from `config.toml`, with two additions a terminal needs: `$AGENTD_ADDR` /
+`$AGENTD_TOKEN` override the file, and the config path itself is discovered
+(`-config`, then `$AGENTD_CONFIG`, then `~/.agentd/config.toml`, then
+`./config.toml`) so a bare `agentd run` works on a configured machine.
+
+**The enabling change.** `POST /sessions/:id/input` now returns the turn's
+`result`, not just `{"status":"sent"}` — the call already blocked for the whole
+turn, so answering with an ack threw the answer away and left a non-streaming
+client with no way to read it. The collect-the-result loop that made that
+possible (subscribe before send, map a blanked result back onto the turn's last
+streamed output, drain briefly after `Send` returns) used to exist in THREE
+copies (`session.RouteInbound`, `scheduler.ManagerRunner`, and nothing at all in
+the API); it is now one method, `session.Manager.SendAndCollect`, used by all
+three.
+
 ## Multimodal media: voice, photos, documents (internal/media)
 
 Media is a **CORE agentd capability, not a channel feature**. One service
@@ -617,7 +680,9 @@ video, gif and sticker processing (these get a one-line decline, never silence).
   test (`TestClaudePersistentContinuity`, `AGENTD_LIVE_CLAUDE=1`) opens ONE session
   and sends two turns: turn 1 sets a codeword, turn 2 recalls HELIOTROPE, proving
   the same process retained context across turns (not a cold start per message).
-  `go run ./cmd/agentd chat` demos the same 2-turn persistent exchange. A
+  `go run ./cmd/agentd demo-chat` demos the same 2-turn persistent exchange
+  (that harness-level demo used to own the `chat` name; `agentd chat` is now the
+  interactive client of the RUNNING daemon). A
   fixture-based multi-turn parse test (`TestParseMultiTurnFixture`, recorded real
   transcript) proves the plumbing without a live call. Config parse, event bus,
   run-log durability, the API `/health` two-signal contract, and the Telegram
@@ -650,7 +715,7 @@ go build ./...
 go test ./...
 
 # prove the persistent multi-turn vertical (needs `claude` on PATH):
-go run ./cmd/agentd chat     # 2 turns on ONE process; turn 2 recalls the codeword
+go run ./cmd/agentd demo-chat   # 2 turns on ONE process; turn 2 recalls the codeword
 
 # one-shot mapping smoke test:
 go run ./cmd/agentd smoke -prompt "Reply with exactly the word PONG and nothing else"
@@ -677,6 +742,10 @@ go run ./cmd/agentd serve -config config.toml
 
 # health (two signals):
 curl -s -H "Authorization: Bearer change-me-bearer" http://127.0.0.1:8787/health
+
+# talk to the RUNNING daemon from a terminal (see the CLI section):
+go run ./cmd/agentd run "Reply with exactly the word PONG and nothing else"
+go run ./cmd/agentd chat
 
 # open the web UI (sets the auth cookie from ?token= on first load):
 open "http://127.0.0.1:8787/ui?token=change-me-bearer"
