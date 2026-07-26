@@ -465,6 +465,7 @@ func serve(args []string) {
 		MaxWallclock:         cfg.Session.MaxWallclock,
 		GCInterval:           cfg.Session.GCInterval,
 		CheckpointTimeout:    cfg.Session.CheckpointTimeout,
+		TurnTimeout:          cfg.Session.TurnTimeout,
 	}
 	// Workspaces: every session is homed in a workspace (cwd = workspace root,
 	// composed injection via --append-system-prompt). See internal/workspace.
@@ -472,9 +473,9 @@ func serve(args []string) {
 	mgr.GitAutoCommit = cfg.Workspace.GitAutocommit
 	log.Printf("agentd: harness=claude-code skip_permissions=%v workspaces=%s default=%q git_autocommit=%v",
 		mgr.SkipPermissions, mgr.Workspaces.Root, mgr.Workspaces.Default, mgr.GitAutoCommit)
-	log.Printf("agentd: session policy context_window=%d reset_pressure=%.2f idle=%s max_turns=%d max_wallclock=%s gc=%s",
+	log.Printf("agentd: session policy context_window=%d reset_pressure=%.2f idle=%s max_turns=%d max_wallclock=%s gc=%s turn_timeout=%s",
 		cfg.Session.ContextWindow, mgr.Policy.ContextResetPressure, mgr.Policy.IdleTimeout,
-		mgr.Policy.MaxTurns, mgr.Policy.MaxWallclock, mgr.Policy.GCInterval)
+		mgr.Policy.MaxTurns, mgr.Policy.MaxWallclock, mgr.Policy.GCInterval, cfg.Session.TurnTimeout)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

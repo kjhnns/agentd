@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -120,6 +121,12 @@ type Policy struct {
 	MaxWallclock         time.Duration // hard backstop: reset after this handle age (0 = off)
 	GCInterval           time.Duration // sweeper cadence (0 = default 1m)
 	CheckpointTimeout    time.Duration // bound on the checkpoint-flush turn (0 = default 120s)
+	// TurnTimeout bounds ONE inbound turn (RouteInbound). It must be generous:
+	// when it expires the reply is abandoned even if the harness answers a
+	// second later, which is exactly how a real research turn silently lost its
+	// answer (see TestTurnWithinBudgetDelivers). 0 = default 15m, matching the
+	// scheduler's per-job bound.
+	TurnTimeout time.Duration
 }
 
 // DefaultPolicy returns the built-in tuning used when none is configured.
@@ -131,7 +138,21 @@ func DefaultPolicy() Policy {
 		MaxWallclock:         8 * time.Hour,
 		GCInterval:           time.Minute,
 		CheckpointTimeout:    120 * time.Second,
+		TurnTimeout:          defaultTurnTimeout,
 	}
+}
+
+// defaultTurnTimeout bounds one inbound turn when [session] turn_timeout is
+// unset. 15m matches the scheduler's per-job bound; the previous hardcoded 150s
+// was shorter than an ordinary web-research turn and silently discarded the
+// answer when it expired.
+const defaultTurnTimeout = 15 * time.Minute
+
+func (p Policy) turnTimeout() time.Duration {
+	if p.TurnTimeout > 0 {
+		return p.TurnTimeout
+	}
+	return defaultTurnTimeout
 }
 
 func (p Policy) checkpointTimeout() time.Duration {
@@ -458,13 +479,67 @@ func RenderInbound(in channel.InboundMsg) string {
 	return strings.Join(parts, "\n\n")
 }
 
+// ErrTurnTimeout marks a turn that was abandoned because it outran the
+// configured budget (Policy.TurnTimeout). The harness may well answer a moment
+// later; that answer has nowhere to go, which is why the budget is generous and
+// why the user is told explicitly instead of left with a bare error reaction.
+var ErrTurnTimeout = errors.New("turn timed out")
+
+// failureNotice renders the single plain-text line a user gets when their turn
+// failed and no reply was produced. Plain text on purpose: Telegram renders
+// markdown asterisks literally. It names the INPUT so a failed voice note reads
+// as a failed voice note rather than a generic error.
+func failureNotice(in channel.InboundMsg, err error) string {
+	what := "that message"
+	if len(in.Media) > 0 {
+		switch in.Media[0].Kind {
+		case media.KindAudio:
+			what = "that voice message"
+		case media.KindImage:
+			what = "that photo"
+		default:
+			what = "that file"
+		}
+	}
+	if errors.Is(err, ErrTurnTimeout) {
+		return fmt.Sprintf("Sorry, I could not finish %s: the turn ran past my time budget, "+
+			"so I gave up on it. Please send it again, or narrow the question.", what)
+	}
+	return fmt.Sprintf("Sorry, I could not process %s: %v", what, err)
+}
+
 // RouteInbound wires a channel inbound message to a session and sends the harness
 // result back through the channel. It reuses one session per chat id (created on
 // first message). This is the end-to-end path.
-func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, sessionForChat map[string]string, cwd, model string) error {
+func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, sessionForChat map[string]string, cwd, model string) (rerr error) {
 	if m.log != nil {
 		_ = m.log.Append("inbound", in)
 	}
+
+	// Silence is never an outcome. Every error exit below leaves the user with
+	// nothing but the 😱 glyph unless we say what went wrong, so a deferred
+	// notice sends one short plain-text line whenever the turn failed AND no
+	// reply was delivered. Detached ctx: the notice must still go out when the
+	// turn died because its own context was cancelled.
+	sessionID := ""
+	replied := false
+	defer func() {
+		if rerr == nil || replied {
+			return
+		}
+		text := failureNotice(in, rerr)
+		nctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if _, err := ch.Send(nctx, channel.OutboundMsg{ChatID: in.UserID, Text: text}); err != nil {
+			log.Printf("session: failure notice to %s/%s failed: %v", in.Channel, in.UserID, err)
+			return
+		}
+		if m.log != nil {
+			_ = m.log.Append("outbound", map[string]string{
+				"session": sessionID, "chat": in.UserID, "text": text, "kind": "failure-notice",
+			})
+		}
+	}()
 
 	// Emoji progress feedback on the user's own message. Best-effort by
 	// contract: an adapter that cannot react no-ops, and a reaction failure
@@ -497,6 +572,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		id = s.ID
 		sessionForChat[in.UserID] = id
 	}
+	sessionID = id
 
 	// A session has the prompt: the turn is in flight. Every exit below flips
 	// this to the done or error glyph via the deferred final reaction.
@@ -540,7 +616,8 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 			react(channel.ReactionNeedsInput)
 		}
 	}
-	timeout := time.After(150 * time.Second)
+	budget := m.Policy.turnTimeout()
+	timeout := time.After(budget)
 collect:
 	for {
 		select {
@@ -566,7 +643,7 @@ collect:
 			}
 			break collect
 		case <-timeout:
-			return fmt.Errorf("session %s turn timed out", id)
+			return fmt.Errorf("session %s turn timed out after %s: %w", id, budget, ErrTurnTimeout)
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -578,6 +655,7 @@ collect:
 	if err != nil {
 		return err
 	}
+	replied = true
 	if m.log != nil {
 		_ = m.log.Append("outbound", map[string]string{"session": id, "chat": in.UserID, "msg_id": rcpt.ID, "text": result})
 	}

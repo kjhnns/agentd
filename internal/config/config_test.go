@@ -185,6 +185,7 @@ max_wallclock     = "4h"
 context_window    = 1000000
 gc_interval       = "30s"
 checkpoint_timeout = "90s"
+turn_timeout      = "20m"
 `))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -211,6 +212,9 @@ checkpoint_timeout = "90s"
 	if s.CheckpointTimeout != 90*time.Second {
 		t.Errorf("checkpoint_timeout = %v", s.CheckpointTimeout)
 	}
+	if s.TurnTimeout != 20*time.Minute {
+		t.Errorf("turn_timeout = %v", s.TurnTimeout)
+	}
 
 	// Defaults when [session] is absent.
 	def, err := Parse([]byte("[server]\nbind = \"127.0.0.1:1\"\n"))
@@ -220,6 +224,11 @@ checkpoint_timeout = "90s"
 	if def.Session.ContextResetPressure != 0.75 || def.Session.IdleTimeout != 30*time.Minute ||
 		def.Session.MaxTurns != 200 || def.Session.ContextWindow != 200000 {
 		t.Fatalf("session defaults not applied: %+v", def.Session)
+	}
+	// A generous default turn budget is load-bearing: 150s silently discarded
+	// the answer to any turn that did real research.
+	if def.Session.TurnTimeout < 10*time.Minute {
+		t.Fatalf("default turn_timeout = %v, want >= 10m", def.Session.TurnTimeout)
 	}
 }
 

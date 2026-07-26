@@ -38,6 +38,11 @@ gc_interval        = "1m"
 # Upper bound on the checkpoint-flush turn; if it overruns, agentd tears down and
 # starts fresh anyway (a wedged flush never strands the session).
 checkpoint_timeout = "120s"
+# Upper bound on ONE inbound turn (a Telegram/web message routed to the agent).
+# On expiry agentd ABANDONS the reply: an answer the harness produces afterwards
+# has nowhere to go, and the user gets a failure notice instead of the answer.
+# Keep it generous, a turn that does web research routinely runs several minutes.
+turn_timeout       = "15m"
 
 # Media: the CORE multimodal capability (internal/media), channel-agnostic by
 # design. Inbound voice / photos / documents from ANY channel are ingested here
