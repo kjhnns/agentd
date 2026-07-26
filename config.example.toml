@@ -106,8 +106,8 @@ reactions = true
 [[channel]]
 kind      = "whatsapp"
 enabled   = false                              # opt in deliberately: wide-open inbound surface
-bin       = "/Users/johannes/bin/wacli"        # 0.11.1+; the PATH copy may be stale (0.5.0 gets 405)
-# store   = "/Users/johannes/.wacli"           # omit to use wacli's own default
+bin       = "wacli"                            # 0.11.1+ required; pin an absolute path if PATH may hold an older copy
+# store   = "~/.wacli"                         # omit to use wacli's own default store dir
 
 # ACCESS. `allow` is the DM allowlist AND the owner set: only these peers can
 # make the agent act. LIST BOTH JID FORMS FOR EACH PERSON. A real @lid JID has
@@ -133,16 +133,19 @@ readonly_groups = []
 
 poll      = "20s"                              # inbound poll interval
 # sync=true makes this channel refresh wacli's local DB itself, which cuts
-# inbound latency. Only enable when NOTHING ELSE runs `wacli sync` (clawd's
-# com.joe_pa.monitor-whatsapp launchd job runs one every 60s); two syncers fight
-# the store lock and both lose.
+# inbound latency to the poll interval. Only enable it when NOTHING ELSE runs
+# `wacli sync` on the same store: wacli takes an EXCLUSIVE store lock, so two
+# syncers fight over it and both lose. If some other job (a cron or launchd
+# `wacli sync --once`) already keeps the store fresh, leave this false and
+# inbound latency is bounded by that job's cadence instead. See the README
+# section "Operational note: the wacli store lock".
 sync      = false
 # Blue ticks on delivered messages (wacli chats mark-read, the equivalent of
 # Baileys readMessages). Suppressed in read-only chats and for group bystanders.
 read_receipts = true
 # How old wacli's newest stored message may get before the channel reports
-# itself DEAF rather than merely quiet. A dead syncer looks exactly like a quiet
-# chat otherwise, which is how clawd's transcriber stayed blind for six days.
+# itself DEAF rather than merely quiet. Whatever refreshes the store can die,
+# and a dead syncer looks exactly like a quiet chat unless something checks.
 stale_after = "3h"
 # Emoji progress feedback, same lifecycle chain as Telegram. WhatsApp allows one
 # reaction per message per sender and a new one REPLACES the previous, so the

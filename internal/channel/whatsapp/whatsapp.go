@@ -4,12 +4,12 @@
 //
 // Why a subprocess and not a linked library:
 //
-//  1. Joe's WhatsApp account already has exactly one linked device, owned by
-//     wacli. A second whatsmeow client on the same device credentials is not a
-//     second reader, it is a takeover: WhatsApp answers with connectionReplaced
-//     (440) and the two clients knock each other offline in a loop. Reusing the
-//     one authenticated session is the only safe option, and it needs no QR
-//     pairing.
+//  1. A WhatsApp account has exactly one linked device per client, and where
+//     wacli is installed it already owns that slot. A second whatsmeow client
+//     on the same device credentials is not a second reader, it is a takeover:
+//     WhatsApp answers with connectionReplaced (440) and the two clients knock
+//     each other offline in a loop. Reusing the one authenticated session is
+//     the only safe option, and it needs no QR pairing.
 //  2. agentd is a pure-stdlib single static binary (design 3.11). Linking
 //     go.mau.fi/whatsmeow would drag in protobuf, libsignal and a cgo SQLite
 //     driver, which is a much larger decision than one channel.
@@ -936,8 +936,8 @@ func (a *Adapter) notePollFailure(err error) {
 //
 // A successful poll that returns nothing is AMBIGUOUS: either nobody messaged
 // us, or whatever refreshes wacli's local DB has died and we will now sit quiet
-// forever. That ambiguity is exactly what made clawd's voice-memo transcriber
-// blind for six days. Disambiguate by asking how old the newest message in the
+// forever. That ambiguity is the classic silent-death failure: a sibling
+// service in this operator's fleet stayed blind for six days on exactly it. Disambiguate by asking how old the newest message in the
 // DB is, across ALL chats and both directions: if the syncer is alive that
 // number stays bounded; if it died it grows without limit.
 func (a *Adapter) notePollSuccess(ctx context.Context) {

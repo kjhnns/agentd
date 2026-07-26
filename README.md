@@ -543,8 +543,8 @@ The adapter logs a startup WARNING naming every `allow` entry that has no
 
 `wacli messages list --json` omits the quoted fields entirely, which is why
 `ReplyTo` was empty in the first cut. The data does exist: the local DB carries
-`messages.quoted_msg_id` and `messages.quoted_sender_jid` (239 of 16123 rows
-populated in Joe's store), and **`wacli messages show --json` exposes them**, in
+`messages.quoted_msg_id` and `messages.quoted_sender_jid` (confirmed populated
+against a real store), and **`wacli messages show --json` exposes them**, in
 snake_case rather than the PascalCase the other commands use. The adapter
 therefore does one extra `messages show` lookup per delivered message to
 populate `InboundMsg.ReplyTo`. That is a local read, so it does not contend on
@@ -555,13 +555,41 @@ turn: threading is a nice-to-have, the message is not.
 
 A successful poll that returns nothing is **ambiguous**: either nobody messaged
 us, or whatever refreshes wacli's local DB has died and the channel will now sit
-quiet forever. That exact ambiguity kept clawd's voice-memo transcriber blind
-for six days. The adapter disambiguates it by asking, on every successful poll,
+quiet forever. That exact ambiguity is the classic silent-death failure mode; a
+sibling service in this operator's fleet stayed blind for six days on it. The adapter disambiguates it by asking, on every successful poll,
 how old the newest message in the store is across all chats and both directions.
 If the syncer is alive that number stays bounded; if it died it grows without
 limit. Past `stale_after` (default 3h) the channel reports `Health.OK = false`
 and fires `OnUnhealthy` once per transition, which the server turns into a
 notify-hub issue. Repeated poll failures (3 in a row) also flip it unhealthy.
+
+### Operational note: the wacli store lock
+
+`wacli` guards its single WhatsApp session with an **exclusive store lock**, so
+exactly one wacli invocation touches a given store at a time. Three consequences
+an operator should know before enabling this channel:
+
+1. **Inbound is a poll, not a stream, on purpose.** `wacli sync --follow
+   --webhook` would be the obvious live-push design and it does exist, but
+   follow-mode holds the lock and the WhatsApp connection for its entire
+   lifetime, which starves every outbound send. Local reads (`messages list`,
+   `messages show`) do **not** contend, so the adapter polls the local DB and
+   keeps the lock free for sends and reactions.
+2. **`sync = false` is the safe default.** With it, the adapter only *reads*
+   wacli's local DB and never syncs, so it coexists with whatever else already
+   keeps that store fresh. Inbound latency is then bounded by that other job's
+   cadence plus `poll`. If a host runs, say, a `wacli sync --once` from cron or
+   launchd every 60 seconds, worst-case inbound latency is roughly 60s + `poll`.
+3. **`sync = true` buys latency and demands exclusivity.** The adapter then runs
+   `wacli sync --once` itself each tick, cutting inbound latency to about
+   `poll`. Only turn it on if **nothing else syncs that store**. Two syncers do
+   not degrade gracefully: they fight over the lock and both lose, with the
+   loser reporting `store is locked (another wacli is running?)`. Retiring the
+   other syncer first is the operator's call, and this repo does not make it.
+
+Whatever the choice, a store that stops being refreshed is the dangerous case,
+because a channel with a dead syncer looks exactly like a quiet one. That is
+what `stale_after` and the health check below exist to catch.
 
 ### Prompt-injection posture
 
