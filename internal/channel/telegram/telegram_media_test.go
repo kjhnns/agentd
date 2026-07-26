@@ -34,6 +34,7 @@ type botServer struct {
 	sent      []string // sendMessage text bodies
 	fileBytes []byte
 	gotFileID string
+	reactions int // setMessageReaction calls (receipt 👀 on every media message)
 }
 
 func newBotServer(t *testing.T, fileBytes []byte) *botServer {
@@ -41,6 +42,12 @@ func newBotServer(t *testing.T, fileBytes []byte) *botServer {
 	bs := &botServer{fileBytes: fileBytes}
 	bs.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/setMessageReaction"):
+			bs.mu.Lock()
+			bs.reactions++
+			bs.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
 		case strings.HasSuffix(r.URL.Path, "/getFile"):
 			bs.mu.Lock()
 			bs.gotFileID = r.URL.Query().Get("file_id")

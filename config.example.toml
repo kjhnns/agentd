@@ -78,6 +78,14 @@ enabled = true                   # default true; set false to park the channel
 token   = "env:TG_BOT_TOKEN"     # export TG_BOT_TOKEN before starting
 allow   = ["7597951120"]         # chat-id allowlist, server-enforced
 policy  = "dm-only"
+# Emoji progress feedback on YOUR OWN message, so a turn is legible at a glance:
+#   👀 received (server has it)  ->  ⚡ working (a session picked it up)
+#   ->  👍 done (reply sent)  |  😱 error (turn failed/timed out)  |  🤔 waiting on you
+# Each call REPLACES the previous glyph (Bot API setMessageReaction). Telegram
+# only accepts its own fixed reaction whitelist (✅ and ⚠️ are rejected), so the
+# glyphs above are all whitelisted ones; a rejected emoji is logged and ignored,
+# never fatal to the turn. Default true; set false for no reactions at all.
+reactions = true
 
 # The WEB channel: a self-contained local UI served by the SAME server (no 2nd
 # port) at /ui, and the reference ChannelAdapter the future wrist/phone app is a

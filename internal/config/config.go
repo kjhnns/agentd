@@ -63,6 +63,9 @@ type Channel struct {
 	Enabled bool     // default true; enabled=false parks the channel
 	Path    string   // web channel: UI route (default "/ui")
 	Title   string   // web channel: UI title
+	// Reactions toggles emoji progress feedback on the user's own inbound
+	// message (telegram: setMessageReaction 👀 -> ⚡ -> 👍 / 😱). Default true.
+	Reactions bool
 }
 
 // Job is one [[job]] entry: a declaratively configured proactive job for the
@@ -181,7 +184,8 @@ func Parse(data []byte) (*Config, error) {
 				curJob = nil
 				section = "harness"
 			case "channel":
-				cfg.Channel = append(cfg.Channel, Channel{Enabled: true}) // enabled defaults true
+				// enabled + reactions both default true
+				cfg.Channel = append(cfg.Channel, Channel{Enabled: true, Reactions: true})
 				curChannel = &cfg.Channel[len(cfg.Channel)-1]
 				curHarness = nil
 				curJob = nil
@@ -380,6 +384,13 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 				return fmt.Errorf("enabled: %w", err)
 			}
 			ch.Enabled = b
+			return nil
+		case "reactions":
+			b, err := asBool(raw)
+			if err != nil {
+				return fmt.Errorf("reactions: %w", err)
+			}
+			ch.Reactions = b
 			return nil
 		case "allow":
 			arr, err := asStringArray(raw)

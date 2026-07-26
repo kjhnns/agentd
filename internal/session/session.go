@@ -465,6 +465,20 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	if m.log != nil {
 		_ = m.log.Append("inbound", in)
 	}
+
+	// Emoji progress feedback on the user's own message. Best-effort by
+	// contract: an adapter that cannot react no-ops, and a reaction failure
+	// never changes the turn's outcome. The receipt glyph (👀) is set by the
+	// adapter at receipt; this function owns the rest of the chain.
+	react := func(emoji string) {
+		if in.MsgID == "" || emoji == "" {
+			return
+		}
+		if err := ch.Ack(in.UserID, in.MsgID, emoji); err != nil {
+			log.Printf("session: reaction %q on %s/%s failed: %v", emoji, in.Channel, in.MsgID, err)
+		}
+	}
+
 	id, ok := sessionForChat[in.UserID]
 	if ok {
 		// A session the idle-GC reclaimed (process freed) no longer exists; the
@@ -477,11 +491,18 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	if !ok {
 		s, err := m.Create(ctx, "", cwd, model, "telegram:"+in.UserID)
 		if err != nil {
+			react(channel.ReactionError)
 			return err
 		}
 		id = s.ID
 		sessionForChat[in.UserID] = id
 	}
+
+	// A session has the prompt: the turn is in flight. Every exit below flips
+	// this to the done or error glyph via the deferred final reaction.
+	react(channel.ReactionWorking)
+	finalReaction := channel.ReactionError
+	defer func() { react(finalReaction) }()
 
 	// Collect the result by subscribing to the bus for this session's result event.
 	subID, events := m.bus.Subscribe()
@@ -513,6 +534,10 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 			} else {
 				result = lastOutput
 			}
+		case eventbus.KindNeedsInput:
+			// Interim state: the agent is blocked on the user. The terminal
+			// done/error glyph still replaces it when the turn resolves.
+			react(channel.ReactionNeedsInput)
 		}
 	}
 	timeout := time.After(150 * time.Second)
@@ -556,5 +581,6 @@ collect:
 	if m.log != nil {
 		_ = m.log.Append("outbound", map[string]string{"session": id, "chat": in.UserID, "msg_id": rcpt.ID, "text": result})
 	}
+	finalReaction = channel.ReactionDone
 	return nil
 }

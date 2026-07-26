@@ -20,10 +20,26 @@ import (
 type InboundMsg struct {
 	Channel string           `json:"channel"`  // "telegram", ...
 	UserID  string           `json:"user_id"`  // chat id / user id (allowlist key)
+	MsgID   string           `json:"msg_id"`   // provider message id; the Ack/react target
+	Sender  string           `json:"sender"`   // provider sender id (may differ from UserID in groups)
+	TS      int64            `json:"ts"`       // provider send time, unix seconds (0 = unknown)
 	Text    string           `json:"text"`     // message text / caption (UNTRUSTED input)
 	Media   []media.Artifact `json:"media"`    // ingested artifacts; may be empty
 	ReplyTo string           `json:"reply_to"` // id of the message being replied to
 }
+
+// Lifecycle reaction emoji. These are the visible progress feedback a user gets
+// on their own message while a turn runs, ported behaviour-for-behaviour from
+// clawd's tg-bridge chain (daemon 👀 on receipt, UserPromptSubmit hook ⚡, Stop
+// hook 👍, stall watcher 😱). Every glyph here is on Telegram's fixed
+// bot-reaction whitelist; a channel that cannot react implements Ack as a no-op.
+const (
+	ReactionReceived   = "👀" // message reached the server
+	ReactionWorking    = "⚡" // a session picked it up, turn in flight
+	ReactionDone       = "👍" // turn finished, reply sent
+	ReactionError      = "😱" // turn failed / timed out
+	ReactionNeedsInput = "🤔" // the agent is waiting on the user
+)
 
 // OutboundMsg is a normalized outbound message.
 type OutboundMsg struct {
@@ -47,6 +63,8 @@ type Adapter interface {
 	// Send delivers an outbound message and returns a real id (evidence).
 	Send(ctx context.Context, m OutboundMsg) (SendReceipt, error)
 	SupportsMedia() bool
-	// Ack is optional read/typing/react; a no-op is a valid implementation.
-	Ack(msgID, reaction string) error
+	// Ack is optional read/typing/react feedback on an INBOUND message; a no-op
+	// is a valid implementation. It must never block or fail the caller's turn:
+	// implementations are best-effort and log their own failures.
+	Ack(chatID, msgID, reaction string) error
 }

@@ -55,7 +55,8 @@ scope. What is IN:
   session path is the persistent one above.
 - **Channel adapter interface** (`internal/channel`) + a fresh in-process
   **Telegram adapter** (`internal/channel/telegram`): getUpdates long-poll with
-  backoff, server-enforced chat-id allowlist, `sendMessage`. No tg-bridge reuse,
+  backoff, server-enforced chat-id allowlist, `sendMessage`, and emoji progress
+  reactions (see the Telegram reactions section below). No tg-bridge reuse,
   no SSE, no MCP proxy, no enabledPlugins flag.
 - **Web channel** (`internal/channel/web`): a self-contained, authenticated local
   UI served by the SAME server, and the reference ChannelAdapter (see the
@@ -438,6 +439,45 @@ Configured by the single `[media]` block (`config.example.toml`): `enabled`,
 `whisper_key` (literal or `env:VAR`), `whisper_model`, `whisper_lang`,
 `max_file_mb`, `retention`, `media_dir`.
 
+## Telegram channel: emoji progress reactions
+
+Every inbound Telegram message carries a visible progress marker on the user's
+OWN message, so the state of a turn is legible at a glance without the bot
+sending any chatter. This is the reaction chain ported from clawd's tg-bridge
+(daemon receipt react + `tg-thinking-react` UserPromptSubmit hook +
+`tg-turn-done` Stop hook), reimplemented as one in-process path:
+
+| Stage | Emoji | Set by | When |
+| --- | --- | --- | --- |
+| received | 👀 | adapter (`handleUpdate`) | update passes the allowlist, before any work (media included, before download/transcription) |
+| working | ⚡ | `session.RouteInbound` | a session has the prompt, turn in flight |
+| needs input | 🤔 | `session.RouteInbound` | an `eventbus.KindNeedsInput` event arrives mid-turn |
+| done | 👍 | `session.RouteInbound` | result collected and the reply was sent |
+| error | 😱 | `session.RouteInbound` | turn failed, timed out, or the session could not be created |
+
+Unsupported media kinds and non-allowlisted chats get NO reaction, matching
+tg-bridge (the former gets a one-line text decline, the latter is silently
+dropped).
+
+Mechanics and guarantees:
+
+- `Adapter.Ack(chatID, msgID, reaction)` calls the Bot API `setMessageReaction`.
+  A one-element reaction list REPLACES the bot's previous glyph, so the chain
+  reads as one changing marker rather than a pile of emoji.
+- Telegram accepts reactions only from its own fixed whitelist. `✅` / `⚠️` /
+  `❗` come back `REACTION_INVALID` for a bot in a private chat (verified in
+  clawd on 2026-06-06), which is why "done" is 👍 and not a check mark. Every
+  glyph above is on the whitelist.
+- Reactions can never block or fail a turn. `Ack` enqueues onto ONE worker
+  goroutine (bounded queue; a full queue drops with a log) and returns
+  immediately, which also keeps the chain in lifecycle order. The HTTP call has
+  its own 5s timeout, and an API rejection is logged and swallowed.
+- Capturing `message_id` is what makes any of this possible: `InboundMsg` now
+  carries `MsgID`, plus the provider `TS` (unix seconds) and `Sender` id.
+- Config: `reactions` on the `[[channel]]` block, default `true`,
+  `reactions = false` parks the whole chain (receipt included). Channels that
+  cannot react (web) implement `Ack` as a no-op.
+
 ## What is actually proven vs stubbed
 
 - **Proven working:** the Claude Code PERSISTENT streaming vertical. A live gated
@@ -452,7 +492,11 @@ Configured by the single `[media]` block (`config.example.toml`): `enabled`,
 - **Compiles + unit-tested, NOT exercised against live infra:** the Telegram
   adapter against a real bot (needs a `TG_BOT_TOKEN`); the full end-to-end
   Telegram <-> Claude round-trip is wired in `session.RouteInbound` but has not been
-  run against a live bot in this scaffold.
+  run against a live bot in this scaffold. The reaction chain is covered by
+  httptest Bot API fixtures (`telegram_react_test.go`: metadata capture, the
+  ordered 👀 -> ⚡ -> 👍 chain over a real `RouteInbound` turn, the needs-input
+  glyph, a `REACTION_INVALID` rejection not breaking the turn, and
+  `reactions = false` producing zero calls).
 - **Web channel + notification hub — proven over the real HTTP/WS/scheduler
   stack:** unit + integration tests cover the notifier fan-out
   (`internal/notify`), the scheduler notify policy -> hub -> web sink path

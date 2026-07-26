@@ -589,7 +589,7 @@ func serve(args []string) {
 				log.Printf("agentd: telegram channel configured but token empty (%s); channel NOT started", c.Token)
 				continue
 			}
-			tg = telegram.New(token, c.Allow)
+			tg = telegram.New(token, c.Allow).WithReactions(c.Reactions)
 			if mediaSvc != nil {
 				tg.WithMedia(mediaSvc)
 			}
@@ -599,7 +599,7 @@ func serve(args []string) {
 			}
 			transportUp.Store(true)
 			hub.Register(tg) // Telegram is a notify sink too (uniform hub)
-			log.Printf("agentd: telegram channel started (allow=%v)", c.Allow)
+			log.Printf("agentd: telegram channel started (allow=%v, reactions=%v)", c.Allow, c.Reactions)
 
 			sessionForChat := map[string]string{}
 			go func(ch *telegram.Adapter) {

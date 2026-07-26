@@ -76,10 +76,10 @@ func New(bus *eventbus.Bus, title string) *Adapter {
 
 // ---- channel.Adapter ----
 
-func (a *Adapter) Name() string                       { return "web" }
-func (a *Adapter) SupportsMedia() bool                { return false }
-func (a *Adapter) Inbound() <-chan channel.InboundMsg { return a.inbound }
-func (a *Adapter) Ack(msgID, reaction string) error   { return nil }
+func (a *Adapter) Name() string                             { return "web" }
+func (a *Adapter) SupportsMedia() bool                      { return false }
+func (a *Adapter) Inbound() <-chan channel.InboundMsg       { return a.inbound }
+func (a *Adapter) Ack(chatID, msgID, reaction string) error { return nil }
 
 // UserID is the session key the web channel routes under (exported for wiring).
 func (a *Adapter) UserID() string { return webUserID }

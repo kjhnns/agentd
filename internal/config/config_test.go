@@ -124,6 +124,30 @@ enabled = false
 	}
 }
 
+func TestParseChannelReactions(t *testing.T) {
+	cfg, err := Parse([]byte(`
+[[channel]]
+kind = "telegram"
+
+[[channel]]
+kind = "telegram"
+reactions = false
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !cfg.Channel[0].Reactions {
+		t.Error("reactions should default true")
+	}
+	if cfg.Channel[1].Reactions {
+		t.Error("reactions=false should park emoji progress feedback")
+	}
+	// Strict key switch: an unknown channel key is still an error.
+	if _, err := Parse([]byte("[[channel]]\nkind = \"telegram\"\nreaction = true\n")); err == nil {
+		t.Error("expected unknown [[channel]] key to be rejected")
+	}
+}
+
 func TestParseWorkspaceTable(t *testing.T) {
 	cfg, err := Parse([]byte(`
 [workspace]
