@@ -108,13 +108,42 @@ kind      = "whatsapp"
 enabled   = false                              # opt in deliberately: wide-open inbound surface
 bin       = "/Users/johannes/bin/wacli"        # 0.11.1+; the PATH copy may be stale (0.5.0 gets 405)
 # store   = "/Users/johannes/.wacli"           # omit to use wacli's own default
-allow     = ["41791234567@s.whatsapp.net"]     # REQUIRED; empty refuses to start
+
+# ACCESS. `allow` is the DM allowlist AND the owner set: only these peers can
+# make the agent act. LIST BOTH JID FORMS FOR EACH PERSON. A real @lid JID has
+# DIFFERENT DIGITS from the phone JID, so listing the phone number does NOT
+# cover the @lid, and WhatsApp routes some replies over @lid. Missing it means
+# your own replies are silently dropped. Find yours with:
+#   sqlite3 ~/.wacli/session.db 'select * from whatsmeow_lid_map'
+# The channel logs a startup WARNING for any entry with no @lid counterpart.
+# Two entries, ONE person: the phone JID and that same person's @lid, whose
+# digits are unrelated to the phone number. (Arrays must stay on one line: the
+# config parser is line-based.)
+allow     = [ "41791234567@s.whatsapp.net", "188884444777@lid" ]
+
+# DM and group policies are INDEPENDENT: open | allowlist | locked.
+# Locking groups does not close DMs, and vice versa.
+policy_dm    = "allowlist"
+policy_group = "allowlist"
+# Groups the agent may read AND answer in.
+allow_groups    = []
+# Groups the agent reads but NEVER speaks in. Membership here alone is enough
+# to deliver; if a group is in both lists, read-only wins.
+readonly_groups = []
+
 poll      = "20s"                              # inbound poll interval
 # sync=true makes this channel refresh wacli's local DB itself, which cuts
 # inbound latency. Only enable when NOTHING ELSE runs `wacli sync` (clawd's
 # com.joe_pa.monitor-whatsapp launchd job runs one every 60s); two syncers fight
 # the store lock and both lose.
 sync      = false
+# Blue ticks on delivered messages (wacli chats mark-read, the equivalent of
+# Baileys readMessages). Suppressed in read-only chats and for group bystanders.
+read_receipts = true
+# How old wacli's newest stored message may get before the channel reports
+# itself DEAF rather than merely quiet. A dead syncer looks exactly like a quiet
+# chat otherwise, which is how clawd's transcriber stayed blind for six days.
+stale_after = "3h"
 # Emoji progress feedback, same lifecycle chain as Telegram. WhatsApp allows one
 # reaction per message per sender and a new one REPLACES the previous, so the
 # chain reads as one changing marker. Unlike Telegram there is no fixed emoji

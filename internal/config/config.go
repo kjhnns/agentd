@@ -77,6 +77,22 @@ type Channel struct {
 	// wacli holds an EXCLUSIVE store lock, so enabling this REQUIRES that
 	// nothing else runs `wacli sync` (clawd's monitor-whatsapp job does).
 	Sync bool
+	// whatsapp access model, ported from Camila's Baileys channel: DMs and
+	// groups get INDEPENDENT policies, each "open" | "allowlist" | "locked"
+	// (default allowlist). Allow is the DM list and doubles as the owner set.
+	PolicyDM    string
+	PolicyGroup string
+	// AllowGroups are group JIDs the agent may read AND answer in.
+	AllowGroups []string
+	// ReadonlyGroups are group JIDs the agent reads but never speaks in.
+	// Membership here alone is enough to deliver; if a group is in both lists,
+	// read-only wins.
+	ReadonlyGroups []string
+	// ReadReceipts sends blue ticks on delivered messages. Default true.
+	ReadReceipts bool
+	// StaleAfter is how old wacli's newest stored message may get before the
+	// channel reports itself deaf rather than merely quiet. Default 3h.
+	StaleAfter time.Duration
 }
 
 // Job is one [[job]] entry: a declaratively configured proactive job for the
@@ -197,7 +213,7 @@ func Parse(data []byte) (*Config, error) {
 				section = "harness"
 			case "channel":
 				// enabled + reactions both default true
-				cfg.Channel = append(cfg.Channel, Channel{Enabled: true, Reactions: true})
+				cfg.Channel = append(cfg.Channel, Channel{Enabled: true, Reactions: true, ReadReceipts: true})
 				curChannel = &cfg.Channel[len(cfg.Channel)-1]
 				curHarness = nil
 				curJob = nil
@@ -424,6 +440,34 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 			}
 			ch.Sync = b
 			return nil
+		case "read_receipts":
+			b, err := asBool(raw)
+			if err != nil {
+				return fmt.Errorf("read_receipts: %w", err)
+			}
+			ch.ReadReceipts = b
+			return nil
+		case "allow_groups":
+			arr, err := asStringArray(raw)
+			if err != nil {
+				return err
+			}
+			ch.AllowGroups = arr
+			return nil
+		case "readonly_groups":
+			arr, err := asStringArray(raw)
+			if err != nil {
+				return err
+			}
+			ch.ReadonlyGroups = arr
+			return nil
+		case "stale_after":
+			d, err := asDuration(raw)
+			if err != nil {
+				return fmt.Errorf("stale_after: %w", err)
+			}
+			ch.StaleAfter = d
+			return nil
 		case "poll":
 			d, err := asDuration(raw)
 			if err != nil {
@@ -451,6 +495,10 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 			ch.Bin = s
 		case "store":
 			ch.Store = s
+		case "policy_dm":
+			ch.PolicyDM = s
+		case "policy_group":
+			ch.PolicyGroup = s
 		default:
 			return fmt.Errorf("unknown [[channel]] key %q", key)
 		}
