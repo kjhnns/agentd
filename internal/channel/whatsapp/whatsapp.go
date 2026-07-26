@@ -558,13 +558,34 @@ func (a *Adapter) setReaction(r reactReq) error {
 func (a *Adapter) wacli(ctx context.Context, args ...string) ([]byte, error) {
 	full := make([]string, 0, len(args)+4)
 	full = append(full, args...)
-	full = append(full, "--lock-wait", defaultLockWait.String())
+	full = append(full, "--lock-wait", lockWaitFor(ctx).String())
 	if a.store != "" {
 		full = append(full, "--store", a.store)
 	}
 	a.exec.Lock()
 	defer a.exec.Unlock()
 	return a.run(ctx, full)
+}
+
+// lockWaitFor sizes --lock-wait to the caller's remaining budget. Without this
+// a caller on a short deadline (session.RouteInbound sends its failure notice
+// on a DETACHED 20s context) would have wacli killed by CommandContext while it
+// was still politely waiting for the store lock, and the user would get the
+// silence that notice exists to prevent. Leave headroom so wacli reports a
+// lock-timeout itself rather than dying mid-wait.
+func lockWaitFor(ctx context.Context) time.Duration {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return defaultLockWait
+	}
+	budget := time.Duration(float64(time.Until(dl)) * 0.8)
+	if budget < time.Second {
+		return time.Second
+	}
+	if budget > defaultLockWait {
+		return defaultLockWait
+	}
+	return budget
 }
 
 func (a *Adapter) execWacli(ctx context.Context, args []string) ([]byte, error) {

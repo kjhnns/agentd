@@ -616,6 +616,59 @@ func TestWacliInvocationsAreSerialized(t *testing.T) {
 	}
 }
 
+// TestLockWaitRespectsCallerDeadline guards the interaction with
+// session.RouteInbound, which sends its failure notice on a detached 20s
+// context: a longer --lock-wait would have wacli killed mid-wait and the user
+// would get silence instead of the failure line.
+func TestLockWaitRespectsCallerDeadline(t *testing.T) {
+	if got := lockWaitFor(context.Background()); got != defaultLockWait {
+		t.Errorf("no deadline: lock-wait = %v, want %v", got, defaultLockWait)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	got := lockWaitFor(ctx)
+	if got >= 20*time.Second {
+		t.Errorf("lock-wait %v must stay inside the caller's 20s budget", got)
+	}
+	if got < 10*time.Second {
+		t.Errorf("lock-wait %v is needlessly short for a 20s budget", got)
+	}
+	// An already-expired budget must not produce a negative or zero duration.
+	dead, cancel2 := context.WithTimeout(context.Background(), -time.Second)
+	defer cancel2()
+	if got := lockWaitFor(dead); got <= 0 {
+		t.Errorf("expired budget: lock-wait = %v, must stay positive", got)
+	}
+	// A very long budget is still capped.
+	long, cancel3 := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel3()
+	if got := lockWaitFor(long); got != defaultLockWait {
+		t.Errorf("long budget: lock-wait = %v, want the %v cap", got, defaultLockWait)
+	}
+}
+
+func TestSendForwardsBoundedLockWait(t *testing.T) {
+	a, f := newAdapter([]string{"41791234567"})
+	f.respond = func(args []string) ([]byte, error) { return []byte(`{"success":true,"data":{"MsgID":"X"}}`), nil }
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := a.Send(ctx, channel.OutboundMsg{ChatID: "41791234567@s.whatsapp.net", Text: "hi"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	c := f.argv()[0]
+	i := indexOf(c, "--lock-wait")
+	if i < 0 {
+		t.Fatalf("no --lock-wait in %v", c)
+	}
+	d, err := time.ParseDuration(c[i+1])
+	if err != nil {
+		t.Fatalf("unparsable lock-wait %q: %v", c[i+1], err)
+	}
+	if d >= 20*time.Second {
+		t.Errorf("lock-wait %v exceeds the caller's budget", d)
+	}
+}
+
 func TestStoreFlagForwarded(t *testing.T) {
 	a, f := newAdapter([]string{"41791234567"})
 	a.WithStore("/tmp/altstore")
