@@ -478,6 +478,59 @@ Mechanics and guarantees:
   `reactions = false` parks the whole chain (receipt included). Channels that
   cannot react (web) implement `Ack` as a no-op.
 
+## WhatsApp channel (`internal/channel/whatsapp`)
+
+The WhatsApp adapter opens **no WhatsApp connection of its own and needs no QR
+pairing**. It drives the already-paired [`wacli`](https://wacli.sh) session
+(whatsmeow, store at `~/.wacli`) as a serialized subprocess.
+
+Why not link whatsmeow directly, which would be the natural fit for a Go server:
+
+- The account already has exactly one linked device, owned by `wacli`. A second
+  whatsmeow client on the **same device credentials is a takeover, not a second
+  reader**: WhatsApp replies `connectionReplaced` (440) and the two clients
+  knock each other offline in a loop. Reusing the one authenticated session is
+  the only safe option, and it needs nothing from the user.
+- agentd is a pure-stdlib single static binary (design 3.11). `go.mau.fi/whatsmeow`
+  would drag in protobuf, libsignal and a cgo SQLite driver, which is a much
+  bigger decision than one channel.
+
+**The lock constraint shapes the design.** `wacli` guards that single session
+with an *exclusive store lock*, so exactly one invocation may run at a time.
+Inbound is therefore a cursor poll of wacli's **local DB** (`wacli messages list
+--json --from-them --asc --after <cursor>`), which is a read and does not
+contend, rather than `wacli sync --follow --webhook`: follow-mode holds the lock
+and the WhatsApp connection for its entire lifetime, which would starve every
+outbound send. Every invocation goes through one mutex plus `--lock-wait`.
+
+| Concern | How |
+| --- | --- |
+| inbound | cursor poll, `poll` interval (default 20s); dedup by message id |
+| allowlist | server-enforced, matches the **bare number, the phone JID and the `@lid` JID** (WhatsApp delivers replies on a `@lid` JID distinct from the phone JID; matching one form only silently loses messages). An **empty `allow` refuses to start** |
+| groups | supported. `UserID` is the group JID (session + allowlist key), `Sender` is the participant JID, so a group thread keeps one session while still attributing each turn |
+| media | voice notes, images and documents go through `wacli media download` into a temp dir and then `media.Ingest` with `Source: "whatsapp"`, so they get the identical transcription and path-reference treatment as Telegram. No marker text is baked here; `session.RenderInbound` owns that |
+| outbound | `wacli send text --json`; the returned message id is the acceptance artifact. `Send` refuses any chat the allowlist does not cover |
+| reactions | native, via `wacli send react`. WhatsApp allows one reaction per message per sender and a new one **replaces** the previous, so the 👀 → ⚡ → 👍 / 😱 / 🤔 chain reads as one changing marker exactly like Telegram. Group reactions pass `--sender`. Unlike Telegram there is no fixed emoji whitelist, so all five glyphs go through |
+| credentials | none in config. Auth *is* the existing wacli store; the only paths configured are `bin` and (optionally) `store` |
+
+Config keys on the `[[channel]]` block: `kind = "whatsapp"`, `bin`, `store`,
+`allow`, `poll`, `sync`, `reactions`, `enabled`.
+
+`sync = true` makes the channel refresh wacli's local DB itself, which cuts
+inbound latency. **Only enable it when nothing else runs `wacli sync`** - clawd's
+`com.joe_pa.monitor-whatsapp` launchd job runs one every 60 seconds, and two
+syncers fight the store lock and both lose. With `sync = false` (the default)
+inbound latency is bounded by whatever external syncer is refreshing the DB.
+
+Out of scope, same as Telegram: outbound media (`SupportsMedia()` stays false),
+video, gif and sticker processing (these get a one-line decline, never silence).
+
+**Known gap:** `wacli messages list --json` exposes no quoted / reply-to field
+(verified against wacli 0.11.1), so `InboundMsg.ReplyTo` is always empty on this
+channel and a WhatsApp quote-reply arrives without its parent. Closing that
+needs a change in wacli, not here; a test asserts the empty value so a future
+wacli that does expose it fails loudly instead of the gap staying invisible.
+
 ## What is actually proven vs stubbed
 
 - **Proven working:** the Claude Code PERSISTENT streaming vertical. A live gated

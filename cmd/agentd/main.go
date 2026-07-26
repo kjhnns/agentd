@@ -30,6 +30,7 @@ import (
 	"github.com/kjhnns/agentd/internal/api"
 	"github.com/kjhnns/agentd/internal/channel/telegram"
 	"github.com/kjhnns/agentd/internal/channel/web"
+	"github.com/kjhnns/agentd/internal/channel/whatsapp"
 	"github.com/kjhnns/agentd/internal/config"
 	"github.com/kjhnns/agentd/internal/eventbus"
 	"github.com/kjhnns/agentd/internal/harness"
@@ -620,6 +621,36 @@ func serve(args []string) {
 					}()
 				}
 			}(tg)
+
+		case "whatsapp":
+			// Drives the ALREADY-PAIRED wacli session; no QR, no second
+			// WhatsApp connection. See internal/channel/whatsapp for why.
+			waCh := whatsapp.New(c.Bin, c.Allow).
+				WithReactions(c.Reactions).
+				WithStore(c.Store).
+				WithPoll(c.Poll).
+				WithOwnSync(c.Sync)
+			if mediaSvc != nil {
+				waCh.WithMedia(mediaSvc)
+			}
+			if err := waCh.Start(ctx); err != nil {
+				log.Printf("agentd: whatsapp start failed: %v", err)
+				continue
+			}
+			transportUp.Store(true)
+			log.Printf("agentd: whatsapp channel started (allow=%v, reactions=%v, sync=%v)", c.Allow, c.Reactions, c.Sync)
+
+			sessionForWA := map[string]string{}
+			go func(ch *whatsapp.Adapter) {
+				for in := range ch.Inbound() {
+					in := in
+					go func() {
+						if err := mgr.RouteInbound(ctx, ch, in, sessionForWA, cwd, model); err != nil {
+							log.Printf("agentd: whatsapp route inbound error: %v", err)
+						}
+					}()
+				}
+			}(waCh)
 
 		case "web":
 			webCh := web.New(bus, c.Title)

@@ -148,6 +148,65 @@ reactions = false
 	}
 }
 
+func TestParseWhatsAppChannel(t *testing.T) {
+	cfg, err := Parse([]byte(`
+[[channel]]
+kind      = "whatsapp"
+bin       = "/Users/johannes/bin/wacli"
+store     = "/Users/johannes/.wacli"
+allow     = [ "41791234567@s.whatsapp.net", "120363000000@g.us" ]
+poll      = "15s"
+sync      = true
+reactions = false
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.Channel) != 1 {
+		t.Fatalf("channels = %d, want 1", len(cfg.Channel))
+	}
+	c := cfg.Channel[0]
+	if c.Kind != "whatsapp" {
+		t.Errorf("kind = %q", c.Kind)
+	}
+	if c.Bin != "/Users/johannes/bin/wacli" {
+		t.Errorf("bin = %q", c.Bin)
+	}
+	if c.Store != "/Users/johannes/.wacli" {
+		t.Errorf("store = %q", c.Store)
+	}
+	if c.Poll != 15*time.Second {
+		t.Errorf("poll = %v, want 15s", c.Poll)
+	}
+	if !c.Sync {
+		t.Error("sync = false, want true")
+	}
+	if c.Reactions {
+		t.Error("reactions = true, want false")
+	}
+	if len(c.Allow) != 2 || c.Allow[1] != "120363000000@g.us" {
+		t.Errorf("allow = %v", c.Allow)
+	}
+	// The whatsapp channel carries NO token: auth is the existing wacli store.
+	if c.Token != "" {
+		t.Errorf("token = %q, want empty", c.Token)
+	}
+	// Defaults when the keys are absent.
+	cfg2, err := Parse([]byte("[[channel]]\nkind = \"whatsapp\"\n"))
+	if err != nil {
+		t.Fatalf("Parse defaults: %v", err)
+	}
+	if cfg2.Channel[0].Sync {
+		t.Error("sync must default false so it does not fight an external syncer")
+	}
+	if cfg2.Channel[0].Poll != 0 {
+		t.Error("poll must default to zero so the adapter picks its own default")
+	}
+	if !cfg2.Channel[0].Reactions {
+		t.Error("reactions should default true")
+	}
+}
+
 func TestParseWorkspaceTable(t *testing.T) {
 	cfg, err := Parse([]byte(`
 [workspace]

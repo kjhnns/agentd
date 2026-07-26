@@ -92,6 +92,35 @@ policy  = "dm-only"
 # never fatal to the turn. Default true; set false for no reactions at all.
 reactions = true
 
+# The WHATSAPP channel. It does NOT open its own WhatsApp connection and needs
+# NO QR pairing: it drives the already-paired `wacli` session (whatsmeow, store
+# at ~/.wacli). A second whatsmeow client on the same device credentials is a
+# TAKEOVER, not a second reader (WhatsApp answers connectionReplaced/440 and the
+# two clients knock each other offline), so reusing the one session is the only
+# safe option. There is no token: auth IS the existing wacli store.
+#
+# LOCK CONSTRAINT: wacli guards that session with an EXCLUSIVE store lock, so
+# only one wacli invocation runs at a time. That is why inbound is a cursor poll
+# of wacli's local DB (a lock-free READ) and not `wacli sync --follow`, which
+# would hold the lock and the connection forever and starve outbound sends.
+[[channel]]
+kind      = "whatsapp"
+enabled   = false                              # opt in deliberately: wide-open inbound surface
+bin       = "/Users/johannes/bin/wacli"        # 0.11.1+; the PATH copy may be stale (0.5.0 gets 405)
+# store   = "/Users/johannes/.wacli"           # omit to use wacli's own default
+allow     = ["41791234567@s.whatsapp.net"]     # REQUIRED; empty refuses to start
+poll      = "20s"                              # inbound poll interval
+# sync=true makes this channel refresh wacli's local DB itself, which cuts
+# inbound latency. Only enable when NOTHING ELSE runs `wacli sync` (clawd's
+# com.joe_pa.monitor-whatsapp launchd job runs one every 60s); two syncers fight
+# the store lock and both lose.
+sync      = false
+# Emoji progress feedback, same lifecycle chain as Telegram. WhatsApp allows one
+# reaction per message per sender and a new one REPLACES the previous, so the
+# chain reads as one changing marker. Unlike Telegram there is no fixed emoji
+# whitelist, so all five glyphs go through natively.
+reactions = true
+
 # The WEB channel: a self-contained local UI served by the SAME server (no 2nd
 # port) at /ui, and the reference ChannelAdapter the future wrist/phone app is a
 # client of. It shows the session list (status + context pressure), a live event

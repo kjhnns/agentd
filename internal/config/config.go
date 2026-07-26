@@ -67,6 +67,16 @@ type Channel struct {
 	// Reactions toggles emoji progress feedback on the user's own inbound
 	// message (telegram: setMessageReaction 👀 -> ⚡ -> 👍 / 😱). Default true.
 	Reactions bool
+	// whatsapp channel: the adapter drives the already-paired wacli session
+	// rather than opening a second WhatsApp connection, so it needs the binary
+	// and (optionally) a non-default store dir instead of a token.
+	Bin   string        // path to the wacli binary (default "wacli" on PATH)
+	Store string        // wacli store dir (default: wacli's own, ~/.wacli)
+	Poll  time.Duration // inbound poll interval (default 20s)
+	// Sync makes the channel refresh wacli's local DB itself. Off by default:
+	// wacli holds an EXCLUSIVE store lock, so enabling this REQUIRES that
+	// nothing else runs `wacli sync` (clawd's monitor-whatsapp job does).
+	Sync bool
 }
 
 // Job is one [[job]] entry: a declaratively configured proactive job for the
@@ -407,6 +417,20 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 			}
 			ch.Allow = arr
 			return nil
+		case "sync":
+			b, err := asBool(raw)
+			if err != nil {
+				return fmt.Errorf("sync: %w", err)
+			}
+			ch.Sync = b
+			return nil
+		case "poll":
+			d, err := asDuration(raw)
+			if err != nil {
+				return fmt.Errorf("poll: %w", err)
+			}
+			ch.Poll = d
+			return nil
 		}
 		s, err := asString(raw)
 		if err != nil {
@@ -423,6 +447,10 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 			ch.Path = s
 		case "title":
 			ch.Title = s
+		case "bin":
+			ch.Bin = s
+		case "store":
+			ch.Store = s
 		default:
 			return fmt.Errorf("unknown [[channel]] key %q", key)
 		}
