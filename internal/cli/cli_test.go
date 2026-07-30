@@ -203,7 +203,7 @@ func TestRunSessionTargeting(t *testing.T) {
 	d, srv := newFakeDaemon(t)
 	point(t, srv)
 	d.mu.Lock()
-	d.titles["telegram-a"] = "telegram:7597951120"
+	d.titles["telegram-a"] = "telegram:123456789"
 	d.mu.Unlock()
 
 	code, _, stderr := runCLI(t, "", "-session", "telegram-a", "hello")
@@ -380,14 +380,14 @@ func TestSessionsCommandLists(t *testing.T) {
 	d, srv := newFakeDaemon(t)
 	point(t, srv)
 	d.mu.Lock()
-	d.titles["abc123"] = "telegram:7597951120"
+	d.titles["abc123"] = "telegram:123456789"
 	d.mu.Unlock()
 
 	var out, errb bytes.Buffer
 	if code := Sessions(nil, &out, &errb); code != ExitOK {
 		t.Fatalf("exit = %d: %s", code, errb.String())
 	}
-	if !strings.Contains(out.String(), "abc123") || !strings.Contains(out.String(), "telegram:7597951120") {
+	if !strings.Contains(out.String(), "abc123") || !strings.Contains(out.String(), "telegram:123456789") {
 		t.Fatalf("listing = %q", out.String())
 	}
 }

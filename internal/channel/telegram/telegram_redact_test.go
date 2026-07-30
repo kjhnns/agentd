@@ -66,7 +66,7 @@ func assertScrubbed(t *testing.T, what, s string) {
 // request URL. This is the exact shape of the real leak (a getUpdates
 // "context deadline exceeded" whose url.Error carried bot<TOKEN> into the log).
 func newDeadAdapter() *Adapter {
-	a := New(testToken, []string{"7597951120"})
+	a := New(testToken, []string{"123456789"})
 	a.base = "http://127.0.0.1:1" // nothing listens on port 1: connection refused
 	a.client = &http.Client{Timeout: 2 * time.Second}
 	return a
@@ -125,7 +125,7 @@ func TestPollLoopLogLineIsRedacted(t *testing.T) {
 // TestSendTransportErrorIsRedacted covers the sendMessage path.
 func TestSendTransportErrorIsRedacted(t *testing.T) {
 	a := newDeadAdapter()
-	_, err := a.Send(context.Background(), channel.OutboundMsg{ChatID: "7597951120", Text: "hi"})
+	_, err := a.Send(context.Background(), channel.OutboundMsg{ChatID: "123456789", Text: "hi"})
 	if err == nil {
 		t.Fatal("expected a transport error")
 	}
@@ -136,7 +136,7 @@ func TestSendTransportErrorIsRedacted(t *testing.T) {
 // failures are logged by reactLoop on every rejected emoji.
 func TestSetReactionTransportErrorIsRedacted(t *testing.T) {
 	a := newDeadAdapter()
-	err := a.setReaction("7597951120", 42, "👀")
+	err := a.setReaction("123456789", 42, "👀")
 	if err == nil {
 		t.Fatal("expected a transport error")
 	}
@@ -176,7 +176,7 @@ func TestDownloadFileDownloadLegIsRedacted(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := New(testToken, []string{"7597951120"})
+	a := New(testToken, []string{"123456789"})
 	a.base = srv.URL
 	a.client = &http.Client{Timeout: 2 * time.Second}
 

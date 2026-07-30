@@ -217,21 +217,21 @@ func TestInboundParsing(t *testing.T) {
 func TestGroupSenderDistinctFromChat(t *testing.T) {
 	// Groups ARE supported: the chat is the session + allowlist key, the
 	// participant is the identity. They must not collapse into one field.
-	a, f := newGroupAdapter([]string{"41789505264-1623055354@g.us"})
+	a, f := newGroupAdapter([]string{"41791234567-1623055354@g.us"})
 	f.respond = func(args []string) ([]byte, error) {
 		return listJSON(textMsg(
-			"41789505264-1623055354@g.us",
-			"41789505264@s.whatsapp.net",
+			"41791234567-1623055354@g.us",
+			"41791234567@s.whatsapp.net",
 			"3AD3385E", "Our flight is cancelled")), nil
 	}
 	if err := a.pollOnce(context.Background()); err != nil {
 		t.Fatalf("pollOnce: %v", err)
 	}
 	in := <-a.Inbound()
-	if in.UserID != "41789505264-1623055354@g.us" {
+	if in.UserID != "41791234567-1623055354@g.us" {
 		t.Errorf("UserID = %q, want the group jid", in.UserID)
 	}
-	if in.Sender != "41789505264@s.whatsapp.net" {
+	if in.Sender != "41791234567@s.whatsapp.net" {
 		t.Errorf("Sender = %q, want the participant jid", in.Sender)
 	}
 	if in.UserID == in.Sender {

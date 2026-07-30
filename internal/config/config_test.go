@@ -23,7 +23,7 @@ skip_permissions = true
 [[channel]]
 kind   = "telegram"
 token  = "env:TG_BOT_TOKEN"      # resolved from environment
-allow  = ["7597951120", "123"]
+allow  = ["123456789", "123"]
 policy = "dm-only"
 `
 
@@ -57,7 +57,7 @@ func TestParseSample(t *testing.T) {
 	if c.Kind != "telegram" || c.Token != "env:TG_BOT_TOKEN" || c.Policy != "dm-only" {
 		t.Errorf("channel = %+v", c)
 	}
-	if len(c.Allow) != 2 || c.Allow[0] != "7597951120" || c.Allow[1] != "123" {
+	if len(c.Allow) != 2 || c.Allow[0] != "123456789" || c.Allow[1] != "123" {
 		t.Errorf("allow = %v", c.Allow)
 	}
 }
@@ -153,8 +153,8 @@ func TestParseWhatsAppChannel(t *testing.T) {
 	cfg, err := Parse([]byte(`
 [[channel]]
 kind      = "whatsapp"
-bin       = "/Users/johannes/bin/wacli"
-store     = "/Users/johannes/.wacli"
+bin       = "/Users/me/bin/wacli"
+store     = "/Users/me/.wacli"
 allow     = [ "41791234567@s.whatsapp.net", "120363000000@g.us" ]
 poll      = "15s"
 sync      = true
@@ -170,10 +170,10 @@ reactions = false
 	if c.Kind != "whatsapp" {
 		t.Errorf("kind = %q", c.Kind)
 	}
-	if c.Bin != "/Users/johannes/bin/wacli" {
+	if c.Bin != "/Users/me/bin/wacli" {
 		t.Errorf("bin = %q", c.Bin)
 	}
-	if c.Store != "/Users/johannes/.wacli" {
+	if c.Store != "/Users/me/.wacli" {
 		t.Errorf("store = %q", c.Store)
 	}
 	if c.Poll != 15*time.Second {

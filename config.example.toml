@@ -81,7 +81,7 @@ skip_permissions = true
 kind    = "telegram"
 enabled = true                   # default true; set false to park the channel
 token   = "env:TG_BOT_TOKEN"     # export TG_BOT_TOKEN before starting
-allow   = ["7597951120"]         # chat-id allowlist, server-enforced
+allow   = ["123456789"]         # chat-id allowlist, server-enforced
 policy  = "dm-only"
 # Emoji progress feedback on YOUR OWN message, so a turn is legible at a glance:
 #   👀 received (server has it)  ->  ⚡ working (a session picked it up)

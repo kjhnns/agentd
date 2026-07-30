@@ -177,7 +177,7 @@ func TestInboundCapturesProviderMetadata(t *testing.T) {
 	a := New("tok", []string{"111"}).WithReactions(false)
 	a.base = b.srv.URL
 
-	a.handleUpdate(textUpdate(1, 111, 6543, 1750000000, 7597951120, "hi"))
+	a.handleUpdate(textUpdate(1, 111, 6543, 1750000000, 123456789, "hi"))
 
 	select {
 	case m := <-a.Inbound():
@@ -187,8 +187,8 @@ func TestInboundCapturesProviderMetadata(t *testing.T) {
 		if m.TS != 1750000000 {
 			t.Errorf("TS = %d, want 1750000000", m.TS)
 		}
-		if m.Sender != "7597951120" {
-			t.Errorf("Sender = %q, want 7597951120", m.Sender)
+		if m.Sender != "123456789" {
+			t.Errorf("Sender = %q, want 123456789", m.Sender)
 		}
 	default:
 		t.Fatal("expected an inbound message")
@@ -202,7 +202,7 @@ func TestReceiptReactionOnText(t *testing.T) {
 	a := New("tok", []string{"111"})
 	a.base = b.srv.URL
 
-	a.handleUpdate(textUpdate(1, 111, 6543, 1750000000, 7597951120, "hi"))
+	a.handleUpdate(textUpdate(1, 111, 6543, 1750000000, 123456789, "hi"))
 
 	got := b.waitEmojis(t, []string{channel.ReactionReceived})
 	if !sameStrings(got, []string{channel.ReactionReceived}) {
@@ -243,7 +243,7 @@ func TestReactionsDisabledMakesNoCalls(t *testing.T) {
 	a := New("tok", []string{"111"}).WithReactions(false)
 	a.base = b.srv.URL
 
-	runTurn(t, a, echoAdapter{}, textUpdate(1, 111, 6543, 1750000000, 7597951120, "hi"))
+	runTurn(t, a, echoAdapter{}, textUpdate(1, 111, 6543, 1750000000, 123456789, "hi"))
 
 	time.Sleep(150 * time.Millisecond)
 	if got := b.emojis(); len(got) != 0 {
@@ -263,7 +263,7 @@ func TestLifecycleReactionChain(t *testing.T) {
 	a := New("tok", []string{"111"})
 	a.base = b.srv.URL
 
-	runTurn(t, a, echoAdapter{}, textUpdate(1, 111, 6543, 1750000000, 7597951120, "hi"))
+	runTurn(t, a, echoAdapter{}, textUpdate(1, 111, 6543, 1750000000, 123456789, "hi"))
 
 	want := []string{channel.ReactionReceived, channel.ReactionWorking, channel.ReactionDone}
 	got := b.waitEmojis(t, want)
@@ -286,7 +286,7 @@ func TestNeedsInputReaction(t *testing.T) {
 	a := New("tok", []string{"111"})
 	a.base = b.srv.URL
 
-	runTurn(t, a, echoAdapter{needsInput: true}, textUpdate(1, 111, 6543, 1750000000, 7597951120, "hi"))
+	runTurn(t, a, echoAdapter{needsInput: true}, textUpdate(1, 111, 6543, 1750000000, 123456789, "hi"))
 
 	want := []string{
 		channel.ReactionReceived, channel.ReactionWorking,
@@ -306,7 +306,7 @@ func TestRejectedEmojiDoesNotBreakTurn(t *testing.T) {
 	a := New("tok", []string{"111"})
 	a.base = b.srv.URL
 
-	runTurn(t, a, echoAdapter{}, textUpdate(1, 111, 6543, 1750000000, 7597951120, "hi"))
+	runTurn(t, a, echoAdapter{}, textUpdate(1, 111, 6543, 1750000000, 123456789, "hi"))
 
 	want := []string{channel.ReactionReceived, channel.ReactionWorking, channel.ReactionDone}
 	got := b.waitEmojis(t, want)
