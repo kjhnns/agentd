@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -463,6 +464,27 @@ func (a *Adapter) Send(ctx context.Context, h harness.Handle, in harness.Input) 
 	select {
 	case e := <-waiter:
 		if e.Kind == eventbus.KindError {
+			// Auth is resolved ONCE, at claude process startup: the CLI loads the
+			// OAuth credential store into memory and never re-reads it for the life
+			// of the process. So a claude spawned while the store was bad (e.g. the
+			// CLI tombstones it -- refreshToken:"" -- after a refresh_token grant
+			// comes back invalid_grant) stays broken forever, and every later turn
+			// on this session fails even after the store has been repaired by an
+			// interactive /login. Observed 2026-08-09: session f7dd41b6f621830e kept
+			// returning "Not logged in" from a child spawned one minute before the
+			// re-login, while a session started after it answered normally.
+			//
+			// Marking the handle dead hands the session to the EXISTING dead-process
+			// recovery in session.gcSweep/recoverDead, which tears the process down
+			// and restarts it fresh from the committed artifacts under the same
+			// session id. The replacement re-reads the credential store on startup,
+			// so the session self-heals on the next sweep instead of needing a
+			// human to notice and start a new session. No token is cached, read, or
+			// logged here: the recovery is purely "throw away the stale process".
+			if isAuthError(e.Text) {
+				log.Printf("session %s: auth failure on turn; marking process dead so it is respawned with fresh credentials", hh.id)
+				hh.markDead()
+			}
 			return fmt.Errorf("claudecode: turn error: %s", e.Text)
 		}
 		return nil
@@ -501,6 +523,32 @@ func (a *Adapter) Teardown(h harness.Handle) error {
 	}
 	hh.markDead()
 	return nil
+}
+
+// authErrorMarkers are the claude CLI's credential-layer failure messages. They
+// share one property that makes them safe to key on: they are decided BEFORE any
+// request leaves the machine, from the credential store the process loaded at
+// startup, so they can never be transient/model/rate-limit errors that a retry on
+// the same process would clear. Matching is on the CLI's own wording only; e.Text
+// is a CLI diagnostic string and never carries token material.
+var authErrorMarkers = []string{
+	"OAuth session expired and could not be refreshed", // -p mode, OAuthRefreshDeadError
+	"Not logged in",                                    // no usable credential in the store
+	"Please run /login",                                // interactive-mode phrasing of the same
+	"OAuth token has expired",
+}
+
+// isAuthError reports whether a turn error came from the CLI's credential layer
+// rather than from the model or the transport. Only these justify discarding the
+// process: the credential state is fixed at process startup, so the ONLY way a
+// session recovers is a fresh process.
+func isAuthError(text string) bool {
+	for _, m := range authErrorMarkers {
+		if strings.Contains(text, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // userEnvelope builds the stream-json user message the CLI expects on stdin. This
