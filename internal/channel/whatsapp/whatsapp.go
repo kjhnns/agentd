@@ -876,7 +876,7 @@ func (a *Adapter) setReaction(r reactReq) error {
 	// and it should say so.
 	if isGroup(r.chatID) {
 		if r.sender == "" {
-			return fmt.Errorf("whatsapp: group reaction on %s/%s has no sender JID (ackSender miss); wacli requires --sender",
+			return fmt.Errorf("whatsapp: group reaction on %s/%s has no sender JID (acks miss); wacli requires --sender",
 				r.chatID, r.msgID)
 		}
 		args = append(args, "--sender", r.sender)
