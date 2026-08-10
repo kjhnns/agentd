@@ -131,12 +131,19 @@ type Policy struct {
 	MaxWallclock         time.Duration // hard backstop: reset after this handle age (0 = off)
 	GCInterval           time.Duration // sweeper cadence (0 = default 1m)
 	CheckpointTimeout    time.Duration // bound on the checkpoint-flush turn (0 = default 120s)
-	// TurnTimeout bounds ONE inbound turn (RouteInbound). It must be generous:
-	// when it expires the reply is abandoned even if the harness answers a
-	// second later, which is exactly how a real research turn silently lost its
-	// answer (see TestTurnWithinBudgetDelivers). 0 = default 15m, matching the
-	// scheduler's per-job bound.
+	// TurnTimeout is the QUIET WINDOW for ONE inbound turn (RouteInbound), not a
+	// wallclock cap: the turn is abandoned only after this long with no progress
+	// event (tool_call / output / result). Progress RESETS it, so a turn that is
+	// genuinely working is never reaped for taking a long time. When it does
+	// expire the reply is abandoned even if the harness answers a second later,
+	// which is exactly how a real research turn silently lost its answer (see
+	// TestTurnWithinBudgetDelivers). 0 = default 15m.
 	TurnTimeout time.Duration
+	// TurnCeiling is the absolute wallclock BACKSTOP on one turn, so making the
+	// bound above an inactivity timer cannot make a pathological loop
+	// unkillable. It is deliberately far above any real turn (the longest real
+	// one observed is 25m) and below MaxWallclock. 0 = default 2h, <0 = off.
+	TurnCeiling time.Duration
 }
 
 // DefaultPolicy returns the built-in tuning used when none is configured.
@@ -149,20 +156,42 @@ func DefaultPolicy() Policy {
 		GCInterval:           time.Minute,
 		CheckpointTimeout:    120 * time.Second,
 		TurnTimeout:          defaultTurnTimeout,
+		TurnCeiling:          defaultTurnCeiling,
 	}
 }
 
-// defaultTurnTimeout bounds one inbound turn when [session] turn_timeout is
-// unset. 15m matches the scheduler's per-job bound; the previous hardcoded 150s
-// was shorter than an ordinary web-research turn and silently discarded the
-// answer when it expired.
+// defaultTurnTimeout is the QUIET window when [session] turn_timeout is unset.
+// Deliberately unchanged at 15m even though it stopped being a wallclock cap:
+// as an inactivity bound it is ~6.5x the longest silence ever observed inside a
+// real working turn (138.6s, 2026-08-10 10:38:09Z to 10:40:28Z), and keeping the
+// number means a genuinely hung turn is still reaped no later than it was
+// before. Raising it would only slow down reaping the wedged case.
 const defaultTurnTimeout = 15 * time.Minute
+
+// defaultTurnCeiling is the absolute per-turn backstop. 2h is far above the
+// longest real turn observed (25m: the 2026-08-10 10:25Z booking turn, which
+// finished at 10:50:34Z) and far below MaxWallclock (8h, the handle-age reset),
+// so it can only ever catch a pathological loop.
+const defaultTurnCeiling = 2 * time.Hour
 
 func (p Policy) turnTimeout() time.Duration {
 	if p.TurnTimeout > 0 {
 		return p.TurnTimeout
 	}
 	return defaultTurnTimeout
+}
+
+// turnCeiling returns the absolute per-turn backstop. A NEGATIVE configured
+// value means "no ceiling" (opt out explicitly); zero means "use the default",
+// matching how every other Policy knob spells its default.
+func (p Policy) turnCeiling() time.Duration {
+	if p.TurnCeiling < 0 {
+		return 0
+	}
+	if p.TurnCeiling > 0 {
+		return p.TurnCeiling
+	}
+	return defaultTurnCeiling
 }
 
 func (p Policy) checkpointTimeout() time.Duration {
@@ -413,16 +442,47 @@ func (m *Manager) Send(ctx context.Context, id, text string) (*SendResult, error
 
 // TurnOptions tunes ONE collected turn (SendAndCollect).
 type TurnOptions struct {
-	// Timeout bounds the whole turn. <=0 means "no bound beyond ctx", which is
-	// what a caller that already runs under a bounded context (the scheduler)
-	// wants. On expiry the collected reply is abandoned and the error wraps
-	// ErrTurnTimeout.
+	// Timeout is the QUIET window, not a wallclock cap on the turn: the turn is
+	// abandoned only after this long with NO progress event from the session.
+	// Every tool_call / output / result RESETS it, so a turn that is genuinely
+	// working is never reaped no matter how long the work takes. <=0 means "no
+	// bound beyond ctx", which is what a caller already running under a bounded
+	// context (the scheduler) wants. On expiry the error wraps ErrTurnTimeout.
+	//
+	// It used to be a hard cap, and that killed real work: 2026-08-10T10:40:28Z
+	// a hotel-booking turn was abandoned at exactly 900.1s having emitted 45
+	// progress events (38 tool_call, 7 output), its longest quiet stretch being
+	// 138.6s. The harness finished the job at 10:50:34Z and the answer had
+	// nowhere to go. See TestLongProgressingTurnSurvivesPastTheOldHardCap.
 	Timeout time.Duration
+	// Ceiling is the absolute wallclock BACKSTOP measured from the start of the
+	// turn. It exists so an inactivity timer can never make a pathological loop
+	// (one that keeps emitting tool calls forever) unkillable. <=0 means "no
+	// ceiling". On expiry the error wraps ErrTurnCeiling (which itself wraps
+	// ErrTurnTimeout, so existing errors.Is(ErrTurnTimeout) callers still see a
+	// timeout and still map to 504).
+	Ceiling time.Duration
 	// OnEvent, when set, is called for EVERY bus event belonging to this
 	// session while the turn runs. It is the hook for interim feedback (a
 	// needs-input glyph on Telegram, a streamed line in the CLI) and must not
 	// block: it runs on the collect loop.
 	OnEvent func(eventbus.Event)
+}
+
+// isProgress reports whether an event is EVIDENCE OF WORK, i.e. whether it may
+// reset the quiet timer. Only events the harness emits because it actually did
+// something count: a tool invocation, model text, the final result.
+//
+// status and needs_input deliberately do NOT count. A status heartbeat would
+// keep a wedged turn alive forever (that is the exact failure mode an
+// inactivity timeout has to avoid), and needs_input means the turn is blocked
+// on a human who has no way to answer mid-turn, so it SHOULD age out.
+func isProgress(k eventbus.Kind) bool {
+	switch k {
+	case eventbus.KindOutput, eventbus.KindToolCall, eventbus.KindResult:
+		return true
+	}
+	return false
 }
 
 // SendAndCollect sends one user turn to a session and returns the turn's
@@ -451,14 +511,58 @@ func (m *Manager) SendAndCollect(ctx context.Context, id, text string, opt TurnO
 		turnErr <- err
 	}()
 
+	started := time.Now()
 	var result, lastOutput string
 	gotResult := false
+	steps := 0
+	lastStep := ""
+	lastProgress := started
+
+	// The quiet timer. A zero/negative Timeout means "no bound beyond ctx": a
+	// nil channel blocks forever in the select, which is exactly that.
+	var quiet *time.Timer
+	var quietC <-chan time.Time
+	if opt.Timeout > 0 {
+		quiet = time.NewTimer(opt.Timeout)
+		defer quiet.Stop()
+		quietC = quiet.C
+	}
+	// The absolute backstop. Armed once and never reset: that is the point.
+	var ceilingC <-chan time.Time
+	if opt.Ceiling > 0 {
+		ct := time.NewTimer(opt.Ceiling)
+		defer ct.Stop()
+		ceilingC = ct.C
+	}
+
 	collect := func(e eventbus.Event) {
 		if e.SessionID != id {
 			return
 		}
 		if opt.OnEvent != nil {
 			opt.OnEvent(e)
+		}
+		// Progress resets the quiet timer. This is the whole fix: work that is
+		// visibly happening buys more time; silence does not.
+		if quiet != nil && isProgress(e.Kind) {
+			if !quiet.Stop() {
+				// Already fired: drain so the stale tick cannot end the turn on
+				// the next loop iteration even though we just saw progress.
+				select {
+				case <-quiet.C:
+				default:
+				}
+			}
+			quiet.Reset(opt.Timeout)
+		}
+		if isProgress(e.Kind) {
+			steps++
+			lastProgress = time.Now()
+			if e.Kind == eventbus.KindToolCall && e.Tool != "" {
+				lastStep = "tool " + e.Tool
+			} else if e.Kind == eventbus.KindOutput && e.Text != "" {
+				lastStep = firstLine(e.Text)
+			}
 		}
 		switch e.Kind {
 		case eventbus.KindOutput:
@@ -473,12 +577,26 @@ func (m *Manager) SendAndCollect(ctx context.Context, id, text string, opt TurnO
 		}
 	}
 
-	// A zero/negative Timeout means "no bound beyond ctx": a nil channel blocks
-	// forever in the select, which is exactly that.
-	var timeout <-chan time.Time
-	if opt.Timeout > 0 {
-		timeout = time.After(opt.Timeout)
+	// abandon builds the timeout error. The PARTIAL work is not thrown away: the
+	// last streamed output and a count of completed steps ride along so the user
+	// is told what was accomplished instead of getting a bare error.
+	abandon := func(ceiling bool) (string, error) {
+		te := &TurnTimeoutError{
+			SessionID: id,
+			Ceiling:   ceiling,
+			Elapsed:   time.Since(started),
+			Quiet:     time.Since(lastProgress),
+			Budget:    opt.Timeout,
+			Steps:     steps,
+			LastStep:  lastStep,
+			Partial:   lastOutput,
+		}
+		if ceiling {
+			te.Budget = opt.Ceiling
+		}
+		return lastOutput, te
 	}
+
 	for {
 		select {
 		case e := <-events:
@@ -502,12 +620,30 @@ func (m *Manager) SendAndCollect(ctx context.Context, id, text string, opt TurnO
 				}
 			}
 			return result, nil
-		case <-timeout:
-			return "", fmt.Errorf("session %s turn timed out after %s: %w", id, opt.Timeout, ErrTurnTimeout)
+		case <-quietC:
+			return abandon(false)
+		case <-ceilingC:
+			return abandon(true)
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}
 	}
+}
+
+// firstLine returns the first non-empty line of s, truncated, for use in a
+// human-facing "last thing I was doing" summary.
+func firstLine(s string) string {
+	for _, ln := range strings.Split(s, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		if len(ln) > 120 {
+			return ln[:117] + "..."
+		}
+		return ln
+	}
+	return ""
 }
 
 // resultGrace is how long SendAndCollect keeps draining the bus after Send
@@ -518,6 +654,10 @@ const resultGrace = 2 * time.Second
 // the built-in default) so callers outside this package (the HTTP API, the
 // CLI client) bound a turn with the SAME number the channels use.
 func (m *Manager) TurnTimeout() time.Duration { return m.Policy.turnTimeout() }
+
+// TurnCeiling exposes the configured absolute per-turn backstop so callers
+// outside this package arm the SAME backstop the channels do.
+func (m *Manager) TurnCeiling() time.Duration { return m.Policy.turnCeiling() }
 
 // evalTriggers returns whether a context reset should fire after a completed
 // turn, and why. Order: hard backstops first (they protect proxy-only harnesses
@@ -602,16 +742,80 @@ func RenderInbound(in channel.InboundMsg) string {
 	return strings.Join(parts, "\n\n")
 }
 
-// ErrTurnTimeout marks a turn that was abandoned because it outran the
-// configured budget (Policy.TurnTimeout). The harness may well answer a moment
-// later; that answer has nowhere to go, which is why the budget is generous and
-// why the user is told explicitly instead of left with a bare error reaction.
+// ErrTurnTimeout marks a turn that was abandoned on a time bound. Since the
+// bound became an INACTIVITY window (Policy.TurnTimeout), this specifically
+// means the session went quiet: no tool call, no output, no result for the whole
+// window. The harness may still answer later; that answer has nowhere to go,
+// which is why the user is told explicitly instead of left with a bare glyph.
 var ErrTurnTimeout = errors.New("turn timed out")
 
-// failureNotice renders the single plain-text line a user gets when their turn
+// ErrTurnCeiling marks the BACKSTOP firing: the turn was still emitting progress
+// but blew the absolute wallclock ceiling (Policy.TurnCeiling). It wraps
+// ErrTurnTimeout so callers that only care "was this a timeout" (the HTTP API's
+// 504 mapping, the CLI) keep working unchanged, while the user-facing notice can
+// say something truthful and different.
+var ErrTurnCeiling = fmt.Errorf("turn hit its absolute ceiling: %w", ErrTurnTimeout)
+
+// TurnTimeoutError is the rich form of a turn abandonment. It carries what the
+// turn ACCOMPLISHED before it was cut off (step count, last step, last streamed
+// output) so the failure notice can report progress instead of discarding it.
+type TurnTimeoutError struct {
+	SessionID string
+	Ceiling   bool          // true = absolute backstop, false = went quiet
+	Elapsed   time.Duration // wallclock since the turn started
+	Quiet     time.Duration // since the last progress event
+	Budget    time.Duration // the bound that fired
+	Steps     int           // progress events seen (tool calls + output + result)
+	LastStep  string        // human summary of the last thing it did
+	Partial   string        // last streamed output, the salvageable work
+}
+
+func (e *TurnTimeoutError) Error() string {
+	// Both forms lead with "timed out after <the CONFIGURED bound>" so an
+	// operator reads the knob that fired, not a jittery measured value.
+	if e.Ceiling {
+		return fmt.Sprintf("session %s turn timed out after %s: hit the absolute ceiling while still working (ran %s, %d steps): %v",
+			e.SessionID, dur(e.Budget), dur(e.Elapsed), e.Steps, ErrTurnCeiling)
+	}
+	return fmt.Sprintf("session %s turn timed out after %s with no progress (ran %s, %d steps): %v",
+		e.SessionID, dur(e.Budget), dur(e.Elapsed), e.Steps, ErrTurnTimeout)
+}
+
+// dur renders a duration for humans without rounding a sub-second budget away to
+// "0s", which made the configured budget unreadable in the error text.
+func dur(d time.Duration) string {
+	if d < time.Second {
+		return d.Round(time.Millisecond).String()
+	}
+	return d.Round(time.Second).String()
+}
+
+// Unwrap routes errors.Is to the right sentinel. Ceiling unwraps to
+// ErrTurnCeiling, which in turn unwraps to ErrTurnTimeout, so a ceiling error
+// IS a timeout for every existing caller while still being distinguishable.
+func (e *TurnTimeoutError) Unwrap() error {
+	if e.Ceiling {
+		return ErrTurnCeiling
+	}
+	return ErrTurnTimeout
+}
+
+// failureNotice renders the short plain-text notice a user gets when their turn
 // failed and no reply was produced. Plain text on purpose: Telegram renders
-// markdown asterisks literally. It names the INPUT so a failed voice note reads
-// as a failed voice note rather than a generic error.
+// markdown asterisks literally, and it is read on a phone. It names the INPUT so
+// a failed voice note reads as a failed voice note rather than a generic error.
+//
+// The branches are a TAXONOMY, ordered so they are mutually exclusive in
+// practice and so the most actionable cause always wins. A user who cannot tell
+// a dead login from a timeout from a restart cannot fix any of them, which is
+// its own bug: on 2026-08-09 an expired Claude OAuth credential surfaced as
+// "Sorry, I could not process that voice message: claudecode: turn error:
+// Failed to authenticate: OAuth session expired and could not be refreshed",
+// which buries the one fact that mattered and the one action that fixes it.
+//
+// Order matters. Auth is checked FIRST so a credential failure can never be
+// reported as anything else; ceiling before quiet-timeout because a ceiling
+// error also satisfies errors.Is(err, ErrTurnTimeout) by design.
 func failureNotice(in channel.InboundMsg, err error) string {
 	what := "that message"
 	if len(in.Media) > 0 {
@@ -624,11 +828,88 @@ func failureNotice(in channel.InboundMsg, err error) string {
 			what = "that file"
 		}
 	}
-	if errors.Is(err, ErrTurnTimeout) {
-		return fmt.Sprintf("Sorry, I could not finish %s: the turn ran past my time budget, "+
-			"so I gave up on it. Please send it again, or narrow the question.", what)
+
+	switch {
+	// 1. The Claude login died. Nothing agentd, Telegram or the network can do
+	// about it, and only an interactive login clears it (the CLI tombstones the
+	// shared credential on an invalid_grant refresh). Say all three things: what
+	// broke, what to do, and that the request was NOT processed.
+	case errors.Is(err, harness.ErrAuth):
+		return "Your Claude login has expired, so I could not run " + what + ". " +
+			"This is the Claude login, not agentd or Telegram. " +
+			"Run /login in a terminal, then send it again."
+
+	// 2. Cancelled: agentd was shut down or restarted while the turn was in
+	// flight, or the caller went away. Nothing was wrong with the request.
+	case errors.Is(err, context.Canceled):
+		return "I was stopped while working on " + what + ", so it did not finish. " +
+			"Nothing was wrong with the request. Send it again."
+
+	// 3. The absolute backstop fired: it WAS still working, just far too long.
+	case errors.Is(err, ErrTurnCeiling):
+		return withPartial("I worked on "+what+" for "+timeoutDetail(err)+
+			" and hit my hard limit, so I stopped it. It was still running, not stuck. "+
+			"Send it again in smaller pieces.", err)
+
+	// 4. Went quiet: no tool call, no output, nothing, for the whole window.
+	// This is the "genuinely hung" case the inactivity timer exists to catch.
+	case errors.Is(err, ErrTurnTimeout):
+		return withPartial("I stopped working on "+what+" because it went silent "+timeoutDetail(err)+
+			". That usually means it got stuck rather than that it was slow. Send it again.", err)
+
+	// 5. The agent process died or was restarted under the turn.
+	case errors.Is(err, harness.ErrProcessGone):
+		return "My agent process died while handling " + what + ", so it did not finish. " +
+			"It restarts itself. Send it again in a moment."
 	}
+
 	return fmt.Sprintf("Sorry, I could not process %s: %v", what, err)
+}
+
+// withPartial appends the salvageable work to a timeout notice. An abandoned
+// turn has usually produced real output already; throwing it away and returning
+// a bare error wastes it and leaves the user with nothing to act on.
+func withPartial(msg string, err error) string {
+	var te *TurnTimeoutError
+	if !errors.As(err, &te) {
+		return msg
+	}
+	p := strings.TrimSpace(te.Partial)
+	if p == "" {
+		return msg
+	}
+	if len(p) > partialNoticeMax {
+		p = p[:partialNoticeMax] + "..."
+	}
+	return msg + "\n\nHere is what I had so far:\n" + p
+}
+
+// partialNoticeMax caps the salvaged partial so the notice stays readable on a
+// phone; the full output is still in the run log.
+const partialNoticeMax = 1200
+
+// timeoutDetail renders the progress a timed-out turn made, so the notice
+// reports what was accomplished rather than discarding it silently.
+func timeoutDetail(err error) string {
+	var te *TurnTimeoutError
+	if !errors.As(err, &te) {
+		return "for too long"
+	}
+	if te.Ceiling {
+		s := dur(te.Elapsed)
+		if te.Steps > 0 {
+			s += " and " + fmt.Sprintf("%d", te.Steps) + " steps"
+		}
+		return s
+	}
+	s := "for " + dur(te.Quiet)
+	if te.Steps > 0 {
+		s += " after " + fmt.Sprintf("%d", te.Steps) + " steps"
+		if te.LastStep != "" {
+			s += " (last: " + te.LastStep + ")"
+		}
+	}
+	return s
 }
 
 // RouteInbound wires a channel inbound message to a session and sends the harness
@@ -707,6 +988,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	// the only channel-specific piece, delivered through the event hook.
 	result, err := m.SendAndCollect(ctx, id, RenderInbound(in), TurnOptions{
 		Timeout: m.Policy.turnTimeout(),
+		Ceiling: m.Policy.turnCeiling(),
 		OnEvent: func(e eventbus.Event) {
 			if e.Kind == eventbus.KindNeedsInput {
 				// Interim state: the agent is blocked on the user. The terminal

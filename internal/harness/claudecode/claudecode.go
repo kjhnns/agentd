@@ -436,7 +436,7 @@ func (a *Adapter) Send(ctx context.Context, h harness.Handle, in harness.Input) 
 	hh.mu.Lock()
 	if hh.dead {
 		hh.mu.Unlock()
-		return fmt.Errorf("claudecode: session %s process is not alive", hh.id)
+		return fmt.Errorf("claudecode: session %s process is not alive: %w", hh.id, harness.ErrProcessGone)
 	}
 	waiter := make(chan eventbus.Event, 1)
 	hh.waiter = waiter
@@ -481,15 +481,22 @@ func (a *Adapter) Send(ctx context.Context, h harness.Handle, in harness.Input) 
 			// so the session self-heals on the next sweep instead of needing a
 			// human to notice and start a new session. No token is cached, read, or
 			// logged here: the recovery is purely "throw away the stale process".
+			//
+			// The SAME classifier also decides what the USER is told. The core
+			// cannot parse CLI prose and must not grow a second detector that
+			// could disagree with this one, so the returned error WRAPS
+			// harness.ErrAuth and session.failureNotice keys off errors.Is.
+			// One classifier, two consumers.
 			if isAuthError(e.Text) {
 				log.Printf("session %s: auth failure on turn; marking process dead so it is respawned with fresh credentials", hh.id)
 				hh.markDead()
+				return fmt.Errorf("claudecode: turn error: %s: %w", e.Text, harness.ErrAuth)
 			}
 			return fmt.Errorf("claudecode: turn error: %s", e.Text)
 		}
 		return nil
 	case <-hh.done:
-		return fmt.Errorf("claudecode: session %s process exited before result", hh.id)
+		return fmt.Errorf("claudecode: session %s process exited before result: %w", hh.id, harness.ErrProcessGone)
 	case <-ctx.Done():
 		return ctx.Err()
 	}

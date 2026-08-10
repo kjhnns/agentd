@@ -294,6 +294,7 @@ context_window    = 1000000
 gc_interval       = "30s"
 checkpoint_timeout = "90s"
 turn_timeout      = "20m"
+turn_ceiling      = "3h"
 `))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -323,6 +324,9 @@ turn_timeout      = "20m"
 	if s.TurnTimeout != 20*time.Minute {
 		t.Errorf("turn_timeout = %v", s.TurnTimeout)
 	}
+	if s.TurnCeiling != 3*time.Hour {
+		t.Errorf("turn_ceiling = %v", s.TurnCeiling)
+	}
 
 	// Defaults when [session] is absent.
 	def, err := Parse([]byte("[server]\nbind = \"127.0.0.1:1\"\n"))
@@ -337,6 +341,13 @@ turn_timeout      = "20m"
 	// the answer to any turn that did real research.
 	if def.Session.TurnTimeout < 10*time.Minute {
 		t.Fatalf("default turn_timeout = %v, want >= 10m", def.Session.TurnTimeout)
+	}
+	// turn_ceiling is the absolute backstop that keeps the (now inactivity-based)
+	// turn_timeout from making a runaway unkillable. It must default to
+	// something, sit above any real turn, and stay under max_wallclock.
+	if def.Session.TurnCeiling <= def.Session.TurnTimeout || def.Session.TurnCeiling >= def.Session.MaxWallclock {
+		t.Fatalf("default turn_ceiling = %v, want between turn_timeout (%v) and max_wallclock (%v)",
+			def.Session.TurnCeiling, def.Session.TurnTimeout, def.Session.MaxWallclock)
 	}
 }
 

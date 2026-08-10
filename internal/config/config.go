@@ -52,7 +52,8 @@ type Session struct {
 	ContextWindow        int           // model context window (tokens) for real pressure (default 200000)
 	GCInterval           time.Duration // how often the sweeper enforces idle/dead reclaim (default 1m)
 	CheckpointTimeout    time.Duration // bound on the checkpoint-flush turn before teardown proceeds anyway (default 120s)
-	TurnTimeout          time.Duration // bound on ONE inbound turn; on expiry the reply is abandoned (default 15m)
+	TurnTimeout          time.Duration // QUIET window on ONE inbound turn: abandoned after this long with NO progress event; progress resets it (default 15m)
+	TurnCeiling          time.Duration // absolute wallclock backstop on one turn, so the inactivity bound cannot make a runaway unkillable (default 2h; negative = off)
 }
 
 // Channel is one [[channel]] entry.
@@ -158,6 +159,7 @@ func DefaultSession() Session {
 		GCInterval:           time.Minute,
 		CheckpointTimeout:    120 * time.Second,
 		TurnTimeout:          15 * time.Minute,
+		TurnCeiling:          2 * time.Hour,
 	}
 }
 
@@ -344,6 +346,12 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 				return fmt.Errorf("turn_timeout: %w", err)
 			}
 			cfg.Session.TurnTimeout = d
+		case "turn_ceiling":
+			d, err := asDuration(raw)
+			if err != nil {
+				return fmt.Errorf("turn_ceiling: %w", err)
+			}
+			cfg.Session.TurnCeiling = d
 		default:
 			return fmt.Errorf("unknown [session] key %q", key)
 		}

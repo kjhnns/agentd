@@ -5,8 +5,31 @@ package harness
 
 import (
 	"context"
+	"errors"
 
 	"github.com/kjhnns/agentd/internal/eventbus"
+)
+
+// Cross-adapter failure CLASSES. The core must be able to tell a user WHY a turn
+// failed without parsing an adapter's prose, and it must not grow a second,
+// divergent classifier per adapter. So each adapter classifies ONCE, at the
+// point it already knows, and wraps the matching sentinel; the core only does
+// errors.Is. Two detectors that can disagree is a bug waiting to happen.
+//
+// These are deliberately few and mutually exclusive by construction: an adapter
+// wraps at most one of them per error.
+var (
+	// ErrAuth marks a CREDENTIAL-layer failure: the harness could not
+	// authenticate at all. It is decided from local credential state before any
+	// request leaves the machine, so it is never a transient model/transport
+	// blip and no retry on the same process can clear it. Only an interactive
+	// re-login fixes it, which is exactly what the user has to be told.
+	ErrAuth = errors.New("harness authentication failed")
+
+	// ErrProcessGone marks "the agent process died or was never alive": a crash,
+	// a teardown, a restart mid-turn. Distinct from a timeout (nothing waited
+	// too long; the other end simply vanished) and from a cancel.
+	ErrProcessGone = errors.New("harness process is gone")
 )
 
 // Capabilities lets the core pick the richest available mode per adapter.

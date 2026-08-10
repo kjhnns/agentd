@@ -145,8 +145,12 @@ func TestTimedOutVoiceMessageGetsSpokenReason(t *testing.T) {
 	if !strings.Contains(notice, "voice message") {
 		t.Errorf("failure notice = %q, want it to name the voice message", notice)
 	}
-	if !strings.Contains(strings.ToLower(notice), "time budget") {
-		t.Errorf("failure notice = %q, want it to state the reason", notice)
+	// The reason wording changed with the taxonomy: slowAdapter emits no
+	// progress events at all, so this is the WENT-SILENT branch, not a "ran too
+	// long" branch. Naming silence is the whole point: a turn that is visibly
+	// working is no longer killed for taking time.
+	if !strings.Contains(strings.ToLower(notice), "silent") {
+		t.Errorf("failure notice = %q, want it to state the reason (it went silent)", notice)
 	}
 	if strings.Contains(notice, "*") || strings.Contains(notice, "—") {
 		t.Errorf("failure notice = %q, want plain text with no markdown and no em-dash", notice)

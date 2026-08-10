@@ -38,11 +38,20 @@ gc_interval        = "1m"
 # Upper bound on the checkpoint-flush turn; if it overruns, agentd tears down and
 # starts fresh anyway (a wedged flush never strands the session).
 checkpoint_timeout = "120s"
-# Upper bound on ONE inbound turn (a Telegram/web message routed to the agent).
-# On expiry agentd ABANDONS the reply: an answer the harness produces afterwards
-# has nowhere to go, and the user gets a failure notice instead of the answer.
-# Keep it generous, a turn that does web research routinely runs several minutes.
+# QUIET WINDOW on ONE inbound turn (a Telegram/web message routed to the agent).
+# This is NOT a cap on how long a turn may take. It is how long the turn may go
+# with NO sign of progress: every tool call, streamed output line and result
+# RESETS it, so work that is genuinely happening is never killed for taking a
+# while. It fires only when the session has gone silent, which is the case where
+# the turn really is stuck. On expiry agentd ABANDONS the reply (an answer the
+# harness produces afterwards has nowhere to go) and the user gets a failure
+# notice that says the turn went silent, plus whatever partial output it had.
 turn_timeout       = "15m"
+# ABSOLUTE backstop on one turn, so an inactivity bound cannot make a runaway
+# unkillable: a loop that keeps emitting tool calls forever would otherwise keep
+# resetting turn_timeout forever. Sits far above any real turn and below
+# max_wallclock. A negative value turns the backstop off (not recommended).
+turn_ceiling       = "2h"
 
 # Media: the CORE multimodal capability (internal/media), channel-agnostic by
 # design. Inbound voice / photos / documents from ANY channel are ingested here

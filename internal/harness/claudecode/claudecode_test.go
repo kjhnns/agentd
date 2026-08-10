@@ -3,6 +3,7 @@ package claudecode
 import (
 	"bufio"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -445,6 +446,56 @@ func TestAuthErrorKillsProcessEndToEnd(t *testing.T) {
 				t.Fatalf("after %s turn error: status=%v dead=%v, want dead=%v",
 					tc.name, a.Status(h), gotDead, tc.wantDead)
 			}
+
+			// ONE classifier, two consumers. The same isAuthError call that
+			// marks the process dead also wraps harness.ErrAuth, which is what
+			// session.failureNotice keys off to tell the user their CLAUDE login
+			// died and that /login is the fix. A second, divergent detector in
+			// the core is exactly the bug this guards against: if the
+			// user-facing classification and the recovery classification ever
+			// disagree, this fails.
+			gotAuth := errors.Is(err, harness.ErrAuth)
+			if gotAuth != tc.wantDead {
+				t.Fatalf("after %s turn error: errors.Is(err, harness.ErrAuth) = %v, want %v "+
+					"(the user-facing classification must match the process-recovery one)",
+					tc.name, gotAuth, tc.wantDead)
+			}
 		})
+	}
+}
+
+// TestProcessExitIsClassifiedAsProcessGone: a child that dies mid-turn is a
+// CRASH, not a timeout and not an auth failure. The core has to be able to say
+// which, so the error carries harness.ErrProcessGone.
+func TestProcessExitIsClassifiedAsProcessGone(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-claude")
+	// Reads the turn envelope, then exits without ever producing a result.
+	script := "#!/bin/sh\nIFS= read -r _line\nexit 3\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a := New(bin)
+	h, err := a.Start(ctx, harness.SessionConfig{SessionID: "crash-test", Cwd: dir})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer a.Teardown(h)
+	go func() {
+		for range a.Events(h) {
+		}
+	}()
+
+	err = a.Send(ctx, h, harness.Input{Text: "hello"})
+	if err == nil {
+		t.Fatal("expected the turn to fail when the process exits")
+	}
+	if !errors.Is(err, harness.ErrProcessGone) {
+		t.Fatalf("err = %v, want it to wrap harness.ErrProcessGone", err)
+	}
+	if errors.Is(err, harness.ErrAuth) {
+		t.Fatalf("err = %v, must NOT be classified as an auth failure", err)
 	}
 }

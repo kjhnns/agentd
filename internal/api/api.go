@@ -268,6 +268,7 @@ func (s *Server) handleMediaUpload(w http.ResponseWriter, r *http.Request, id st
 	})
 	result, err := s.mgr.SendAndCollect(r.Context(), id, text, session.TurnOptions{
 		Timeout: s.mgr.TurnTimeout(),
+		Ceiling: s.mgr.TurnCeiling(),
 	})
 	if err != nil {
 		code := http.StatusInternalServerError
@@ -470,6 +471,7 @@ func (s *Server) handleInput(w http.ResponseWriter, r *http.Request, id string) 
 	// keep reading the same reply off the WS and ignore this field.
 	result, err := s.mgr.SendAndCollect(r.Context(), id, body.Text, session.TurnOptions{
 		Timeout: s.mgr.TurnTimeout(),
+		Ceiling: s.mgr.TurnCeiling(),
 	})
 	if err != nil {
 		code := http.StatusInternalServerError
