@@ -601,7 +601,8 @@ func TestUIPastSessionsServed(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	page := string(body)
 	for _, want := range []string{
-		"Past sessions",
+		"archived",     // past sessions collapse under their conversation thread
+		"buildThreads", // grouping by title so the list is one row per conversation
 		"/sessions/past",
 		"continuePast",
 		"/continue",
