@@ -576,6 +576,115 @@ func TestAckIgnoresEmptyIDs(t *testing.T) {
 	}
 }
 
+// TestAckOnGroupMessageCarriesSender is the regression test for the bug that
+// made WhatsApp reactions silently useless in every group for months. The
+// production path is session.RouteInbound -> Adapter.Ack, and Ack's signature
+// (chatID, msgID, emoji) has NO sender, so it invoked
+//
+//	wacli send react --to <group> --id <msg> --reaction ⚡
+//
+// which wacli rejects: "--sender is required for group reactions" (exit 1).
+// TestGroupReactionCarriesSender below did NOT catch it because it calls
+// enqueueReaction directly, and enqueueReaction had no production caller.
+func TestAckOnGroupMessageCarriesSender(t *testing.T) {
+	grp := "120363000000@g.us"
+	sender := "41791234567@s.whatsapp.net"
+	a, f := newGroupAdapter([]string{grp})
+	f.respond = func(args []string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, " "), "messages list") {
+			return listJSON(textMsg(grp, sender, "M1", "hi team")), nil
+		}
+		return []byte(`{"success":true}`), nil
+	}
+	if err := a.pollOnce(context.Background()); err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+	<-a.Inbound()
+
+	// Exactly what the session layer does, with the sender it cannot pass.
+	if err := a.Ack(grp, "M1", channel.ReactionWorking); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if !waitFor(t, func() bool { return f.find("send", "react", channel.ReactionWorking) != nil }) {
+		t.Fatalf("no ⚡ reaction invocation recorded, got %v", f.argv())
+	}
+	c := f.find("send", "react", channel.ReactionWorking)
+	if !strings.Contains(strings.Join(c, " "), "--sender "+sender) {
+		t.Errorf("Ack in a group must pass --sender: %v", c)
+	}
+}
+
+// TestAckKeepsSenderPastTheDedupWindow guards the retention split. The closing
+// glyph of the chain is set when the TURN ends, minutes later; if the sender
+// were pruned on the 60s dedup schedule the final reaction would fail exactly
+// like the original bug.
+func TestAckKeepsSenderPastTheDedupWindow(t *testing.T) {
+	grp := "120363000000@g.us"
+	sender := "41791234567@s.whatsapp.net"
+	a, f := newGroupAdapter([]string{grp})
+	f.respond = func(args []string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, " "), "messages list") {
+			return listJSON(textMsg(grp, sender, "M1", "hi team")), nil
+		}
+		return []byte(`{"success":true}`), nil
+	}
+	if err := a.pollOnce(context.Background()); err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+	<-a.Inbound()
+
+	// Move the cursor far past the message and prune, as a long turn would.
+	a.cursor = a.cursor.Add(time.Hour)
+	a.pruneSeen()
+	if _, ok := a.seen["M1"]; ok {
+		t.Fatal("precondition: the dedup entry should have been pruned")
+	}
+
+	if err := a.Ack(grp, "M1", channel.ReactionDone); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if !waitFor(t, func() bool { return f.find("send", "react", channel.ReactionDone) != nil }) {
+		t.Fatalf("no 👍 reaction invocation recorded, got %v", f.argv())
+	}
+	c := f.find("send", "react", channel.ReactionDone)
+	if !strings.Contains(strings.Join(c, " "), "--sender "+sender) {
+		t.Errorf("the closing glyph must still carry --sender: %v", c)
+	}
+}
+
+// TestReceiptGlyphSetOnAcquisition pins the FAST ack: 👀 goes out from the poll
+// loop, before a session process exists. Telegram does the same at receipt.
+func TestReceiptGlyphSetOnAcquisition(t *testing.T) {
+	chat := "41791234567@s.whatsapp.net"
+	a, f := newAdapter([]string{"41791234567"})
+	f.respond = func(args []string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, " "), "messages list") {
+			return listJSON(textMsg(chat, chat, "M1", "hello")), nil
+		}
+		return []byte(`{"success":true}`), nil
+	}
+	if err := a.pollOnce(context.Background()); err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+	if !waitFor(t, func() bool { return f.find("send", "react", channel.ReactionReceived) != nil }) {
+		t.Fatalf("acquisition must set the 👀 receipt glyph, got %v", f.argv())
+	}
+}
+
+// TestGroupReactionWithoutSenderNeverInvokesWacli: a bookkeeping miss must be a
+// logged no-op, not an invocation that exits 1.
+func TestGroupReactionWithoutSenderNeverInvokesWacli(t *testing.T) {
+	grp := "120363000000@g.us"
+	a, f := newGroupAdapter([]string{grp})
+	if err := a.Ack(grp, "UNKNOWN", channel.ReactionWorking); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if f.find("send", "react") != nil {
+		t.Errorf("an unaddressable group reaction must not reach wacli: %v", f.argv())
+	}
+}
+
 func TestGroupReactionCarriesSender(t *testing.T) {
 	// wacli needs --sender to address a reaction inside a group.
 	a, f := newGroupAdapter([]string{"120363000000@g.us"})

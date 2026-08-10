@@ -67,6 +67,12 @@ const (
 	// dedupWindow is the grace period a message id stays in the seen set after
 	// the cursor passes it. Mirrors Camila's 60s dedup window.
 	dedupWindow = 60 * time.Second
+	// ackRetention is how long per-message ack bookkeeping (sender JID, the
+	// do-not-decorate flag) is kept. It must comfortably exceed the longest
+	// turn, because the closing 👍/😱 of the lifecycle chain is set when the
+	// turn ENDS: config turn_timeout is 15m, so 2h leaves plenty of room while
+	// still bounding the map.
+	ackRetention = 2 * time.Hour
 	// sendThrottle is the minimum gap between outbound WhatsApp actions.
 	// WhatsApp rate-limits aggressively and bans on bursts.
 	sendThrottle = time.Second
@@ -136,10 +142,16 @@ type Adapter struct {
 	// seen maps message id -> send time, so dedup survives a cursor that has
 	// not advanced without growing forever.
 	seen map[string]time.Time
-	// noAck holds ids of messages that must never be decorated with a receipt
-	// or a lifecycle reaction: a bystander's message in a group, or anything in
-	// a read-only chat. Ack is per-message, so this is the right granularity.
-	noAck map[string]bool
+	// acks is the per-message bookkeeping the Ack path needs but the
+	// ChannelAdapter contract does not carry. Keyed by message id.
+	//
+	// It has its OWN retention (ackRetention), deliberately not the 60s dedup
+	// window: the lifecycle chain's last glyph (👍 / 😱) is set when the TURN
+	// ends, minutes after the message arrived. Pruning this on the dedup
+	// schedule would lose the sender before the final reaction is sent, which
+	// is the exact bug this map exists to fix.
+	acks  map[string]ackInfo
+	ackMu sync.Mutex // guards acks: written by the poll loop, read from Ack
 
 	exec     sync.Mutex
 	run      runner
@@ -158,6 +170,23 @@ type Adapter struct {
 	// transition) when the channel decides it has gone silently dead.
 	OnUnhealthy func(Health)
 	wasHealthy  bool
+}
+
+// ackInfo is what the adapter must remember about an inbound message so that a
+// LATER lifecycle reaction on it is both addressable and permitted.
+type ackInfo struct {
+	// sender is the JID that sent the message. wacli requires it (--sender) to
+	// address a reaction inside a group; without it `wacli send react` exits 1
+	// with "--sender is required for group reactions". The session layer has
+	// this on InboundMsg.Sender but Ack(chatID, msgID, emoji) cannot pass it,
+	// so acquisition records it here.
+	sender string
+	// noAck marks a message that must never be decorated with a receipt or a
+	// lifecycle reaction: a bystander's message in a group, or anything in a
+	// read-only chat.
+	noAck bool
+	// at is when the message was recorded, for retention only.
+	at time.Time
 }
 
 type reactReq struct {
@@ -184,7 +213,7 @@ func New(bin string, allow []string) *Adapter {
 		staleAfter:     defaultStaleAfter,
 		inbound:        make(chan channel.InboundMsg, 64),
 		seen:           map[string]time.Time{},
-		noAck:          map[string]bool{},
+		acks:           map[string]ackInfo{},
 		reactions:      true,
 		readReceipts:   true,
 		throttle:       sendThrottle,
@@ -513,9 +542,13 @@ func (a *Adapter) handleMessage(ctx context.Context, m waMessage) {
 	// blue ticks and no lifecycle reaction on a stranger's message. Replying in
 	// the group itself stays permitted, since the group is allowlisted.
 	bystander := isGroup(m.ChatJID) && !a.isOwner(m.SenderJID)
-	if g.readOnly || bystander {
-		a.noAck[m.MsgID] = true
+	a.ackMu.Lock()
+	a.acks[m.MsgID] = ackInfo{
+		sender: m.SenderJID,
+		noAck:  g.readOnly || bystander,
+		at:     time.Now(),
 	}
+	a.ackMu.Unlock()
 	if looksLikeAccessRequest(m.Text) {
 		// There is no in-band control plane to attack, so this cannot escalate.
 		// Log it so an attempt is visible rather than silent.
@@ -525,6 +558,11 @@ func (a *Adapter) handleMessage(ctx context.Context, m waMessage) {
 
 	if !g.readOnly && !bystander {
 		a.markRead(m.ChatJID)
+		// 👀 the instant the message reaches the server, exactly like the
+		// Telegram adapter does at receipt (telegram.go). This is the FAST ack:
+		// the ⚡ that session.RouteInbound sets cannot fire until a session
+		// process exists, which on a cold start is seconds away.
+		a.enqueueReaction(m.ChatJID, m.MsgID, m.SenderJID, channel.ReactionReceived)
 	}
 
 	if m.MediaType != "" {
@@ -759,11 +797,27 @@ func (a *Adapter) Ack(chatID, msgID, reaction string) error {
 	if !a.canAct(chatID) {
 		return nil // read-only chat: observe, never touch
 	}
-	if a.noAck[msgID] {
+	info, known := a.ackLookup(msgID)
+	if info.noAck {
 		return nil // bystander's message: deliver it, but do not decorate it
 	}
-	a.enqueue(reactReq{chatID: chatID, msgID: msgID, emoji: reaction})
+	if isGroup(chatID) && !known {
+		// Better a logged miss than a wacli exit 1 nobody reads.
+		log.Printf("whatsapp: no sender recorded for %s/%s; skipping %q (group reactions need --sender)",
+			chatID, msgID, reaction)
+		return nil
+	}
+	// info.sender is what makes a GROUP reaction addressable; see ackInfo.
+	a.enqueue(reactReq{chatID: chatID, msgID: msgID, sender: info.sender, emoji: reaction})
 	return nil
+}
+
+// ackLookup reads the acquisition-time bookkeeping for a message id.
+func (a *Adapter) ackLookup(msgID string) (ackInfo, bool) {
+	a.ackMu.Lock()
+	defer a.ackMu.Unlock()
+	info, ok := a.acks[msgID]
+	return info, ok
 }
 
 func (a *Adapter) enqueueReaction(chatID, msgID, sender, emoji string) {
@@ -771,6 +825,9 @@ func (a *Adapter) enqueueReaction(chatID, msgID, sender, emoji string) {
 		return
 	}
 	if !a.canAct(chatID) {
+		return
+	}
+	if info, _ := a.ackLookup(msgID); info.noAck {
 		return
 	}
 	a.enqueue(reactReq{chatID: chatID, msgID: msgID, sender: sender, emoji: emoji})
@@ -814,7 +871,14 @@ func (a *Adapter) setReaction(r reactReq) error {
 	defer cancel()
 	args := []string{"send", "react", "--to", r.chatID, "--id", r.msgID, "--reaction", r.emoji}
 	// wacli needs the original sender JID to address a reaction inside a group.
-	if isGroup(r.chatID) && r.sender != "" {
+	// Fail before invoking rather than letting wacli exit 1 with "--sender is
+	// required for group reactions": a missing sender is OUR bookkeeping bug,
+	// and it should say so.
+	if isGroup(r.chatID) {
+		if r.sender == "" {
+			return fmt.Errorf("whatsapp: group reaction on %s/%s has no sender JID (ackSender miss); wacli requires --sender",
+				r.chatID, r.msgID)
+		}
 		args = append(args, "--sender", r.sender)
 	}
 	_, err := a.wacli(ctx, args...)
@@ -901,7 +965,21 @@ func (a *Adapter) pruneSeen() {
 	for id, ts := range a.seen {
 		if ts.Before(cut) {
 			delete(a.seen, id)
-			delete(a.noAck, id)
+		}
+	}
+	a.pruneAcks()
+}
+
+// pruneAcks expires ack bookkeeping on ackRetention, NOT on the dedup window.
+// The final glyph of the lifecycle chain lands when the turn ends, so an entry
+// must outlive the longest turn or the reaction loses its --sender.
+func (a *Adapter) pruneAcks() {
+	cut := time.Now().Add(-ackRetention)
+	a.ackMu.Lock()
+	defer a.ackMu.Unlock()
+	for id, info := range a.acks {
+		if info.at.Before(cut) {
+			delete(a.acks, id)
 		}
 	}
 }
