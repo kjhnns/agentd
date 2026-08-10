@@ -89,6 +89,16 @@ type Manager struct {
 	// cadence, checkpoint-flush bound. See Policy.
 	Policy Policy
 
+	// Recap bounds the verbatim thread recap injected into the system prompt at
+	// harness-process start, so a cold start (reset, idle reclaim, restart) does
+	// not lose the literal wording a back-reference like "re 2" points at. Zero
+	// fields fall back to DefaultRecapPolicy. See recap.go.
+	Recap RecapPolicy
+
+	// RecapDisabled turns that injection off entirely: the escape hatch for
+	// tests and for restoring the pre-recap behaviour.
+	RecapDisabled bool
+
 	// Workspaces homes sessions in named workspaces (design 3.5). When set,
 	// Create resolves the requested (or default) workspace, runs the harness
 	// with cwd = the workspace root, and injects a composed system prompt:
@@ -210,6 +220,11 @@ func (m *Manager) Create(ctx context.Context, workspaceName, cwd, model, title s
 	} else if workspaceName != "" {
 		return nil, fmt.Errorf("session: workspace %q requested but no workspace store configured", workspaceName)
 	}
+	// Continuity: a brand-new session id does NOT mean a brand-new conversation.
+	// A Telegram thread is one chat to the user and has been carried by dozens of
+	// session ids; append the verbatim tail of THIS TITLE's thread so the fresh
+	// process can resolve back-references. See recap.go.
+	systemPrompt = m.composeInjection(systemPrompt, title)
 	h, err := m.adapter.Start(ctx, harness.SessionConfig{
 		SessionID:       id,
 		Cwd:             cwd,

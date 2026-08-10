@@ -86,6 +86,12 @@ func (m *Manager) resetLocked(ctx context.Context, s *Session, reason string) er
 		}
 		systemPrompt = sp
 	}
+	// The checkpoint-flush above preserved SUMMARISED state (context.md +
+	// memory). It cannot preserve WORDING: a summary is the agent's paraphrase,
+	// and a back-reference ("re 2", "like I asked you") points at literal text.
+	// Append the verbatim tail of this thread from the run-log so the fresh
+	// process still has the exact words. See recap.go.
+	systemPrompt = m.composeInjection(systemPrompt, s.Title)
 	h, err := m.adapter.Start(ctx, harness.SessionConfig{
 		SessionID:       s.ID,
 		Cwd:             cwd,
@@ -212,6 +218,10 @@ func (m *Manager) recoverDead(ctx context.Context, s *Session) {
 			systemPrompt = sp
 		}
 	}
+	// A dead process was never checkpoint-flushed, so context.md is stale as of
+	// the last reset. The run-log recap is the ONLY record of what was said
+	// since; it matters more here than anywhere else. See recap.go.
+	systemPrompt = m.composeInjection(systemPrompt, s.Title)
 	h, err := m.adapter.Start(ctx, harness.SessionConfig{
 		SessionID:       s.ID,
 		Cwd:             cwd,
