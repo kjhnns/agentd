@@ -163,7 +163,7 @@ type tgMessage struct {
 	Video          *tgFileRef    `json:"video"`
 	VideoNote      *tgFileRef    `json:"video_note"`
 	Sticker        *tgFileRef    `json:"sticker"`
-	Audio          *tgFileRef    `json:"audio"`
+	Audio          *tgAudio      `json:"audio"`
 	Animation      *tgFileRef    `json:"animation"`
 	ReplyToMessage *struct {
 		MessageID int64 `json:"message_id"`
@@ -188,6 +188,17 @@ type tgDocument struct {
 	FileID   string `json:"file_id"`
 	FileName string `json:"file_name"`
 	MimeType string `json:"mime_type"`
+	FileSize int64  `json:"file_size"`
+}
+
+// tgAudio is an audio FILE (music/shared audio), distinct from a voice note.
+// Telegram sends file_name/mime_type/duration here; the media layer already
+// transcribes audio/* the same way it does voice.
+type tgAudio struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	MimeType string `json:"mime_type"`
+	Duration int    `json:"duration"`
 	FileSize int64  `json:"file_size"`
 }
 
@@ -281,12 +292,13 @@ func (a *Adapter) handleUpdate(u tgUpdate) {
 	}
 	m := u.Message
 	switch {
-	case m.Voice != nil, len(m.Photo) > 0, m.Document != nil:
+	case m.Voice != nil, len(m.Photo) > 0, m.Document != nil, m.Audio != nil:
 		// Receipt reaction FIRST: media ingest (download + Whisper) can take
-		// many seconds, so the 👀 must not wait on it.
+		// many seconds, so the 👀 must not wait on it. Audio files transcribe
+		// through the same path as voice notes.
 		a.enqueueReaction(chatID, m.MessageID, channel.ReactionReceived)
 		go a.processMedia(context.Background(), m, chatID)
-	case m.Video != nil, m.VideoNote != nil, m.Sticker != nil, m.Audio != nil, m.Animation != nil:
+	case m.Video != nil, m.VideoNote != nil, m.Sticker != nil, m.Animation != nil:
 		// Unsupported kinds get a polite one-line decline, never silence (the
 		// old code dropped every non-text message on the floor).
 		go a.replyText(chatID, "Sorry, I can only handle text, voice messages, photos, and documents right now.")
@@ -355,6 +367,18 @@ func (a *Adapter) processMedia(ctx context.Context, m *tgMessage, chatID string)
 		}
 		declared = m.Voice.FileSize
 		duration = m.Voice.Duration
+	case m.Audio != nil:
+		fileID = m.Audio.FileID
+		filename = m.Audio.FileName
+		if filename == "" {
+			filename = fmt.Sprintf("audio-%d.mp3", m.MessageID)
+		}
+		mimeType = m.Audio.MimeType
+		if mimeType == "" {
+			mimeType = "audio/mpeg"
+		}
+		declared = m.Audio.FileSize
+		duration = m.Audio.Duration
 	case len(m.Photo) > 0:
 		largest := m.Photo[0]
 		for _, p := range m.Photo[1:] {

@@ -144,6 +144,33 @@ func TestVoiceUpdateTranscribed(t *testing.T) {
 	}
 }
 
+func TestAudioFileTranscribed(t *testing.T) {
+	bs := newBotServer(t, []byte("MP3DATA"))
+	a, _ := newMediaAdapter(t, bs, &stubTranscriber{out: media.Transcript{Text: "song lyrics", Language: "english", DurationS: 12}})
+
+	m := &tgMessage{MessageID: 11,
+		Audio: &tgAudio{FileID: "AUDIO1", FileName: "clip.mp3", MimeType: "audio/mpeg", Duration: 12, FileSize: 100}}
+	m.Chat.ID = 111
+
+	a.handleUpdate(tgUpdate{UpdateID: 20, Message: m})
+
+	select {
+	case in := <-a.Inbound():
+		if len(in.Media) != 1 {
+			t.Fatalf("media artifacts = %d, want 1 (%+v)", len(in.Media), in)
+		}
+		art := in.Media[0]
+		if art.Kind != media.KindAudio || art.Transcript != "song lyrics" || art.DurationS != 12 {
+			t.Errorf("artifact = %+v", art)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no inbound emitted for audio update")
+	}
+	if bs.gotFileID != "AUDIO1" {
+		t.Errorf("getFile file_id = %q, want AUDIO1", bs.gotFileID)
+	}
+}
+
 func TestVoiceTranscribeFailurePoliteReply(t *testing.T) {
 	bs := newBotServer(t, []byte("OPUSDATA"))
 	a, _ := newMediaAdapter(t, bs, &stubTranscriber{err: errors.New("whisper down")})
