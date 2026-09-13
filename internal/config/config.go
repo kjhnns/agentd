@@ -21,6 +21,11 @@ type Server struct {
 	Bind      string // e.g. "127.0.0.1:8787"
 	APIBearer string // bearer token gating the local API
 	StateDir  string // durable state dir (run-log, etc.)
+	// PublicBind is an OPTIONAL second listener that serves ONLY the public
+	// routes (today: the watch channel under /watch/, gated by its own token).
+	// Meant for a tailnet address that a public HTTPS proxy forwards to; the
+	// code-executing API never appears on it. "" = off.
+	PublicBind string
 }
 
 // Harness is one [[harness]] entry.
@@ -64,7 +69,13 @@ type Channel struct {
 	Policy  string   // e.g. "dm-only"
 	Enabled bool     // default true; enabled=false parks the channel
 	Path    string   // web channel: UI route (default "/ui")
-	Title   string   // web channel: UI title
+	Title   string   // web / watch channel: UI title
+	// ShareSession (watch channel) routes wrist messages into the Telegram
+	// chat's session instead of a session of its own: one brain, two surfaces.
+	ShareSession bool
+	// Mirror (watch channel) echoes every wrist transcript and reply into the
+	// Telegram chat, so the phone keeps the record and pushes replies.
+	Mirror bool
 	// Reactions toggles emoji progress feedback on the user's own inbound
 	// message (telegram: setMessageReaction 👀 -> ⚡ -> 👍 / 😱). Default true.
 	Reactions bool
@@ -268,6 +279,8 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 			cfg.Server.Bind = s
 		case "api_bearer":
 			cfg.Server.APIBearer = s
+		case "public_bind":
+			cfg.Server.PublicBind = s
 		case "state_dir":
 			cfg.Server.StateDir = s
 		default:
@@ -433,6 +446,20 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 				return fmt.Errorf("reactions: %w", err)
 			}
 			ch.Reactions = b
+			return nil
+		case "share_session":
+			b, err := asBool(raw)
+			if err != nil {
+				return fmt.Errorf("share_session: %w", err)
+			}
+			ch.ShareSession = b
+			return nil
+		case "mirror":
+			b, err := asBool(raw)
+			if err != nil {
+				return fmt.Errorf("mirror: %w", err)
+			}
+			ch.Mirror = b
 			return nil
 		case "allow":
 			arr, err := asStringArray(raw)

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -31,7 +32,9 @@ import (
 	"time"
 
 	"github.com/kjhnns/agentd/internal/api"
+	"github.com/kjhnns/agentd/internal/channel"
 	"github.com/kjhnns/agentd/internal/channel/telegram"
+	"github.com/kjhnns/agentd/internal/channel/watch"
 	"github.com/kjhnns/agentd/internal/channel/web"
 	"github.com/kjhnns/agentd/internal/channel/whatsapp"
 	"github.com/kjhnns/agentd/internal/cli"
@@ -601,6 +604,9 @@ func serve(args []string) {
 	// Channels. Each configured channel is an in-process ChannelAdapter; the ones
 	// that can also deliver notifications register as notify-hub sinks.
 	var tg *telegram.Adapter
+	var tgAllow []string
+	sessionForChat := map[string]string{} // Telegram chat id -> session (shared with the watch when share_session)
+	var watchCfgs []config.Channel        // wired AFTER the loop: the watch may piggyback on Telegram
 	for _, c := range cfg.Channel {
 		if !c.Enabled {
 			log.Printf("agentd: channel %q disabled (enabled=false); skipped", c.Kind)
@@ -621,6 +627,7 @@ func serve(args []string) {
 				continue
 			}
 			tg = telegram.New(token, c.Allow).WithReactions(c.Reactions)
+			tgAllow = c.Allow
 			if mediaSvc != nil {
 				tg.WithMedia(mediaSvc)
 			}
@@ -632,7 +639,6 @@ func serve(args []string) {
 			hub.Register(tg) // Telegram is a notify sink too (uniform hub)
 			log.Printf("agentd: telegram channel started (allow=%v, reactions=%v)", c.Allow, c.Reactions)
 
-			sessionForChat := map[string]string{}
 			go func(ch *telegram.Adapter) {
 				for in := range ch.Inbound() {
 					in := in
@@ -727,9 +733,74 @@ func serve(args []string) {
 				}
 			}(webCh)
 
+		case "watch":
+			watchCfgs = append(watchCfgs, c)
+
 		default:
 			log.Printf("agentd: unknown channel kind %q; skipped", c.Kind)
 		}
+	}
+
+	// Watch (wrist) channel: an async inbox/outbox behind its OWN token under
+	// /watch/, mounted as a PUBLIC route (no API bearer) so a public HTTPS
+	// proxy can forward to it. With share_session it drives the Telegram
+	// chat's session (one brain, two surfaces); with mirror every transcript
+	// and reply is echoed into that chat.
+	for _, c := range watchCfgs {
+		token := config.ResolveToken(c.Token)
+		if token == "" {
+			log.Printf("agentd: watch channel configured but token empty; channel NOT started")
+			continue
+		}
+		store, err := watch.OpenStore(filepath.Join(cfg.Server.StateDir, "watch-messages.jsonl"))
+		if err != nil {
+			log.Printf("agentd: watch store: %v; channel NOT started", err)
+			continue
+		}
+		defer store.Close()
+		wch := watch.New(token, store).WithTitle(c.Title)
+		if mediaSvc != nil {
+			wch.WithMedia(mediaSvc)
+		}
+		sessMap := map[string]string{}
+		shared := false
+		if c.ShareSession {
+			if tg != nil && len(tgAllow) > 0 {
+				wch.WithUserID(tgAllow[0])
+				sessMap = sessionForChat
+				shared = true
+			} else {
+				log.Printf("agentd: watch share_session=true but no Telegram channel with an allowlist; using an own session")
+			}
+		}
+		if c.Mirror {
+			if tg != nil && len(tgAllow) > 0 {
+				chat := tgAllow[0]
+				wch.WithMirror(func(text string) {
+					mctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+					defer cancel()
+					if _, err := tg.Send(mctx, channel.OutboundMsg{ChatID: chat, Text: text}); err != nil {
+						log.Printf("agentd: watch mirror to telegram failed: %v", err)
+					}
+				})
+			} else {
+				log.Printf("agentd: watch mirror=true but no Telegram channel; mirror off")
+			}
+		}
+		srv.MountPublic("/watch/", wch.Handler())
+		hub.Register(wch)
+		log.Printf("agentd: watch channel started (routes /watch/*, shared_session=%v, mirror=%v)", shared, c.Mirror)
+
+		go func(ch *watch.Adapter, m map[string]string) {
+			for in := range ch.Inbound() {
+				in := in
+				go func() {
+					if err := mgr.RouteInbound(ctx, ch, in, m, cwd, model); err != nil {
+						log.Printf("agentd: watch route inbound error: %v", err)
+					}
+				}()
+			}
+		}(wch, sessMap)
 	}
 	log.Printf("agentd: notification hub has %d sink(s)", hub.Count())
 
@@ -741,6 +812,33 @@ func serve(args []string) {
 		}
 	}()
 
+	// Optional PUBLIC listener: only MountPublic routes, nothing else. The bind
+	// is retried instead of fatal because a tailnet address may come up after
+	// the daemon at boot.
+	var pubSrv *http.Server
+	if pb := cfg.Server.PublicBind; pb != "" {
+		pubSrv = &http.Server{Addr: pb, Handler: srv.PublicHandler(), ReadHeaderTimeout: 15 * time.Second}
+		go func() {
+			for {
+				ln, err := net.Listen("tcp", pb)
+				if err != nil {
+					log.Printf("agentd: public bind %s failed: %v (retry in 10s)", pb, err)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(10 * time.Second):
+						continue
+					}
+				}
+				log.Printf("agentd: public routes listening on http://%s (public routes only)", pb)
+				if err := pubSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+					log.Printf("agentd: public listener: %v", err)
+				}
+				return
+			}
+		}()
+	}
+
 	// Graceful shutdown.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -750,6 +848,9 @@ func serve(args []string) {
 	shutdownCtx, sc := context.WithTimeout(context.Background(), 5*time.Second)
 	defer sc()
 	_ = httpSrv.Shutdown(shutdownCtx)
+	if pubSrv != nil {
+		_ = pubSrv.Shutdown(shutdownCtx)
+	}
 }
 
 func redact(s string) string {

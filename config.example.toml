@@ -3,6 +3,7 @@
 
 [server]
 bind       = "127.0.0.1:8787"   # local-only by default (design 3.9)
+# public_bind = "100.64.0.1:8787"   # optional 2nd listener: PUBLIC routes only (/watch/), e.g. a tailnet address
 api_bearer = "change-me-bearer"  # gates the local HTTP/WS API
 state_dir  = "state"             # run-log + durable state live here
 
@@ -176,6 +177,26 @@ kind    = "web"
 enabled = true
 title   = "agentd"               # shown in the UI header/title
 path    = "/ui"                  # UI route (informational; the app is served at /ui)
+
+# Watch (wrist) channel: the async inbox/outbox behind the Apple Watch app.
+# POST /watch/messages (JSON text or a multipart voice file, transcribed on the
+# spot so the receipt already carries the transcript), GET /watch/messages
+# (long-poll fetch), GET /watch/ping. Gated by its OWN token (never the API
+# bearer) and mounted as a PUBLIC route, so a public HTTPS proxy (Caddy on a
+# VPS, forwarding over Tailscale to [server] public_bind) can reach it while
+# the code-executing API stays on loopback.
+#   share_session = true  the wrist drives the Telegram chat's session
+#                         (one brain, two surfaces; needs a telegram channel)
+#   mirror        = true  every wrist transcript and reply is echoed into the
+#                         Telegram chat (phone keeps the record + push)
+# Conversation store: <state_dir>/watch-messages.jsonl.
+[[channel]]
+kind          = "watch"
+enabled       = false
+token         = "env:AGENTD_WATCH_TOKEN"
+title         = "agentd"
+share_session = true
+mirror        = true
 
 # ------------------------------------------------------------------------------
 # Jobs (internal/scheduler): declarative proactive work. A job = a TRIGGER + a

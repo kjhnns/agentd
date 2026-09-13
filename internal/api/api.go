@@ -33,19 +33,33 @@ type Server struct {
 	sched     *scheduler.Scheduler
 	media     *media.Service
 	mux       *http.ServeMux
+	pub       *http.ServeMux // routes that carry their OWN auth (see MountPublic)
 }
 
 // New builds the API server. transport may be nil (reported as unknown/false).
 func New(bearer string, mgr *session.Manager, bus *eventbus.Bus, transport TransportChecker) *Server {
-	s := &Server{bearer: bearer, mgr: mgr, bus: bus, transport: transport, mux: http.NewServeMux()}
+	s := &Server{bearer: bearer, mgr: mgr, bus: bus, transport: transport, mux: http.NewServeMux(), pub: http.NewServeMux()}
 	s.routes()
 	return s
 }
 
-// Handler returns the bearer-gated http.Handler.
+// Handler returns the bearer-gated http.Handler. Public routes (MountPublic)
+// are matched first and bypass the API bearer: they carry their own gate.
 func (s *Server) Handler() http.Handler {
-	return s.auth(s.mux)
+	authed := s.auth(s.mux)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, pattern := s.pub.Handler(r); pattern != "" {
+			s.pub.ServeHTTP(w, r)
+			return
+		}
+		authed.ServeHTTP(w, r)
+	})
 }
+
+// PublicHandler serves ONLY the public routes and 404s everything else. It is
+// what an extra listener beyond loopback ([server] public_bind) gets, so a
+// proxy misconfiguration can never expose the code-executing API.
+func (s *Server) PublicHandler() http.Handler { return s.pub }
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("/health", s.handleHealth)
@@ -69,6 +83,12 @@ func (s *Server) AttachMedia(svc *media.Service) { s.media = svc }
 // UI) is served by the ONE HTTP server behind the SAME bearer gate, on no second
 // port. Patterns follow http.ServeMux rules (a trailing slash matches a subtree).
 func (s *Server) Mount(pattern string, h http.Handler) { s.mux.Handle(pattern, h) }
+
+// MountPublic registers a handler that is reachable WITHOUT the API bearer, on
+// the main listener and on the public one. The handler MUST enforce its own
+// authentication (the watch channel gates on its own token). Patterns follow
+// http.ServeMux rules.
+func (s *Server) MountPublic(pattern string, h http.Handler) { s.pub.Handle(pattern, h) }
 
 // authed reports whether a request carries the API bearer. The header form
 // (Authorization: Bearer ...) is the canonical machine path. For BROWSERS, which
