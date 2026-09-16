@@ -34,6 +34,7 @@ type Adapter struct {
 	mirror  func(text string)
 	maxWait time.Duration
 	now     func() time.Time
+	usage   *usageReader
 }
 
 // New builds a watch adapter gated by its own bearer token (NOT the API
@@ -42,6 +43,7 @@ type Adapter struct {
 func New(token string, store *Store) *Adapter {
 	return &Adapter{
 		title:   "agentd",
+		usage:   newUsageReader(),
 		token:   token,
 		userID:  DefaultUserID,
 		store:   store,
@@ -165,6 +167,7 @@ func (a *Adapter) echo(text string) {
 func (a *Adapter) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/watch/ping", a.handlePing)
+	mux.HandleFunc("/watch/usage", a.handleUsage)
 	mux.HandleFunc("/watch/messages", a.handleMessages)
 	return a.auth(mux)
 }
