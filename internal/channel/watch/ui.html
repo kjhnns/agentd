@@ -65,9 +65,11 @@
            font: inherit; line-height: 1.45; }
   #draft:focus { outline: 2px solid var(--mine); outline-offset: -1px; }
   button.icon { flex: none; width: 38px; height: 38px; border-radius: 50%; border: 0; cursor: pointer;
-                background: var(--mine); color: #fff; font-size: 16px; display: grid; place-items: center; }
+                background: var(--mine); color: #fff; display: grid; place-items: center; padding: 0; }
+  button.icon svg { display: block; }
   button.icon.ghost { background: var(--theirs); color: var(--ink); }
-  button.icon.rec { background: var(--bad); }
+  button.icon.rec { background: var(--bad); color: #fff; animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .55 } }
   button.icon:disabled { opacity: .4; cursor: default; }
   #hint { font-size: 11.5px; color: var(--muted); padding: 0 16px 8px; min-height: 16px; }
 
@@ -98,8 +100,19 @@
   <div id="hint" class="hidden"></div>
   <footer id="composer" class="hidden">
     <textarea id="draft" rows="1" placeholder="Ask your agent…" spellcheck="false"></textarea>
-    <button id="mic" class="icon ghost" type="button" title="Record a voice message">&#9679;</button>
-    <button id="send" class="icon" type="button" title="Send (Enter)" disabled>&#8593;</button>
+    <button id="mic" class="icon ghost" type="button" title="Record a voice message" aria-label="Record a voice message">
+      <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="9" y="2" width="6" height="11" rx="3"></rect>
+        <path d="M5 11a7 7 0 0 0 14 0"></path><path d="M12 18v4"></path>
+      </svg>
+    </button>
+    <button id="send" class="icon" type="button" title="Send (Enter)" aria-label="Send" disabled>
+      <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2.2"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 20V5"></path><path d="M5.5 11.5 12 5l6.5 6.5"></path>
+      </svg>
+    </button>
   </footer>
 </div>
 
