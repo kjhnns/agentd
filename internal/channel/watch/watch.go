@@ -3,6 +3,7 @@ package watch
 import (
 	"context"
 	"crypto/subtle"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,16 @@ import (
 	"github.com/kjhnns/agentd/internal/media"
 	"github.com/kjhnns/agentd/internal/notify"
 )
+
+//go:embed ui.html
+var uiHTML []byte
+
+// tokenCookie carries the watch token for BROWSER clients (the desktop UI).
+// A browser cannot set an Authorization header on a plain page load, so the
+// token arrives once as ?token= on /watch/ui, is stored in this cookie, and
+// the handler then redirects to the clean URL so the secret does not linger
+// in the address bar, the history or a screenshot.
+const tokenCookie = "agentd_watch_token"
 
 // DefaultUserID keys the wrist conversation in session.RouteInbound's per-user
 // map when the channel runs its own session. With share_session the wiring
@@ -162,22 +173,46 @@ func (a *Adapter) echo(text string) {
 // API bearer is neither required nor accepted here.
 //
 //	GET  /watch/ping                          {ok, title, pending}
-//	GET  /watch/messages?after=N&limit=M&wait=S
+//	GET  /watch/messages?limit=M              newest page + has_more
+//	GET  /watch/messages?after=N&limit=M&wait=S   incremental, long-polled
+//	GET  /watch/messages?before=<id>&limit=M  one page of OLDER messages
 //	POST /watch/messages   JSON {text}  |  multipart file (+text)  -> 202 {message}
+//	GET  /watch/ui[?token=]                   the desktop web UI
 func (a *Adapter) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/watch/ping", a.handlePing)
 	mux.HandleFunc("/watch/usage", a.handleUsage)
 	mux.HandleFunc("/watch/messages", a.handleMessages)
-	return a.auth(mux)
+	gated := a.auth(mux)
+
+	// The UI route runs BEFORE the gate: it owns the sign-in flow (it turns a
+	// ?token= into the cookie and, without one, serves the token form instead
+	// of a bare 401 a browser cannot act on).
+	outer := http.NewServeMux()
+	outer.HandleFunc("/watch/ui", a.handleUI)
+	outer.Handle("/watch/", gated)
+	return outer
 }
 
 func (a *Adapter) authed(r *http.Request) bool {
 	if a.token == "" {
 		return false // an unset token means CLOSED, never open
 	}
-	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	return subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) == 1
+	if a.matches(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")) {
+		return true
+	}
+	// Browser path: the cookie set by /watch/ui. It is SameSite=Strict, so it
+	// is NOT attached to a cross-site request, which is what keeps a hostile
+	// page from POSTing a turn on Joe's behalf. The ?token= query param is
+	// deliberately NOT accepted here: only the UI route consumes it.
+	if c, err := r.Cookie(tokenCookie); err == nil && a.matches(c.Value) {
+		return true
+	}
+	return false
+}
+
+func (a *Adapter) matches(got string) bool {
+	return got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) == 1
 }
 
 func (a *Adapter) auth(next http.Handler) http.Handler {
@@ -218,21 +253,43 @@ func (a *Adapter) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleFetch answers "everything after seq N", optionally long-polling up to
-// wait seconds (capped) when nothing new is there yet.
+// handleFetch serves the three read shapes a paging client needs: the newest
+// page (no params), one page of OLDER messages (before=<id>, for lazy history
+// loading), and everything after a seq (after=N, optionally long-polled). Only
+// the incremental shape long-polls; a history page must answer at once.
 func (a *Adapter) handleFetch(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	waitS, _ := strconv.Atoi(q.Get("wait"))
-	if waitS > 0 && after > 0 {
-		d := time.Duration(waitS) * time.Second
-		if d > a.maxWait {
-			d = a.maxWait
+	before := q.Get("before")
+
+	var (
+		msgs    []Message
+		latest  int64
+		reset   bool
+		hasMore bool
+	)
+	switch {
+	case before != "":
+		msgs, hasMore, latest = a.store.Page(before, limit)
+	case after > 0:
+		if waitS > 0 {
+			d := time.Duration(waitS) * time.Second
+			if d > a.maxWait {
+				d = a.maxWait
+			}
+			a.store.Wait(r.Context(), after, d)
 		}
-		a.store.Wait(r.Context(), after, d)
+		msgs, latest, reset = a.store.Since(after, limit)
+		if reset {
+			// The client is being handed a fresh tail, so tell it whether
+			// older messages are still pageable.
+			_, hasMore, _ = a.store.Tail(limit)
+		}
+	default:
+		msgs, hasMore, latest = a.store.Tail(limit)
 	}
-	msgs, latest, reset := a.store.Since(after, limit)
 	if msgs == nil {
 		msgs = []Message{}
 	}
@@ -240,9 +297,63 @@ func (a *Adapter) handleFetch(w http.ResponseWriter, r *http.Request) {
 		"messages":    msgs,
 		"latest_seq":  latest,
 		"reset":       reset,
+		"has_more":    hasMore,
 		"pending":     a.store.Pending(),
 		"server_time": a.now(),
 	})
+}
+
+// handleUI serves the desktop web UI and owns its sign-in. With ?token= it
+// stores the token in a cookie and redirects to the clean URL; with a valid
+// cookie it serves the page; otherwise it serves the same page, which then
+// shows its token form (a 401 body a browser can act on, not a dead end).
+func (a *Adapter) handleUI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if tok := r.URL.Query().Get("token"); tok != "" {
+		if !a.matches(tok) {
+			a.serveUI(w, http.StatusUnauthorized)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     tokenCookie,
+			Value:    tok,
+			Path:     "/watch/",
+			HttpOnly: true,
+			Secure:   isHTTPS(r),
+			SameSite: http.SameSiteStrictMode,
+			MaxAge:   30 * 24 * 3600,
+		})
+		http.Redirect(w, r, "/watch/ui", http.StatusFound)
+		return
+	}
+	code := http.StatusOK
+	if !a.authed(r) {
+		code = http.StatusUnauthorized
+	}
+	a.serveUI(w, code)
+}
+
+func (a *Adapter) serveUI(w http.ResponseWriter, code int) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(code)
+	_, _ = w.Write(uiHTML)
+}
+
+// isHTTPS reports whether the ORIGINAL request was TLS. The daemon itself is
+// plain HTTP behind a reverse proxy that terminates TLS, so the forwarded
+// header is the only evidence; without it the cookie must not be Secure or the
+// browser would drop it on a local plain-HTTP run.
+func isHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
 // handlePost accepts one delegation: JSON {"text"} or multipart with a "file"

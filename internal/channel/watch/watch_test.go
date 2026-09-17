@@ -55,6 +55,7 @@ type fetchResp struct {
 	Messages  []Message `json:"messages"`
 	LatestSeq int64     `json:"latest_seq"`
 	Reset     bool      `json:"reset"`
+	HasMore   bool      `json:"has_more"`
 	Pending   int       `json:"pending"`
 }
 
@@ -328,3 +329,217 @@ func TestSinceResetWhenLogTrimmed(t *testing.T) {
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
+
+// ---- paging (lazy history loading) ----
+
+func seedConversation(t *testing.T, st *Store, pairs int) []Message {
+	t.Helper()
+	var all []Message
+	for i := 0; i < pairs; i++ {
+		u := st.Append(Message{Role: RoleUser, Kind: KindText, Text: "q" + strconv.Itoa(i), Status: StatusDone})
+		a := st.Append(Message{Role: RoleAgent, Kind: KindReply, Text: "a" + strconv.Itoa(i), ReplyTo: u.ID})
+		all = append(all, u, a)
+	}
+	return all
+}
+
+func TestTailAndPageWalkBackwards(t *testing.T) {
+	st, _ := OpenStore("")
+	all := seedConversation(t, st, 30) // 60 messages
+
+	tail, more, latest := st.Tail(10)
+	if len(tail) != 10 || !more || latest != 60 {
+		t.Fatalf("tail: n=%d more=%v latest=%d", len(tail), more, latest)
+	}
+	if tail[9].ID != all[59].ID || tail[0].ID != all[50].ID {
+		t.Fatalf("tail window wrong: %s..%s", tail[0].Text, tail[9].Text)
+	}
+
+	// Walk back to the very beginning; every message appears exactly once.
+	seen := map[string]bool{}
+	for _, m := range tail {
+		seen[m.ID] = true
+	}
+	anchor := tail[0].ID
+	for i := 0; i < 20 && more; i++ {
+		var page []Message
+		page, more, _ = st.Page(anchor, 10)
+		if len(page) == 0 {
+			t.Fatal("empty page while has_more was true")
+		}
+		for _, m := range page {
+			if seen[m.ID] {
+				t.Fatalf("message %s served twice", m.ID)
+			}
+			seen[m.ID] = true
+		}
+		if page[len(page)-1].Seq >= st.mustGet(t, anchor).Seq {
+			t.Fatalf("page is not strictly older than the anchor")
+		}
+		anchor = page[0].ID
+	}
+	if more {
+		t.Fatal("never reached the start of the conversation")
+	}
+	if len(seen) != 60 {
+		t.Fatalf("walked %d of 60 messages", len(seen))
+	}
+}
+
+func TestPageWithUnknownAnchorFallsBackToTail(t *testing.T) {
+	st, _ := OpenStore("")
+	seedConversation(t, st, 5)
+	page, more, _ := st.Page("gone", 4)
+	if len(page) != 4 || !more {
+		t.Fatalf("unknown anchor: n=%d more=%v", len(page), more)
+	}
+	if page[3].Text != "a4" {
+		t.Fatalf("expected the tail, got %q", page[3].Text)
+	}
+	// The oldest message has nothing before it.
+	first, _, _ := st.Tail(10)
+	empty, more, _ := st.Page(first[0].ID, 10)
+	if len(empty) != 0 || more {
+		t.Fatalf("before the first message: n=%d more=%v", len(empty), more)
+	}
+}
+
+func (s *Store) mustGet(t *testing.T, id string) Message {
+	t.Helper()
+	m, ok := s.Get(id)
+	if !ok {
+		t.Fatalf("no message %s", id)
+	}
+	return m
+}
+
+func TestFetchEndpointPagesAndReportsHasMore(t *testing.T) {
+	a, st := newAdapter(t)
+	h := a.Handler()
+	seedConversation(t, st, 20) // 40 messages
+
+	first := fetch(t, h, "?limit=10")
+	if len(first.Messages) != 10 || !first.HasMore {
+		t.Fatalf("first page: n=%d has_more=%v", len(first.Messages), first.HasMore)
+	}
+	if first.Messages[9].Text != "a19" {
+		t.Fatalf("first page must be the NEWEST 10, got %q last", first.Messages[9].Text)
+	}
+
+	older := fetch(t, h, "?limit=10&before="+first.Messages[0].ID)
+	if len(older.Messages) != 10 || !older.HasMore {
+		t.Fatalf("older page: n=%d has_more=%v", len(older.Messages), older.HasMore)
+	}
+	if older.Messages[9].Seq >= first.Messages[0].Seq {
+		t.Fatal("older page overlaps the first page")
+	}
+
+	// A before= request must NOT long-poll even when wait is set.
+	start := time.Now()
+	_ = fetch(t, h, "?limit=5&wait=25&before="+older.Messages[0].ID)
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("history page long-polled (%v)", time.Since(start))
+	}
+
+	// Incremental fetches still work and carry the new message.
+	last := fetch(t, h, "?limit=10")
+	m := st.Append(Message{Role: RoleSystem, Kind: KindNotice, Text: "later"})
+	inc := fetch(t, h, "?after="+itoa(last.LatestSeq))
+	if len(inc.Messages) != 1 || inc.Messages[0].ID != m.ID {
+		t.Fatalf("incremental: %+v", inc.Messages)
+	}
+}
+
+// ---- browser auth for the desktop UI ----
+
+func TestUIRouteSignInFlow(t *testing.T) {
+	a, _ := newAdapter(t)
+	h := a.Handler()
+
+	// No cookie: the page is served with 401 so the browser can show its form.
+	rec := do(t, h, http.MethodGet, "/watch/ui", "", nil, "")
+	if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "<!doctype html>") {
+		t.Fatalf("bare /watch/ui: %d %q", rec.Code, rec.Body.String()[:min(60, rec.Body.Len())])
+	}
+
+	// A wrong token never sets a cookie.
+	rec = do(t, h, http.MethodGet, "/watch/ui?token=nope", "", nil, "")
+	if rec.Code != http.StatusUnauthorized || len(rec.Result().Cookies()) != 0 {
+		t.Fatalf("wrong token: %d cookies=%d", rec.Code, len(rec.Result().Cookies()))
+	}
+
+	// The right token sets a hardened cookie and redirects to the clean URL.
+	rec = do(t, h, http.MethodGet, "/watch/ui?token=wt", "", nil, "")
+	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/watch/ui" {
+		t.Fatalf("good token: %d -> %q", rec.Code, rec.Header().Get("Location"))
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("cookies = %d", len(cookies))
+	}
+	c := cookies[0]
+	if c.Name != tokenCookie || c.Value != "wt" || !c.HttpOnly ||
+		c.SameSite != http.SameSiteStrictMode || c.Path != "/watch/" {
+		t.Fatalf("cookie not hardened: %+v", c)
+	}
+	if c.Secure {
+		t.Fatal("plain HTTP must not set a Secure cookie (the browser would drop it)")
+	}
+
+	// Behind a TLS-terminating proxy the cookie IS Secure.
+	req := httptest.NewRequest(http.MethodGet, "/watch/ui?token=wt", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if !rr.Result().Cookies()[0].Secure {
+		t.Fatal("proxied HTTPS must set a Secure cookie")
+	}
+}
+
+func TestCookieAuthenticatesTheAPIButQueryTokenDoesNot(t *testing.T) {
+	a, st := newAdapter(t)
+	h := a.Handler()
+	st.Append(Message{Role: RoleSystem, Kind: KindNotice, Text: "hi"})
+
+	withCookie := func(method, path string, body *bytes.Buffer, ctype string) int {
+		if body == nil {
+			body = &bytes.Buffer{}
+		}
+		req := httptest.NewRequest(method, path, body)
+		req.AddCookie(&http.Cookie{Name: tokenCookie, Value: "wt"})
+		if ctype != "" {
+			req.Header.Set("Content-Type", ctype)
+		}
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr.Code
+	}
+	if c := withCookie(http.MethodGet, "/watch/messages", nil, ""); c != 200 {
+		t.Fatalf("cookie GET = %d", c)
+	}
+	if c := withCookie(http.MethodPost, "/watch/messages", bytes.NewBufferString(`{"text":"hi"}`), "application/json"); c != 202 {
+		t.Fatalf("cookie POST = %d", c)
+	}
+	<-a.Inbound()
+
+	// The JSON API must not accept a token in the URL: it would leak through
+	// referrers, logs and history. Only /watch/ui consumes ?token=.
+	if rec := do(t, h, http.MethodGet, "/watch/messages?token=wt", "", nil, ""); rec.Code != 401 {
+		t.Fatalf("query token on the API = %d, want 401", rec.Code)
+	}
+	// A bad cookie is still a 401.
+	req := httptest.NewRequest(http.MethodGet, "/watch/messages", nil)
+	req.AddCookie(&http.Cookie{Name: tokenCookie, Value: "wrong"})
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != 401 {
+		t.Fatalf("bad cookie = %d", rr.Code)
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

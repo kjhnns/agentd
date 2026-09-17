@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>Agent</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f5f7; --panel: #ffffff; --ink: #1c1c1e; --muted: #8a8a8e;
+    --line: #e3e3e8; --mine: #0b6ec9; --mine-ink: #ffffff; --theirs: #ececf0;
+    --bad: #c0392b; --good: #1f8b4c; --warn: #b8710a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d0d0f; --panel: #17171a; --ink: #f2f2f4; --muted: #8e8e93;
+      --line: #2a2a2f; --mine: #1177d6; --mine-ink: #ffffff; --theirs: #26262b;
+      --bad: #ff6b5e; --good: #4cd07d; --warn: #f0a63a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex; justify-content: center;
+  }
+  #app { width: 100%; max-width: 760px; height: 100%; display: flex; flex-direction: column;
+         background: var(--panel); border-left: 1px solid var(--line); border-right: 1px solid var(--line); }
+
+  header { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+           border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+  #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  #dot.ok { background: var(--good); } #dot.bad { background: var(--bad); }
+  #hstatus { color: var(--muted); font-size: 13px; margin-left: auto; text-align: right; }
+
+  #log { flex: 1; overflow-y: auto; padding: 14px 16px 4px; scroll-behavior: auto; }
+  .row { display: flex; margin: 0 0 8px; }
+  .row.user { justify-content: flex-end; }
+  .bubble { max-width: 76%; padding: 8px 12px; border-radius: 16px; white-space: pre-wrap;
+            overflow-wrap: anywhere; }
+  .user .bubble { background: var(--mine); color: var(--mine-ink); border-bottom-right-radius: 5px; }
+  .agent .bubble { background: var(--theirs); border-bottom-left-radius: 5px; }
+  .user.failed .bubble { background: var(--bad); }
+  .user.queued .bubble, .user.working .bubble { opacity: .75; }
+  .agent.failure .bubble { border: 1px solid var(--bad); }
+  .meta { font-size: 11px; color: var(--muted); margin-top: 3px; display: flex; gap: 6px; }
+  .user .meta { justify-content: flex-end; color: rgba(255,255,255,.85); }
+  .row.system { justify-content: center; }
+  .system .bubble { background: transparent; color: var(--muted); font-size: 12.5px; max-width: 90%;
+                    text-align: center; padding: 3px 8px; }
+  .day { text-align: center; color: var(--muted); font-size: 11.5px; text-transform: uppercase;
+         letter-spacing: .06em; margin: 14px 0 10px; }
+
+  #earlier { display: none; width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid var(--line);
+             background: transparent; color: var(--muted); border-radius: 10px; cursor: pointer; font-size: 13px; }
+  #earlier:hover { color: var(--ink); }
+
+  footer { border-top: 1px solid var(--line); padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+           display: flex; gap: 8px; align-items: flex-end; background: var(--panel); }
+  #draft { flex: 1; resize: none; max-height: 40vh; padding: 9px 13px; border-radius: 19px;
+           border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+           font: inherit; line-height: 1.45; }
+  #draft:focus { outline: 2px solid var(--mine); outline-offset: -1px; }
+  button.icon { flex: none; width: 38px; height: 38px; border-radius: 50%; border: 0; cursor: pointer;
+                background: var(--mine); color: #fff; font-size: 16px; display: grid; place-items: center; }
+  button.icon.ghost { background: var(--theirs); color: var(--ink); }
+  button.icon.rec { background: var(--bad); }
+  button.icon:disabled { opacity: .4; cursor: default; }
+  #hint { font-size: 11.5px; color: var(--muted); padding: 0 16px 8px; min-height: 16px; }
+
+  #gate { margin: auto; padding: 28px; max-width: 420px; text-align: center; }
+  #gate input { width: 100%; padding: 10px 12px; margin: 14px 0 10px; border-radius: 10px;
+                border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit; }
+  #gate button { width: 100%; padding: 10px; border-radius: 10px; border: 0; background: var(--mine);
+                 color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+  #gate p { color: var(--muted); font-size: 13px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="app">
+  <form id="gate" class="hidden" autocomplete="off">
+    <h1>Agent</h1>
+    <p>Paste the watch channel token to use this browser. It is stored in a cookie for this site only.</p>
+    <input id="gtoken" type="password" placeholder="watch token" autocomplete="off" spellcheck="false">
+    <button type="submit">Connect</button>
+  </form>
+
+  <header id="chrome" class="hidden">
+    <span id="dot"></span>
+    <h1>Agent</h1>
+    <span id="hstatus"></span>
+  </header>
+  <div id="log" class="hidden"><button id="earlier" type="button">Load earlier messages</button></div>
+  <div id="hint" class="hidden"></div>
+  <footer id="composer" class="hidden">
+    <textarea id="draft" rows="1" placeholder="Ask your agent…" spellcheck="false"></textarea>
+    <button id="mic" class="icon ghost" type="button" title="Record a voice message">&#9679;</button>
+    <button id="send" class="icon" type="button" title="Send (Enter)" disabled>&#8593;</button>
+  </footer>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const log = $("log"), draft = $("draft"), hint = $("hint"), earlier = $("earlier");
+const PAGE = 40;
+
+// ---- state -----------------------------------------------------------------
+// Messages are held by id because the server re-sends a message whenever its
+// status changes (with a fresh seq); order[] is conversation order.
+const msgs = new Map(), els = new Map();
+let order = [], latestSeq = 0, hasMore = false, polling = false, stopped = false;
+
+function api(path, opts) {
+  return fetch(path, Object.assign({ credentials: "same-origin", cache: "no-store" }, opts || {}));
+}
+
+function setConnected(ok, text) {
+  $("dot").className = ok ? "ok" : "bad";
+  $("hstatus").textContent = text || "";
+}
+
+function showGate(show) {
+  $("gate").classList.toggle("hidden", !show);
+  for (const id of ["chrome", "log", "hint", "composer"]) $(id).classList.toggle("hidden", show);
+}
+
+// ---- rendering -------------------------------------------------------------
+function dayKey(iso) { return new Date(iso).toDateString(); }
+
+function timeLabel(iso) {
+  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+const STATUS_LABEL = { queued: "Queued", working: "Working…", needs_input: "Needs input",
+                       done: "Done", failed: "Failed" };
+
+function bubbleFor(m) {
+  const row = document.createElement("div");
+  const body = document.createElement("div");
+  body.className = "bubble";
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  row.appendChild(body); 
+  body.appendChild(document.createTextNode(""));
+  body.appendChild(meta);
+  row._body = body; row._meta = meta;
+  return row;
+}
+
+function paint(row, m) {
+  row.className = "row " + m.role + " " + (m.status || m.kind || "");
+  row._body.firstChild.nodeValue = m.text || "";
+  const bits = [];
+  if (m.kind === "voice" && m.duration_s) bits.push("voice " + m.duration_s + "s");
+  bits.push(timeLabel(m.ts));
+  if (m.role === "user" && m.status) bits.push(STATUS_LABEL[m.status] || m.status);
+  if (m.kind === "failure") bits.unshift("failed");
+  row._meta.textContent = bits.join(" · ");
+}
+
+// Rebuilds the list from `order`, reusing existing nodes so scroll position and
+// text selection survive a poll.
+function render() {
+  const frag = document.createDocumentFragment();
+  let day = null;
+  for (const id of order) {
+    const m = msgs.get(id);
+    const k = dayKey(m.ts);
+    if (k !== day) {
+      day = k;
+      const d = document.createElement("div");
+      d.className = "day";
+      const today = new Date().toDateString();
+      d.textContent = k === today ? "Today"
+        : new Date(m.ts).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+      frag.appendChild(d);
+    }
+    let row = els.get(id);
+    if (!row) { row = bubbleFor(m); els.set(id, row); }
+    paint(row, m);
+    frag.appendChild(row);
+  }
+  log.replaceChildren(earlier, frag);
+  earlier.style.display = hasMore ? "block" : "none";
+}
+
+function nearBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 120; }
+function toBottom() { log.scrollTop = log.scrollHeight; }
+
+// ---- merging ---------------------------------------------------------------
+function upsert(list, where) {
+  let added = false;
+  for (const m of list) {
+    if (!msgs.has(m.id)) {
+      added = true;
+      if (where === "front") order.unshift(m.id); else order.push(m.id);
+    }
+    msgs.set(m.id, m);
+  }
+  if (where !== "front") order.sort((a, b) => {
+    const x = msgs.get(a), y = msgs.get(b);
+    return x.ts === y.ts ? x.seq - y.seq : (x.ts < y.ts ? -1 : 1);
+  });
+  return added;
+}
+
+function apply(data, where) {
+  if (data.reset) { msgs.clear(); els.clear(); order = []; }
+  const added = upsert(data.messages || [], where);
+  if (typeof data.latest_seq === "number") latestSeq = Math.max(latestSeq, data.latest_seq);
+  if (where !== "append-poll" || data.reset) hasMore = !!data.has_more;
+  setConnected(true, data.pending > 0 ? data.pending + " in flight" : "");
+  return added;
+}
+
+// ---- loading ---------------------------------------------------------------
+async function loadFirst() {
+  const r = await api("/watch/messages?limit=" + PAGE);
+  if (r.status === 401) { showGate(true); return false; }
+  showGate(false);
+  apply(await r.json(), "append");
+  render(); toBottom();
+  return true;
+}
+
+async function loadEarlier() {
+  if (!order.length) return;
+  earlier.disabled = true; earlier.textContent = "Loading…";
+  try {
+    const r = await api("/watch/messages?limit=" + PAGE + "&before=" + encodeURIComponent(order[0]));
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const data = await r.json();
+    const anchorId = order[0];
+    const before = log.scrollHeight;
+    upsert(data.messages || [], "front");
+    hasMore = !!data.has_more;
+    render();
+    // Keep the reading position: grow upwards, do not jump.
+    log.scrollTop += log.scrollHeight - before;
+    if (!(data.messages || []).length) hasMore = false;
+    void anchorId;
+  } catch (e) {
+    hint.textContent = "Could not load older messages: " + e.message;
+  } finally {
+    earlier.disabled = false; earlier.textContent = "Load earlier messages";
+  }
+}
+
+async function poll() {
+  if (polling) return;
+  polling = true;
+  while (!stopped) {
+    try {
+      const r = await api("/watch/messages?wait=25&limit=" + PAGE + "&after=" + latestSeq);
+      if (r.status === 401) { showGate(true); break; }
+      const data = await r.json();
+      const wasLow = nearBottom();
+      const added = apply(data, "append-poll");
+      if ((data.messages || []).length) { render(); if (wasLow || added) toBottom(); }
+    } catch (e) {
+      setConnected(false, "offline");
+      await new Promise((r) => setTimeout(r, 4000));
+    }
+  }
+  polling = false;
+}
+
+// ---- sending ---------------------------------------------------------------
+async function sendText() {
+  const text = draft.value.trim();
+  if (!text) return;
+  draft.value = ""; sizeDraft(); $("send").disabled = true;
+  hint.textContent = "Sending…";
+  try {
+    const r = await api("/watch/messages", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: text })
+    });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "HTTP " + r.status);
+    const data = await r.json();
+    upsert([data.message], "append"); render(); toBottom();
+    hint.textContent = "";
+  } catch (e) {
+    draft.value = text; sizeDraft();
+    hint.textContent = "Not sent: " + e.message;
+  }
+}
+
+// Voice: the browser records opus/mp4, the SERVER transcribes it through the
+// same Whisper path as the watch, so the receipt already carries the text.
+let recorder = null, chunks = [], recStart = 0, recTimer = null;
+
+async function toggleRecord() {
+  if (recorder) { recorder.stop(); return; }
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    hint.textContent = "This browser cannot record audio. Type instead.";
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const type = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"]
+      .find((t) => MediaRecorder.isTypeSupported(t)) || "";
+    recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+    chunks = []; recStart = Date.now();
+    recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+    recorder.onstop = async () => {
+      clearInterval(recTimer); recTimer = null;
+      stream.getTracks().forEach((t) => t.stop());
+      const mime = (recorder.mimeType || "audio/webm").split(";")[0];
+      recorder = null;
+      $("mic").classList.remove("rec"); $("mic").classList.add("ghost");
+      const secs = Math.round((Date.now() - recStart) / 1000);
+      const blob = new Blob(chunks, { type: mime });
+      if (secs < 1 || !blob.size) { hint.textContent = "Too short"; return; }
+      await uploadVoice(blob, mime, secs);
+    };
+    recorder.start();
+    $("mic").classList.add("rec"); $("mic").classList.remove("ghost");
+    recTimer = setInterval(() => {
+      const s = Math.round((Date.now() - recStart) / 1000);
+      hint.textContent = "Recording " + s + "s — click the red button to send";
+      if (s >= 120 && recorder) recorder.stop();
+    }, 250);
+  } catch (e) {
+    hint.textContent = "Microphone blocked: " + e.message;
+  }
+}
+
+async function uploadVoice(blob, mime, secs) {
+  const ext = mime.includes("mp4") ? "m4a" : mime.includes("ogg") ? "ogg" : "webm";
+  const fd = new FormData();
+  fd.append("duration_s", String(secs));
+  fd.append("file", blob, "memo." + ext);
+  hint.textContent = "Transcribing…";
+  try {
+    const r = await api("/watch/messages", { method: "POST", body: fd });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "HTTP " + r.status);
+    const data = await r.json();
+    upsert([data.message], "append"); render(); toBottom();
+    hint.textContent = "";
+  } catch (e) {
+    hint.textContent = "Voice not sent: " + e.message;
+  }
+}
+
+// ---- composer chrome -------------------------------------------------------
+function sizeDraft() {
+  draft.style.height = "auto";
+  draft.style.height = Math.min(draft.scrollHeight, window.innerHeight * 0.4) + "px";
+  $("send").disabled = !draft.value.trim();
+}
+
+draft.addEventListener("input", sizeDraft);
+draft.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendText(); }
+});
+$("send").addEventListener("click", sendText);
+$("mic").addEventListener("click", toggleRecord);
+earlier.addEventListener("click", loadEarlier);
+$("gate").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const t = $("gtoken").value.trim();
+  if (t) location.replace("/watch/ui?token=" + encodeURIComponent(t));
+});
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && !polling) { stopped = false; poll(); }
+});
+
+(async function start() {
+  if (await loadFirst()) { draft.focus(); poll(); }
+})();
+</script>
+</body>
+</html>

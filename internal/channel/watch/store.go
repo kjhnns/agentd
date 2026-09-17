@@ -265,6 +265,74 @@ func (s *Store) Get(id string) (Message, bool) {
 	return m, ok
 }
 
+// clampLimit bounds a client-supplied page size.
+func clampLimit(limit int) int {
+	if limit <= 0 {
+		return 50
+	}
+	if limit > 200 {
+		return 200
+	}
+	return limit
+}
+
+// tailLocked returns the newest `limit` distinct messages (oldest first) and
+// the index they start at in the conversation order.
+func (s *Store) tailLocked(limit int) ([]Message, int) {
+	start := 0
+	if len(s.order) > limit {
+		start = len(s.order) - limit
+	}
+	out := make([]Message, 0, len(s.order)-start)
+	for _, id := range s.order[start:] {
+		out = append(out, s.latest[id])
+	}
+	return out, start
+}
+
+// Tail returns the newest `limit` distinct messages (oldest first), whether
+// OLDER messages remain in the store, and the current seq. This is the first
+// page a client loads; it then pages backwards with Page and forwards with
+// Since, so a long conversation is never sent in one piece.
+func (s *Store) Tail(limit int) (msgs []Message, hasMore bool, latest int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out, start := s.tailLocked(clampLimit(limit))
+	return out, start > 0, s.seq
+}
+
+// Page returns up to limit messages that sit immediately BEFORE beforeID in
+// conversation order (oldest first) plus whether older ones remain. The anchor
+// is a message ID, not a seq, because a seq changes whenever that message's
+// status is updated. An unknown or empty anchor yields the tail, so a client
+// whose anchor has already been trimmed out of the store still gets a usable
+// page instead of an error.
+func (s *Store) Page(beforeID string, limit int) (msgs []Message, hasMore bool, latest int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	limit = clampLimit(limit)
+	end := -1
+	for i, id := range s.order {
+		if id == beforeID {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		out, start := s.tailLocked(limit)
+		return out, start > 0, s.seq
+	}
+	start := end - limit
+	if start < 0 {
+		start = 0
+	}
+	out := make([]Message, 0, end-start)
+	for _, id := range s.order[start:end] {
+		out = append(out, s.latest[id])
+	}
+	return out, start > 0, s.seq
+}
+
 // Since returns the newest snapshot of every message touched after seq
 // `after` (oldest first, at most limit). after <= 0 means "the tail of the
 // conversation" (the last limit distinct messages). reset is true when after
@@ -273,26 +341,15 @@ func (s *Store) Get(id string) (Message, bool) {
 func (s *Store) Since(after int64, limit int) (msgs []Message, latest int64, reset bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if limit <= 0 || limit > 200 {
-		limit = 200
-	}
+	limit = clampLimit(limit)
 	latest = s.seq
-	tail := func() []Message {
-		start := 0
-		if len(s.order) > limit {
-			start = len(s.order) - limit
-		}
-		out := make([]Message, 0, len(s.order)-start)
-		for _, id := range s.order[start:] {
-			out = append(out, s.latest[id])
-		}
-		return out
-	}
 	if after <= 0 {
-		return tail(), latest, false
+		out, _ := s.tailLocked(limit)
+		return out, latest, false
 	}
 	if len(s.log) > 0 && after < s.log[0].Seq-1 {
-		return tail(), latest, true
+		out, _ := s.tailLocked(limit)
+		return out, latest, true
 	}
 	seen := map[string]bool{}
 	out := []Message{}
