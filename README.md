@@ -4,7 +4,7 @@
 > the module path is load-bearing beyond `github.com/kjhnns/agentd`.
 
 **Vision.** One local daemon that wraps CLI agentic coding harnesses (Claude Code
-today, Codex or any other CLI tomorrow) so you can talk to your agent from
+and Codex today, other CLIs through adapters) so you can talk to your agent from
 Telegram (and later a web/wrist UI) and swap the underlying harness WITHOUT
 rewriting the surrounding machinery. It replaces today's brittle five-process
 Telegram bridge (separate daemon + MCP proxy + runner + two watchdogs, coordinated
@@ -89,6 +89,56 @@ scope. What is IN:
   `POST /sessions/:id/interrupt`, `POST /sessions/:id/reset`. The web channel
   mounts `GET /ui`, the `/ws` WebSocket, and `POST /confirm/:token` on this same
   server via `(*Server).Mount`, behind the same bearer gate.
+
+## Codex backend
+
+Select Codex by replacing the existing `[[harness]]` block:
+
+```toml
+[[harness]]
+kind = "codex"
+# bin = "/home/you/.local/bin/codex"  # optional, defaults to codex on PATH
+model = ""                          # use the Codex CLI default
+skip_permissions = false             # read-only; see below
+```
+
+Build with `go build -o agentd ./cmd/agentd`, then run
+`./agentd serve -config /path/to/config.toml`. One backend is selected per daemon;
+multiple harness entries and unknown kinds are rejected. Channels, workspaces,
+scheduling and session reset use the same manager for either backend.
+
+Run `codex login` as the daemon's OS user and check `codex login status`.
+The child inherits the daemon's environment and uses Codex's existing login and
+configuration, including `CODEX_HOME` when set. A ChatGPT login uses that account;
+API-key authentication uses the configured API account. agentd does not copy or
+manage either provider's credentials. See the official
+[Codex non-interactive documentation](https://developers.openai.com/codex/noninteractive).
+
+The adapter starts `codex exec --json` for the first turn and
+`codex exec --json resume <thread-id>` for subsequent turns. Prompts travel over
+stdin. It resumes the exact thread, never `--last`, preserving conversation
+history without mixing concurrent sessions. Workspace instructions, the memory
+index, and the handoff are supplied through `developer_instructions` on every
+invocation. A reset creates a new thread from the updated workspace context.
+Text and tool events stream through agentd's normal event bus, with one terminal
+result and no duplicated final answer. Cancellation terminates the turn's process
+group. A failed or interrupted turn returns an error; subsequent turns can resume
+its recorded thread.
+
+`skip_permissions = true` passes Codex's
+`--dangerously-bypass-approvals-and-sandbox`. With `false`, Codex runs read-only
+and never requests approval: this exec adapter has no interactive approval
+transport. Set `true` only when autonomous execution is intended. Codex context
+pressure uses agentd's turns/bytes/age proxy because exec's aggregate token usage
+is not a measurement of current context occupancy. The `smoke` and `demo-chat`
+commands remain Claude-specific; `run` and `chat` use the running daemon's backend.
+
+Offline adapter tests cover resume, event delivery, failures and cancellation.
+The opt-in live test checks workspace instruction injection and two-turn recall:
+
+```sh
+AGENTD_LIVE_CODEX=1 go test ./internal/harness/codex -run TestLiveContinuity -v
+```
 
 ## Workspace: the agent's persistent home (design 3.5)
 

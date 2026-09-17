@@ -73,17 +73,19 @@ max_file_mb   = 20               # per-file cap (Telegram's Bot API caps downloa
 retention     = "168h"           # media older than this is swept (transcripts live in the session, not here)
 # media_dir   = ""               # storage override; empty = <default workspace>/work/media
 
-# One harness entry. Only "claude-code" is implemented in this scaffold.
-# A second adapter (e.g. codex) is a drop-in later; the interface is ready.
+# Select exactly one backend: "claude-code" or "codex".
+# Codex uses the installed CLI login; run `codex login` as the daemon user.
 [[harness]]
 kind  = "claude-code"
+# bin = "/absolute/path/to/claude" # optional; defaults to the backend command on PATH
 model = ""                       # optional model override; empty = harness default
 cwd   = ""                       # optional default working dir for sessions
 # skip_permissions=true passes --dangerously-skip-permissions: claude runs tools
 # WITHOUT asking for approval (hands-free autonomous agent, Joe's default). This
 # DISABLES Claude's own permission guardrail; agentd's confirm-gate is the
 # intended safety layer for visible/destructive actions. Set false to keep
-# Claude's prompts.
+# Claude's prompts. Codex: true bypasses approvals and sandbox; false runs
+# read-only with approvals disabled (exec cannot answer interactive prompts).
 skip_permissions = true
 
 # One channel entry. Token is read from the environment (never inlined).

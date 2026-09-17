@@ -30,6 +30,7 @@ type Server struct {
 
 // Harness is one [[harness]] entry.
 type Harness struct {
+	Bin             string // optional CLI executable path; defaults to the backend command
 	Kind            string // "claude-code", "codex", ...
 	Model           string // per-session default model (optional)
 	Cwd             string // default working dir for sessions
@@ -422,6 +423,8 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 			return err
 		}
 		switch key {
+		case "bin":
+			h.Bin = s
 		case "kind":
 			h.Kind = s
 		case "model":

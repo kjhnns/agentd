@@ -42,6 +42,7 @@ import (
 	"github.com/kjhnns/agentd/internal/eventbus"
 	"github.com/kjhnns/agentd/internal/harness"
 	"github.com/kjhnns/agentd/internal/harness/claudecode"
+	"github.com/kjhnns/agentd/internal/harness/codex"
 	"github.com/kjhnns/agentd/internal/media"
 	"github.com/kjhnns/agentd/internal/notify"
 	"github.com/kjhnns/agentd/internal/runlog"
@@ -457,12 +458,15 @@ func serve(args []string) {
 	defer rl.Close()
 	log.Printf("agentd: run-log at %s", logPath)
 
-	// Harness: only claude-code is implemented in this scaffold.
+	// Select the configured backend; the session/channel machinery is shared.
 	var model string
 	if len(cfg.Harness) > 0 {
 		model = cfg.Harness[0].Model
 	}
-	adapter := claudecode.New("claude").WithContextWindow(cfg.Session.ContextWindow)
+	adapter, err := configuredHarness(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
 	mgr := session.NewManager(adapter, bus, rl)
 	mgr.DefaultModel = model
 	if len(cfg.Harness) > 0 {
@@ -494,8 +498,8 @@ func serve(args []string) {
 	// composed injection via --append-system-prompt). See internal/workspace.
 	mgr.Workspaces = workspace.NewStore(cfg.Workspace.Root, cfg.Workspace.Default)
 	mgr.GitAutoCommit = cfg.Workspace.GitAutocommit
-	log.Printf("agentd: harness=claude-code skip_permissions=%v workspaces=%s default=%q git_autocommit=%v",
-		mgr.SkipPermissions, mgr.Workspaces.Root, mgr.Workspaces.Default, mgr.GitAutoCommit)
+	log.Printf("agentd: harness=%s skip_permissions=%v workspaces=%s default=%q git_autocommit=%v",
+		adapter.Name(), mgr.SkipPermissions, mgr.Workspaces.Root, mgr.Workspaces.Default, mgr.GitAutoCommit)
 	// turn_quiet is named for what it now MEASURES: a turn is abandoned after
 	// that long with no progress event, not after that long of working.
 	log.Printf("agentd: session policy context_window=%d reset_pressure=%.2f idle=%s max_turns=%d max_wallclock=%s gc=%s turn_quiet=%s turn_ceiling=%s",
@@ -861,4 +865,23 @@ func redact(s string) string {
 		return "****"
 	}
 	return s[:2] + "****"
+}
+
+// configuredHarness preserves the default Claude backend for existing configs.
+func configuredHarness(cfg *config.Config) (harness.Adapter, error) {
+	var h config.Harness
+	if len(cfg.Harness) > 1 {
+		return nil, fmt.Errorf("configure exactly one [[harness]] backend per daemon")
+	}
+	if len(cfg.Harness) > 0 {
+		h = cfg.Harness[0]
+	}
+	switch h.Kind {
+	case "", "claude-code":
+		return claudecode.New(h.Bin).WithContextWindow(cfg.Session.ContextWindow), nil
+	case "codex":
+		return codex.New(h.Bin), nil
+	default:
+		return nil, fmt.Errorf("unsupported harness kind %q (use claude-code or codex)", h.Kind)
+	}
 }
