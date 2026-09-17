@@ -208,3 +208,29 @@ func TestCreateWithoutStoreRejectsWorkspaceName(t *testing.T) {
 		t.Fatalf("bare Create: %v", err)
 	}
 }
+
+// TestCreateFallsBackToDefaultModel: POST /sessions (and so `agentd run`, and
+// so every tix ticket agent) sends no model. Before this fallback existed the
+// harness got an empty --model and quietly used the CLI's own default, so the
+// model configured in config.toml applied to the chat channels and to nothing
+// else. An explicit model still wins.
+func TestCreateFallsBackToDefaultModel(t *testing.T) {
+	fa := &fakeAdapter{}
+	mgr := NewManager(fa, eventbus.New(), nil)
+	mgr.Workspaces = workspace.NewStore(t.TempDir(), "default")
+	mgr.DefaultModel = "configured-model"
+
+	if _, err := mgr.Create(context.Background(), "demo", "", "", "blank"); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got := fa.started[0].Model; got != "configured-model" {
+		t.Errorf("blank model = %q, want the configured default", got)
+	}
+
+	if _, err := mgr.Create(context.Background(), "demo", "", "explicit-model", "explicit"); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got := fa.started[1].Model; got != "explicit-model" {
+		t.Errorf("explicit model = %q, want it to win over the default", got)
+	}
+}

@@ -233,6 +233,14 @@ func newID() string {
 // honored when no workspace store is configured (legacy/bare mode).
 func (m *Manager) Create(ctx context.Context, workspaceName, cwd, model, title string) (*Session, error) {
 	id := newID()
+	// An empty model means "no preference", not "no model". The channels pass
+	// the configured one explicitly, but POST /sessions (so `agentd run`, and
+	// with it every tix ticket agent) leaves it blank, which used to hand the
+	// harness an empty --model and silently fall back to the CLI's own default.
+	// The model in config.toml then applied to Telegram and nothing else.
+	if model == "" {
+		model = m.DefaultModel
+	}
 	var ws *workspace.Workspace
 	systemPrompt := ""
 	if m.Workspaces != nil {
