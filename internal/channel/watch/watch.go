@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"strconv"
@@ -42,7 +43,8 @@ type Adapter struct {
 	store   *Store
 	media   *media.Service
 	inbound chan channel.InboundMsg
-	mirror  func(text string)
+	mirror  func(text string, silent bool)
+	mirrorQ chan mirrorJob
 	maxWait time.Duration
 	now     func() time.Time
 	usage   *usageReader
@@ -78,7 +80,26 @@ func (a *Adapter) WithUserID(id string) *Adapter {
 // WithMirror installs a best-effort echo of every inbound transcript and
 // outbound reply to another channel (Joe's Telegram chat), so the phone
 // keeps the full record and pushes replies while the watch is asleep.
-func (a *Adapter) WithMirror(fn func(text string)) *Adapter { a.mirror = fn; return a }
+func (a *Adapter) WithMirror(fn func(text string, silent bool)) *Adapter {
+	a.mirror = fn
+	// ONE worker, not a goroutine per echo: the mirror has to preserve order.
+	// A split reply is a long half followed by its summary, and delivering
+	// those to Telegram out of order would put the truncated half last, which
+	// is the exact thing the split exists to avoid.
+	a.mirrorQ = make(chan mirrorJob, 64)
+	go func() {
+		for j := range a.mirrorQ {
+			fn(j.text, j.silent)
+		}
+	}()
+	return a
+}
+
+// mirrorJob is one queued echo to the mirror channel.
+type mirrorJob struct {
+	text   string
+	silent bool
+}
 
 // WithTitle labels the channel in /watch/ping.
 func (a *Adapter) WithTitle(t string) *Adapter {
@@ -112,7 +133,9 @@ func (a *Adapter) Send(ctx context.Context, m channel.OutboundMsg) (channel.Send
 		}
 	}
 	stored := a.store.Append(msg)
-	a.echo("⌚ " + m.Text)
+	// Silence carries into the mirror too: the long half of a split reply must
+	// not raise a Telegram push either, or the user gets the truncated one.
+	a.echo("⌚ "+m.Text, m.Silent)
 	return channel.SendReceipt{ID: stored.ID}, nil
 }
 
@@ -159,11 +182,15 @@ func (a *Adapter) Notify(n notify.Notification) error {
 	return nil
 }
 
-func (a *Adapter) echo(text string) {
-	if a.mirror == nil {
+func (a *Adapter) echo(text string, silent bool) {
+	if a.mirrorQ == nil {
 		return
 	}
-	go a.mirror(text)
+	select {
+	case a.mirrorQ <- mirrorJob{text: text, silent: silent}:
+	default:
+		log.Printf("watch: mirror queue full, dropping an echo")
+	}
 }
 
 // ---- HTTP ----
@@ -463,7 +490,7 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "inbound queue full, try again")
 		return
 	}
-	a.echo("⌚ You: " + stored.Text)
+	a.echo("⌚ You: "+stored.Text, false)
 	writeJSON(w, http.StatusAccepted, map[string]any{"message": stored, "pending": a.store.Pending()})
 }
 

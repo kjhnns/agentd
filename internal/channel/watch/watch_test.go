@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -542,4 +543,46 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// A split reply's long half must reach the mirror WITHOUT a notification, and
+// its summary with one: otherwise the Telegram push is the truncated half.
+func TestMirrorCarriesSilenceOfTheLongHalf(t *testing.T) {
+	a, _ := newAdapter(t)
+	type echoed struct {
+		text   string
+		silent bool
+	}
+	var mu sync.Mutex
+	var got []echoed
+	a.WithMirror(func(text string, silent bool) {
+		mu.Lock()
+		got = append(got, echoed{text, silent})
+		mu.Unlock()
+	})
+
+	_, _ = a.Send(context.Background(), channel.OutboundMsg{ChatID: "c", Text: "the long answer", Silent: true})
+	_, _ = a.Send(context.Background(), channel.OutboundMsg{ChatID: "c", Text: "the summary", Silent: false})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		if n >= 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("mirror saw %d messages, want 2: %+v", len(got), got)
+	}
+	if !got[0].silent || got[0].text != "⌚ the long answer" {
+		t.Errorf("long half must be mirrored silently, got %+v", got[0])
+	}
+	if got[1].silent || got[1].text != "⌚ the summary" {
+		t.Errorf("summary must be mirrored with a notification, got %+v", got[1])
+	}
 }

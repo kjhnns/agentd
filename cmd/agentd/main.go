@@ -784,10 +784,10 @@ func serve(args []string) {
 		if c.Mirror {
 			if tg != nil && len(tgAllow) > 0 {
 				chat := tgAllow[0]
-				wch.WithMirror(func(text string) {
+				wch.WithMirror(func(text string, silent bool) {
 					mctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 					defer cancel()
-					if _, err := tg.Send(mctx, channel.OutboundMsg{ChatID: chat, Text: text}); err != nil {
+					if _, err := tg.Send(mctx, channel.OutboundMsg{ChatID: chat, Text: text, Silent: silent}); err != nil {
 						log.Printf("agentd: watch mirror to telegram failed: %v", err)
 					}
 				})
