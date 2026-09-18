@@ -60,6 +60,10 @@ type Session struct {
 	CheckpointTimeout    time.Duration // bound on the checkpoint-flush turn before teardown proceeds anyway (default 120s)
 	TurnTimeout          time.Duration // QUIET window on ONE inbound turn: abandoned after this long with NO progress event; progress resets it (default 15m)
 	TurnCeiling          time.Duration // absolute wallclock backstop on one turn, so the inactivity bound cannot make a runaway unkillable (default 2h; negative = off)
+	// SummaryBudget is the character budget of the LAST message of a reply, the
+	// part a wrist notification previews. Above it, the agent is asked to send
+	// the full answer first and a summary after it. 0 = off (one verbatim reply).
+	SummaryBudget int
 }
 
 // Channel is one [[channel]] entry.
@@ -172,6 +176,7 @@ func DefaultSession() Session {
 		CheckpointTimeout:    120 * time.Second,
 		TurnTimeout:          15 * time.Minute,
 		TurnCeiling:          2 * time.Hour,
+		SummaryBudget:        200,
 	}
 }
 
@@ -366,6 +371,12 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 				return fmt.Errorf("turn_ceiling: %w", err)
 			}
 			cfg.Session.TurnCeiling = d
+		case "summary_budget":
+			n, err := asInt(raw)
+			if err != nil {
+				return fmt.Errorf("summary_budget: %w", err)
+			}
+			cfg.Session.SummaryBudget = int(n)
 		default:
 			return fmt.Errorf("unknown [session] key %q", key)
 		}

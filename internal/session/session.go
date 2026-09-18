@@ -108,6 +108,8 @@ type Manager struct {
 	// sessions fall back to the caller-provided cwd with no injection.
 	Workspaces *workspace.Store
 
+	// Reply shapes how an answer is delivered (see ReplyPolicy).
+	Reply ReplyPolicy
 	// GitAutoCommit commits workspace changes after each completed turn (see
 	// workspace/git.go for the commit policy). Config [workspace] git_autocommit.
 	GitAutoCommit bool
@@ -640,6 +642,15 @@ func (m *Manager) SendAndCollect(ctx context.Context, id, text string, opt TurnO
 
 // firstLine returns the first non-empty line of s, truncated, for use in a
 // human-facing "last thing I was doing" summary.
+// summaryOrWhole picks the message that is delivered LAST: the summary when
+// the reply was split, otherwise the whole reply.
+func summaryOrWhole(body, summary string) string {
+	if summary != "" {
+		return summary
+	}
+	return body
+}
+
 func firstLine(s string) string {
 	for _, ln := range strings.Split(s, "\n") {
 		ln = strings.TrimSpace(ln)
@@ -719,6 +730,99 @@ func (m *Manager) Teardown(id string) error {
 		_ = m.log.Append("session_teardown", map[string]string{"session": id})
 	}
 	return err
+}
+
+// SummaryMarker separates the two halves of a long reply. The agent is asked
+// to emit it on a line of its own; everything after it is the short summary
+// that is delivered LAST, so it is the message a wrist notification previews
+// and the one sitting at the bottom of the chat.
+const SummaryMarker = "---SUMMARY---"
+
+// ReplyPolicy shapes how a turn's answer is delivered to surfaces whose
+// notifications are truncated (an Apple Watch push, a phone lock screen).
+type ReplyPolicy struct {
+	// SummaryBudget is the character budget for that last message. 0 turns the
+	// whole mechanism off and replies are delivered verbatim, in one piece.
+	SummaryBudget int
+}
+
+// ReplyFormatInstruction is the per-turn instruction handed to the agent. It
+// is appended to the user's message rather than baked into the workspace
+// constitution on purpose: it describes how THIS transport delivers an answer,
+// it has to change with the configured budget, and a workspace edit would
+// apply it to scheduled jobs and API callers that have no wrist attached.
+func ReplyFormatInstruction(budget int) string {
+	if budget <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"[Reply format: this answer is read on an Apple Watch. Only the LAST message "+
+			"is shown at the bottom of the chat, and a notification previews about %d "+
+			"characters of it.\n"+
+			"If your whole answer fits in %d characters, just write it, with no marker.\n"+
+			"If it does NOT fit, write the full answer first, then a line containing "+
+			"exactly %s, then a summary of at most %d characters. The summary is read "+
+			"on its own with the full answer out of sight, so it must answer the "+
+			"question rather than describe what you wrote. No preamble, no markdown.]",
+		budget, budget, SummaryMarker, budget)
+}
+
+// RenderTurn is RenderInbound plus this manager's reply-format instruction.
+func (m *Manager) RenderTurn(in channel.InboundMsg) string {
+	text := RenderInbound(in)
+	instr := ReplyFormatInstruction(m.Reply.SummaryBudget)
+	if instr == "" || strings.TrimSpace(text) == "" {
+		return text
+	}
+	return text + "\n\n" + instr
+}
+
+// SplitReply divides a reply on the summary marker into the long body and the
+// short summary that must be delivered last. Without a marker the reply is
+// returned whole and summary is empty. A summary longer than the budget is cut
+// at a word boundary: the point of it is to FIT, and the full text is right
+// above it in the chat.
+func SplitReply(reply string, budget int) (body, summary string) {
+	if budget <= 0 {
+		// The agent was never asked to mark a summary, so a marker in the text
+		// is incidental prose and must not cut the reply in half.
+		return reply, ""
+	}
+	idx := -1
+	for _, cut := range []string{"\n" + SummaryMarker, SummaryMarker} {
+		if i := strings.LastIndex(reply, cut); i >= 0 {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return reply, ""
+	}
+	body = strings.TrimSpace(reply[:idx])
+	rest := reply[idx:]
+	if i := strings.Index(rest, SummaryMarker); i >= 0 {
+		rest = rest[i+len(SummaryMarker):]
+	}
+	summary = strings.TrimSpace(rest)
+	if body == "" || summary == "" {
+		// A marker with nothing on one side is not a split; deliver as one.
+		return reply, ""
+	}
+	return body, truncateWords(summary, budget)
+}
+
+// truncateWords shortens s to at most n characters, breaking on a word
+// boundary where one exists, and marks that it was cut.
+func truncateWords(s string, n int) string {
+	if n <= 0 || len([]rune(s)) <= n {
+		return s
+	}
+	r := []rune(s)
+	cut := string(r[:n-1])
+	if i := strings.LastIndexAny(cut, " \n\t"); i > n/2 {
+		cut = cut[:i]
+	}
+	return strings.TrimRight(cut, " \n\t.,;:") + "\u2026"
 }
 
 // RenderInbound builds the canonical turn text from an inbound message's Text
@@ -994,7 +1098,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 
 	// One turn, collected by the shared SendAndCollect: the needs-input glyph is
 	// the only channel-specific piece, delivered through the event hook.
-	result, err := m.SendAndCollect(ctx, id, RenderInbound(in), TurnOptions{
+	result, err := m.SendAndCollect(ctx, id, m.RenderTurn(in), TurnOptions{
 		Timeout: m.Policy.turnTimeout(),
 		Ceiling: m.Policy.turnCeiling(),
 		OnEvent: func(e eventbus.Event) {
@@ -1011,13 +1115,30 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	if result == "" {
 		result = "(no result)"
 	}
-	rcpt, err := ch.Send(ctx, channel.OutboundMsg{ChatID: in.UserID, Text: result})
-	if err != nil {
-		return err
+	// A long answer goes out as TWO messages: the full text first and silent,
+	// then the summary, which therefore lands last (the bottom of the chat and
+	// the one notification the user actually gets).
+	body, summary := SplitReply(result, m.Reply.SummaryBudget)
+	send := func(text string, silent bool) error {
+		rcpt, serr := ch.Send(ctx, channel.OutboundMsg{ChatID: in.UserID, Text: text, Silent: silent})
+		if serr != nil {
+			return serr
+		}
+		replied = true
+		if m.log != nil {
+			_ = m.log.Append("outbound", map[string]string{
+				"session": id, "chat": in.UserID, "msg_id": rcpt.ID, "text": text,
+			})
+		}
+		return nil
 	}
-	replied = true
-	if m.log != nil {
-		_ = m.log.Append("outbound", map[string]string{"session": id, "chat": in.UserID, "msg_id": rcpt.ID, "text": result})
+	if summary != "" {
+		if err := send(body, true); err != nil {
+			return err
+		}
+	}
+	if err := send(summaryOrWhole(body, summary), false); err != nil {
+		return err
 	}
 	finalReaction = channel.ReactionDone
 	return nil

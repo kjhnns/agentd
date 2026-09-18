@@ -46,6 +46,11 @@ type OutboundMsg struct {
 	ChatID string   `json:"chat_id"`
 	Text   string   `json:"text"`
 	Media  []string `json:"media"`
+	// Silent asks the channel to deliver without alerting the user. It is set
+	// on the long half of a split reply so the wrist buzzes ONCE, for the
+	// summary that actually fits a notification. A channel that cannot do this
+	// simply ignores it (delivery is never skipped).
+	Silent bool `json:"silent,omitempty"`
 }
 
 // SendReceipt carries a real provider id, the acceptance artifact for a send.

@@ -53,6 +53,13 @@ turn_timeout       = "15m"
 # resetting turn_timeout forever. Sits far above any real turn and below
 # max_wallclock. A negative value turns the backstop off (not recommended).
 turn_ceiling       = "2h"
+# Replies are read on an Apple Watch, where only the LAST message shows at the
+# bottom of the chat and a notification previews roughly this many characters.
+# Above the budget the agent is asked, PER TURN, to write the full answer, then
+# a ---SUMMARY--- line, then a short summary; agentd then delivers the full
+# answer first and SILENTLY and the summary after it, so the summary is what
+# lands last and is the only push. 0 turns this off (one verbatim reply).
+summary_budget     = 200
 
 # Media: the CORE multimodal capability (internal/media), channel-agnostic by
 # design. Inbound voice / photos / documents from ANY channel are ingested here

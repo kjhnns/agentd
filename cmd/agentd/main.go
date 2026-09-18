@@ -496,6 +496,7 @@ func serve(args []string) {
 	}
 	// Workspaces: every session is homed in a workspace (cwd = workspace root,
 	// composed injection via --append-system-prompt). See internal/workspace.
+	mgr.Reply = session.ReplyPolicy{SummaryBudget: cfg.Session.SummaryBudget}
 	mgr.Workspaces = workspace.NewStore(cfg.Workspace.Root, cfg.Workspace.Default)
 	mgr.GitAutoCommit = cfg.Workspace.GitAutocommit
 	log.Printf("agentd: harness=%s skip_permissions=%v workspaces=%s default=%q git_autocommit=%v",
@@ -506,6 +507,9 @@ func serve(args []string) {
 		cfg.Session.ContextWindow, mgr.Policy.ContextResetPressure, mgr.Policy.IdleTimeout,
 		mgr.Policy.MaxTurns, mgr.Policy.MaxWallclock, mgr.Policy.GCInterval,
 		mgr.TurnTimeout(), mgr.TurnCeiling())
+	if mgr.Reply.SummaryBudget > 0 {
+		log.Printf("agentd: replies longer than %d chars are delivered as full answer + summary (summary last)", mgr.Reply.SummaryBudget)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

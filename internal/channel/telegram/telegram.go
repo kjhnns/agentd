@@ -497,10 +497,16 @@ func (a *Adapter) Send(ctx context.Context, m channel.OutboundMsg) (channel.Send
 		// Media path is intentionally stubbed in this scaffold.
 		return channel.SendReceipt{}, fmt.Errorf("telegram: media send not implemented (stub)")
 	}
-	payload, _ := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"chat_id": m.ChatID,
 		"text":    m.Text,
-	})
+	}
+	if m.Silent {
+		// Delivered into the chat, but no push: the summary that follows is
+		// the one meant to reach the user's wrist.
+		fields["disable_notification"] = true
+	}
+	payload, _ := json.Marshal(fields)
 	endpoint := fmt.Sprintf("%s/bot%s/sendMessage", a.base, a.token)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {

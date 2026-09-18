@@ -281,7 +281,7 @@ func (s *Server) handleMediaUpload(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 
-	text := session.RenderInbound(channel.InboundMsg{
+	text := s.mgr.RenderTurn(channel.InboundMsg{
 		Channel: "web",
 		Text:    r.FormValue("text"),
 		Media:   []media.Artifact{art},
