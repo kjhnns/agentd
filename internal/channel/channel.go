@@ -51,6 +51,10 @@ type OutboundMsg struct {
 	// summary that actually fits a notification. A channel that cannot do this
 	// simply ignores it (delivery is never skipped).
 	Silent bool `json:"silent,omitempty"`
+	// Summary marks the short half of a split reply, so a channel that keeps a
+	// conversation can label it ("summary of the message above") instead of
+	// letting it read as a complete, self-contained answer.
+	Summary bool `json:"summary,omitempty"`
 }
 
 // SendReceipt carries a real provider id, the acceptance artifact for a send.

@@ -47,9 +47,14 @@ scope. What is IN:
   **Skip-permissions default.** With `skip_permissions = true` (Joe's default in
   `config.example.toml`) the adapter passes `--dangerously-skip-permissions`, so
   claude runs tools WITHOUT asking for approval: a hands-free autonomous agent.
-  This disables Claude's own permission guardrail; agentd's confirm-gate is the
-  intended safety layer for visible/destructive actions. Set it `false` to keep
-  Claude's prompts. It is a per-`[[harness]]` config toggle.
+  This disables Claude's own permission guardrail, and agentd does NOT replace
+  it: there is no confirm-gate in the code (the web UI's `/confirm/:token` is a
+  stub that only records a decision). Run with `skip_permissions = true` only
+  where the consequence is understood: anything that can post a message, and
+  any content the agent reads, can make it act with the daemon user's full
+  rights. See the 2026-09 security audit for the containment options that do
+  not add per-step approval. Set it `false` to keep Claude's prompts. It is a
+  per-`[[harness]]` config toggle.
 
   A one-shot `claude -p` path is retained only for the `smoke` subcommand; the real
   session path is the persistent one above.

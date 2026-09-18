@@ -84,11 +84,12 @@
 </head>
 <body>
 <div id="app">
-  <form id="gate" class="hidden" autocomplete="off">
+  <form id="gate" class="hidden" method="post" action="/watch/ui" autocomplete="off">
     <h1>Agent</h1>
-    <p>Paste the watch channel token to use this browser. It is stored in a cookie for this site only.</p>
-    <input id="gtoken" type="password" placeholder="watch token" autocomplete="off" spellcheck="false">
+    <p>Paste the watch channel token to use this browser. It travels once in this form, then lives in a cookie for this site only. It is never part of a URL.</p>
+    <input id="gtoken" name="token" type="password" placeholder="watch token" autocomplete="off" spellcheck="false" required>
     <button type="submit">Connect</button>
+    <p id="gatehint"></p>
   </form>
 
   <header id="chrome" class="hidden">
@@ -375,11 +376,12 @@ draft.addEventListener("keydown", (e) => {
 $("send").addEventListener("click", sendText);
 $("mic").addEventListener("click", toggleRecord);
 earlier.addEventListener("click", loadEarlier);
-$("gate").addEventListener("submit", (e) => {
-  e.preventDefault();
-  const t = $("gtoken").value.trim();
-  if (t) location.replace("/watch/ui?token=" + encodeURIComponent(t));
-});
+// A token pasted into the URL the old way is not accepted any more (it would
+// sit in history and referrers). Scrub it from the address bar and say so.
+if (location.search.includes("token=")) {
+  history.replaceState(null, "", location.pathname);
+  $("gatehint").textContent = "Tokens in the URL are no longer accepted. Paste it into the field above.";
+}
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && !polling) { stopped = false; poll(); }
 });

@@ -600,7 +600,13 @@ func serve(args []string) {
 	// API server (created before channels so the web channel can mount its UI +
 	// WS routes on this ONE server, behind the SAME bearer gate, on no 2nd port).
 	var transportUp atomic.Bool
-	srv := api.New(cfg.Server.APIBearer, mgr, bus, func() bool { return transportUp.Load() })
+	// The API bearer honours the same env: indirection as every channel token,
+	// and an EMPTY result refuses to start rather than opening the API.
+	apiBearer := config.ResolveToken(cfg.Server.APIBearer)
+	if apiBearer == "" {
+		log.Fatalf("agentd: [server] api_bearer resolves to empty; refusing to start an unauthenticated API (set a literal or env:VAR)")
+	}
+	srv := api.New(apiBearer, mgr, bus, func() bool { return transportUp.Load() })
 	srv.AttachScheduler(sched)
 	srv.AttachMedia(mediaSvc)
 
@@ -812,9 +818,9 @@ func serve(args []string) {
 	}
 	log.Printf("agentd: notification hub has %d sink(s)", hub.Count())
 
-	httpSrv := &http.Server{Addr: cfg.Server.Bind, Handler: srv.Handler()}
+	httpSrv := &http.Server{Addr: cfg.Server.Bind, Handler: srv.Handler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second}
 	go func() {
-		log.Printf("agentd: API listening on http://%s (bearer %s)", cfg.Server.Bind, redact(cfg.Server.APIBearer))
+		log.Printf("agentd: API listening on http://%s (bearer %s)", cfg.Server.Bind, redact(apiBearer))
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("http: %v", err)
 		}
@@ -825,7 +831,7 @@ func serve(args []string) {
 	// the daemon at boot.
 	var pubSrv *http.Server
 	if pb := cfg.Server.PublicBind; pb != "" {
-		pubSrv = &http.Server{Addr: pb, Handler: srv.PublicHandler(), ReadHeaderTimeout: 15 * time.Second}
+		pubSrv = &http.Server{Addr: pb, Handler: srv.PublicHandler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second}
 		go func() {
 			for {
 				ln, err := net.Listen("tcp", pb)

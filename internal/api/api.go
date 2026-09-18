@@ -253,6 +253,13 @@ func (s *Server) handleMediaUpload(w http.ResponseWriter, r *http.Request, id st
 		http.Error(w, "session not found", http.StatusNotFound)
 		return
 	}
+	// Bound the body BEFORE multipart parsing (which spools to temp files); the
+	// media service re-checks its own cap on the bytes it actually ingests.
+	cap := int64(20 << 20)
+	if s.media.MaxBytes > 0 {
+		cap = s.media.MaxBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, cap+(1<<20))
 	file, hdr, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "missing multipart field \"file\"", http.StatusBadRequest)

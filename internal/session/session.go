@@ -1119,8 +1119,8 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	// then the summary, which therefore lands last (the bottom of the chat and
 	// the one notification the user actually gets).
 	body, summary := SplitReply(result, m.Reply.SummaryBudget)
-	send := func(text string, silent bool) error {
-		rcpt, serr := ch.Send(ctx, channel.OutboundMsg{ChatID: in.UserID, Text: text, Silent: silent})
+	send := func(text string, silent, summary bool) error {
+		rcpt, serr := ch.Send(ctx, channel.OutboundMsg{ChatID: in.UserID, Text: text, Silent: silent, Summary: summary})
 		if serr != nil {
 			return serr
 		}
@@ -1133,11 +1133,11 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		return nil
 	}
 	if summary != "" {
-		if err := send(body, true); err != nil {
+		if err := send(body, true, false); err != nil {
 			return err
 		}
 	}
-	if err := send(summaryOrWhole(body, summary), false); err != nil {
+	if err := send(summaryOrWhole(body, summary), false, summary != ""); err != nil {
 		return err
 	}
 	finalReaction = channel.ReactionDone

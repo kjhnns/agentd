@@ -15,6 +15,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -48,6 +50,7 @@ const (
 	KindReply   = "reply"
 	KindFailure = "failure"
 	KindNotice  = "notice"
+	KindSummary = "summary" // the short half of a split reply; the long half precedes it
 
 	StatusQueued     = "queued"
 	StatusWorking    = "working"
@@ -80,6 +83,15 @@ type Store struct {
 	compactAt int // JSONL lines that trigger a compaction on open
 }
 
+// Record and line bounds. One oversized record must never be able to take the
+// whole store (and with it the channel) down: text above maxTextBytes is cut
+// on append, and a line above maxLineBytes found on disk is skipped on replay
+// instead of aborting it.
+const (
+	maxTextBytes = 256 << 10 // 256 KiB of message text is far beyond any real reply
+	maxLineBytes = 8 << 20
+)
+
 // OpenStore opens (or creates) the JSONL store at path. An empty path gives a
 // memory-only store (tests).
 func OpenStore(path string) (*Store, error) { return openStore(path, 5000) }
@@ -99,11 +111,15 @@ func openStore(path string, compactAt int) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	lines, err := s.replay()
+	lines, skipped, err := s.replay()
 	if err != nil {
 		return nil, err
 	}
-	if lines > s.compactAt {
+	if skipped > 0 {
+		log.Printf("watch store: skipped %d unreadable or oversized line(s) in %s", skipped, path)
+	}
+	if lines > s.compactAt || skipped > 0 {
+		// Compacting also drops the bad lines, so the next open is clean.
 		if err := s.compact(); err != nil {
 			return nil, err
 		}
@@ -112,32 +128,101 @@ func openStore(path string, compactAt int) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := repairTornTail(f); err != nil {
+		f.Close()
+		return nil, err
+	}
 	s.f = f
 	return s, nil
 }
 
+// repairTornTail makes sure the file ends with a newline, so a record cut
+// short by a crash cannot swallow the next append into one unreadable line.
+func repairTornTail(f *os.File) error {
+	st, err := f.Stat()
+	if err != nil || st.Size() == 0 {
+		return err
+	}
+	buf := make([]byte, 1)
+	if _, err := f.ReadAt(buf, st.Size()-1); err != nil {
+		// Opened write-only on some platforms: fall back to a read handle.
+		rf, rerr := os.Open(f.Name())
+		if rerr != nil {
+			return rerr
+		}
+		defer rf.Close()
+		if _, err := rf.ReadAt(buf, st.Size()-1); err != nil {
+			return err
+		}
+	}
+	if buf[0] != '\n' {
+		_, err = f.Write([]byte("\n"))
+	}
+	return err
+}
+
 // replay loads the JSONL file into memory. Returns the number of lines read.
-func (s *Store) replay() (int, error) {
+// replay loads the JSONL file into memory. It returns the number of records
+// absorbed and the number of lines skipped. A bad line (torn, corrupt, or
+// oversized) is skipped, never fatal: a bufio.Scanner would abort the whole
+// replay on one long line, which used to take the channel down at startup.
+func (s *Store) replay() (int, int, error) {
 	f, err := os.Open(s.path)
 	if os.IsNotExist(err) {
-		return 0, nil
+		return 0, 0, nil
 	}
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer f.Close()
-	n := 0
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		var m Message
-		if json.Unmarshal(sc.Bytes(), &m) != nil || m.ID == "" {
-			continue // a torn tail line is skipped, never fatal
+	n, skipped := 0, 0
+	r := bufio.NewReaderSize(f, 64*1024)
+	for {
+		line, rerr := readLine(r, maxLineBytes)
+		if line != nil {
+			var m Message
+			if len(line) > maxLineBytes || json.Unmarshal(line, &m) != nil || m.ID == "" {
+				skipped++
+			} else {
+				n++
+				s.absorb(m)
+			}
 		}
-		n++
-		s.absorb(m)
+		if rerr != nil {
+			if rerr == io.EOF {
+				return n, skipped, nil
+			}
+			return n, skipped, rerr
+		}
 	}
-	return n, sc.Err()
+}
+
+// readLine reads one newline-terminated line of any length. Bytes beyond
+// limit are consumed and discarded but counted, so the caller can skip the
+// line without the reader losing its place.
+func readLine(r *bufio.Reader, limit int) ([]byte, error) {
+	var out []byte
+	over := false
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if !over {
+			out = append(out, chunk...)
+			if len(out) > limit {
+				over = true
+				out = out[:limit+1] // keep it recognisably oversized, drop the rest
+			}
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		if len(out) > 0 && out[len(out)-1] == '\n' {
+			out = out[:len(out)-1]
+		}
+		if len(out) == 0 && err != nil {
+			return nil, err
+		}
+		return out, err
+	}
 }
 
 // absorb applies one replayed snapshot (caller holds no lock: open only).
@@ -208,6 +293,15 @@ func (s *Store) Append(m Message) Message {
 }
 
 func (s *Store) appendLocked(m Message) Message {
+	if len(m.Text) > maxTextBytes {
+		// Cut on a rune boundary and say so, rather than persist a record the
+		// replay would have to skip (which would lose the message entirely).
+		cut := []rune(m.Text)
+		for len(string(cut)) > maxTextBytes-24 {
+			cut = cut[:len(cut)*9/10]
+		}
+		m.Text = string(cut) + "\n\u2026 [truncated by agentd]"
+	}
 	now := time.Now().UTC()
 	if m.TS.IsZero() {
 		m.TS = now
@@ -430,5 +524,6 @@ func (s *Store) Attribute() (Message, bool) {
 // (tests: proves compaction without poking at file internals).
 func (s *Store) replayCount() (int, error) {
 	probe := &Store{path: s.path, latest: map[string]Message{}, wake: make(chan struct{}), maxLog: 1 << 20, maxIDs: 1 << 20}
-	return probe.replay()
+	n, _, err := probe.replay()
+	return n, err
 }

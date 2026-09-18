@@ -10,9 +10,11 @@ import (
 	"io"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kjhnns/agentd/internal/channel"
@@ -30,6 +32,11 @@ var uiHTML []byte
 // in the address bar, the history or a screenshot.
 const tokenCookie = "agentd_watch_token"
 
+// maxInboundText bounds a delegation's text on BOTH the JSON and the multipart
+// branch. The multipart one used to have no cap of its own, so a 5 MiB text
+// field could produce a store record the replay could not read.
+const maxInboundText = 64 << 10
+
 // DefaultUserID keys the wrist conversation in session.RouteInbound's per-user
 // map when the channel runs its own session. With share_session the wiring
 // overrides it with the Telegram chat id so both surfaces drive ONE session.
@@ -45,6 +52,7 @@ type Adapter struct {
 	inbound chan channel.InboundMsg
 	mirror  func(text string, silent bool)
 	mirrorQ chan mirrorJob
+	fails   authFailures
 	maxWait time.Duration
 	now     func() time.Time
 	usage   *usageReader
@@ -126,6 +134,9 @@ func (a *Adapter) SupportsMedia() bool                { return false }
 // attributed to the user message that started the turn.
 func (a *Adapter) Send(ctx context.Context, m channel.OutboundMsg) (channel.SendReceipt, error) {
 	msg := Message{Role: RoleAgent, Kind: KindReply, Text: m.Text}
+	if m.Summary {
+		msg.Kind = KindSummary
+	}
 	if u, ok := a.store.Attribute(); ok {
 		msg.ReplyTo = u.ID
 		if u.Status == StatusFailed {
@@ -221,21 +232,92 @@ func (a *Adapter) Handler() http.Handler {
 	return outer
 }
 
-func (a *Adapter) authed(r *http.Request) bool {
+// authed reports whether the request carries the watch token, and whether it
+// arrived as the browser cookie (which needs an extra origin check on writes).
+func (a *Adapter) authed(r *http.Request) (ok, viaCookie bool) {
 	if a.token == "" {
-		return false // an unset token means CLOSED, never open
+		return false, false // an unset token means CLOSED, never open
 	}
 	if a.matches(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")) {
-		return true
+		return true, false
 	}
-	// Browser path: the cookie set by /watch/ui. It is SameSite=Strict, so it
-	// is NOT attached to a cross-site request, which is what keeps a hostile
-	// page from POSTing a turn on Joe's behalf. The ?token= query param is
-	// deliberately NOT accepted here: only the UI route consumes it.
+	// Browser path: the cookie set by /watch/ui. SameSite=Strict keeps it off
+	// CROSS-SITE requests, but "site" is the registrable domain: a page on any
+	// sibling host under the same domain is same-site and the cookie rides
+	// along. That is why cookie-authenticated WRITES also demand a matching
+	// Origin (see sameOrigin). The ?token= query param is never accepted here.
 	if c, err := r.Cookie(tokenCookie); err == nil && a.matches(c.Value) {
-		return true
+		return true, true
 	}
-	return false
+	return false, false
+}
+
+// sameOrigin is the CSRF check for cookie-authenticated writes: the browser's
+// Origin header must name exactly this host, over the scheme the request used.
+// Browsers always send Origin on a POST, so a missing header is a refusal.
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" || r.Host == "" {
+		return false
+	}
+	scheme := "http"
+	if isHTTPS(r) {
+		scheme = "https"
+	}
+	return strings.EqualFold(origin, scheme+"://"+r.Host)
+}
+
+func isWrite(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	}
+	return true
+}
+
+// authFailures is a small global brake on token guessing: after `limit`
+// failures inside one window, unauthenticated requests answer 429 until the
+// window turns. Authenticated requests are never slowed. It exists for
+// detection and abuse control; a 64-hex token is not guessable either way.
+type authFailures struct {
+	mu     sync.Mutex
+	window time.Time
+	count  int
+}
+
+const (
+	authFailLimit  = 30
+	authFailWindow = time.Minute
+)
+
+// note records one failure and reports whether the brake is now engaged.
+func (f *authFailures) note(now time.Time) (engaged bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if now.Sub(f.window) > authFailWindow {
+		f.window, f.count = now, 0
+	}
+	f.count++
+	return f.count > authFailLimit
+}
+
+func (f *authFailures) engaged(now time.Time) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return now.Sub(f.window) <= authFailWindow && f.count > authFailLimit
+}
+
+// clientIP is the address to log: the first X-Forwarded-For hop when the
+// request came through the proxy, else the socket peer.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		return strings.TrimSpace(strings.Split(xff, ",")[0])
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func (a *Adapter) matches(got string) bool {
@@ -244,8 +326,21 @@ func (a *Adapter) matches(got string) bool {
 
 func (a *Adapter) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !a.authed(r) {
+		now := a.now()
+		ok, viaCookie := a.authed(r)
+		if !ok {
+			if a.fails.note(now) {
+				log.Printf("watch: auth brake engaged (%d+ failures/min), last from %s", authFailLimit, clientIP(r))
+				http.Error(w, "too many attempts", http.StatusTooManyRequests)
+				return
+			}
+			log.Printf("watch: rejected %s %s from %s", r.Method, r.URL.Path, clientIP(r))
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if viaCookie && isWrite(r.Method) && !sameOrigin(r) {
+			log.Printf("watch: refused cookie write with origin %q from %s", r.Header.Get("Origin"), clientIP(r))
+			http.Error(w, "cross-origin write refused", http.StatusForbidden)
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
@@ -264,6 +359,10 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 }
 
 func (a *Adapter) handlePing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "title": a.title, "pending": a.store.Pending(), "server_time": a.now(),
 	})
@@ -335,12 +434,37 @@ func (a *Adapter) handleFetch(w http.ResponseWriter, r *http.Request) {
 // cookie it serves the page; otherwise it serves the same page, which then
 // shows its token form (a 401 body a browser can act on, not a dead end).
 func (a *Adapter) handleUI(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if tok := r.URL.Query().Get("token"); tok != "" {
+	noStore(w)
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+		// A token in a URL ends up in history, referrers and logs, so the GET
+		// form of sign-in is gone: the page shows its form instead, and the
+		// page's script scrubs a stray ?token= out of the address bar.
+		code := http.StatusOK
+		if ok, _ := a.authed(r); !ok {
+			code = http.StatusUnauthorized
+		}
+		a.serveUI(w, code)
+	case http.MethodPost:
+		// Sign-in: the token travels in the body, the cookie comes back, and a
+		// 303 lands on the clean URL. Same-origin only: a foreign page must not
+		// be able to sign this browser into a token of the attacker's choosing.
+		if !sameOrigin(r) {
+			http.Error(w, "cross-origin sign-in refused", http.StatusForbidden)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "bad form", http.StatusBadRequest)
+			return
+		}
+		tok := strings.TrimSpace(r.PostFormValue("token"))
 		if !a.matches(tok) {
+			if a.fails.note(a.now()) {
+				http.Error(w, "too many attempts", http.StatusTooManyRequests)
+				return
+			}
+			log.Printf("watch: rejected sign-in from %s", clientIP(r))
 			a.serveUI(w, http.StatusUnauthorized)
 			return
 		}
@@ -353,21 +477,23 @@ func (a *Adapter) handleUI(w http.ResponseWriter, r *http.Request) {
 			SameSite: http.SameSiteStrictMode,
 			MaxAge:   30 * 24 * 3600,
 		})
-		http.Redirect(w, r, "/watch/ui", http.StatusFound)
-		return
+		http.Redirect(w, r, "/watch/ui", http.StatusSeeOther)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
-	code := http.StatusOK
-	if !a.authed(r) {
-		code = http.StatusUnauthorized
-	}
-	a.serveUI(w, code)
+}
+
+// noStore sets the headers every sign-in related response carries, including
+// the redirect, which used to skip them.
+func noStore(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 }
 
 func (a *Adapter) serveUI(w http.ResponseWriter, code int) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Referrer-Policy", "no-referrer")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
+	noStore(w)
 	w.WriteHeader(code)
 	_, _ = w.Write(uiHTML)
 }
@@ -405,6 +531,10 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		text = strings.TrimSpace(r.FormValue("text"))
+		if len(text) > maxInboundText {
+			writeErr(w, http.StatusRequestEntityTooLarge, "text too long")
+			return
+		}
 		file, hdr, err := r.FormFile("file")
 		if err == nil {
 			defer file.Close()
@@ -443,12 +573,16 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Text string `json:"text"`
 		}
-		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+		r.Body = http.MaxBytesReader(w, r.Body, maxInboundText+(4<<10))
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeErr(w, http.StatusBadRequest, "bad JSON body")
 			return
 		}
 		text = strings.TrimSpace(body.Text)
+		if len(text) > maxInboundText {
+			writeErr(w, http.StatusRequestEntityTooLarge, "text too long")
+			return
+		}
 	}
 	if text == "" && art == nil {
 		writeErr(w, http.StatusBadRequest, "nothing to send: give text or a file")

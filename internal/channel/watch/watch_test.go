@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -453,6 +454,21 @@ func TestFetchEndpointPagesAndReportsHasMore(t *testing.T) {
 
 // ---- browser auth for the desktop UI ----
 
+func postForm(t *testing.T, h http.Handler, path, origin, form string, extra func(*http.Request)) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	if extra != nil {
+		extra(req)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
 func TestUIRouteSignInFlow(t *testing.T) {
 	a, _ := newAdapter(t)
 	h := a.Handler()
@@ -460,81 +476,247 @@ func TestUIRouteSignInFlow(t *testing.T) {
 	// No cookie: the page is served with 401 so the browser can show its form.
 	rec := do(t, h, http.MethodGet, "/watch/ui", "", nil, "")
 	if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "<!doctype html>") {
-		t.Fatalf("bare /watch/ui: %d %q", rec.Code, rec.Body.String()[:min(60, rec.Body.Len())])
+		t.Fatalf("bare /watch/ui: %d", rec.Code)
+	}
+	for _, hdr := range []string{"Cache-Control", "Referrer-Policy"} {
+		if rec.Header().Get(hdr) == "" {
+			t.Errorf("sign-in page lacks %s", hdr)
+		}
 	}
 
-	// A wrong token never sets a cookie.
-	rec = do(t, h, http.MethodGet, "/watch/ui?token=nope", "", nil, "")
+	// A token in the URL is NOT a sign-in any more: no cookie, still the form.
+	rec = do(t, h, http.MethodGet, "/watch/ui?token=wt", "", nil, "")
+	if rec.Code != http.StatusUnauthorized || len(rec.Result().Cookies()) != 0 {
+		t.Fatalf("GET ?token= must not sign in: %d cookies=%d", rec.Code, len(rec.Result().Cookies()))
+	}
+
+	// A wrong token in the form never sets a cookie.
+	rec = postForm(t, h, "/watch/ui", "http://example.com", "token=nope", nil)
 	if rec.Code != http.StatusUnauthorized || len(rec.Result().Cookies()) != 0 {
 		t.Fatalf("wrong token: %d cookies=%d", rec.Code, len(rec.Result().Cookies()))
 	}
 
-	// The right token sets a hardened cookie and redirects to the clean URL.
-	rec = do(t, h, http.MethodGet, "/watch/ui?token=wt", "", nil, "")
-	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/watch/ui" {
-		t.Fatalf("good token: %d -> %q", rec.Code, rec.Header().Get("Location"))
+	// The right token in a same-origin POST sets a hardened cookie and 303s to
+	// the clean URL, with the no-store headers ON the redirect.
+	rec = postForm(t, h, "/watch/ui", "http://example.com", "token=wt", nil)
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/watch/ui" {
+		t.Fatalf("good token: %d -> %q %s", rec.Code, rec.Header().Get("Location"), rec.Body.String())
+	}
+	if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Referrer-Policy") != "no-referrer" {
+		t.Errorf("redirect lacks no-store/no-referrer: %v", rec.Header())
 	}
 	cookies := rec.Result().Cookies()
 	if len(cookies) != 1 {
 		t.Fatalf("cookies = %d", len(cookies))
 	}
 	c := cookies[0]
-	if c.Name != tokenCookie || c.Value != "wt" || !c.HttpOnly ||
-		c.SameSite != http.SameSiteStrictMode || c.Path != "/watch/" {
+	if c.Name != tokenCookie || c.Value != "wt" || !c.HttpOnly || c.SameSite != http.SameSiteStrictMode || c.Path != "/watch/" {
 		t.Fatalf("cookie not hardened: %+v", c)
 	}
 	if c.Secure {
-		t.Fatal("plain HTTP must not set a Secure cookie (the browser would drop it)")
+		t.Fatal("plain HTTP must not set a Secure cookie")
 	}
 
 	// Behind a TLS-terminating proxy the cookie IS Secure.
-	req := httptest.NewRequest(http.MethodGet, "/watch/ui?token=wt", nil)
-	req.Header.Set("X-Forwarded-Proto", "https")
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-	if !rr.Result().Cookies()[0].Secure {
-		t.Fatal("proxied HTTPS must set a Secure cookie")
+	rec = postForm(t, h, "/watch/ui", "https://example.com", "token=wt", func(r *http.Request) {
+		r.Header.Set("X-Forwarded-Proto", "https")
+	})
+	if rec.Code != http.StatusSeeOther || !rec.Result().Cookies()[0].Secure {
+		t.Fatalf("proxied HTTPS must set a Secure cookie: %d", rec.Code)
+	}
+
+	// A foreign page must not be able to sign this browser into ITS token.
+	rec = postForm(t, h, "/watch/ui", "https://evil.example", "token=wt", nil)
+	if rec.Code != http.StatusForbidden || len(rec.Result().Cookies()) != 0 {
+		t.Fatalf("cross-origin sign-in: %d cookies=%d", rec.Code, len(rec.Result().Cookies()))
 	}
 }
 
-func TestCookieAuthenticatesTheAPIButQueryTokenDoesNot(t *testing.T) {
+func withCookie(t *testing.T, h http.Handler, method, path, origin string, body *bytes.Buffer, ctype string) *httptest.ResponseRecorder {
+	t.Helper()
+	if body == nil {
+		body = &bytes.Buffer{}
+	}
+	req := httptest.NewRequest(method, path, body)
+	req.AddCookie(&http.Cookie{Name: tokenCookie, Value: "wt"})
+	if ctype != "" {
+		req.Header.Set("Content-Type", ctype)
+	}
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	return rr
+}
+
+// The cookie authenticates reads freely; WRITES need a matching Origin,
+// because SameSite=Strict still admits a sibling host of the same domain.
+func TestCookieWritesRequireSameOrigin(t *testing.T) {
 	a, st := newAdapter(t)
 	h := a.Handler()
 	st.Append(Message{Role: RoleSystem, Kind: KindNotice, Text: "hi"})
 
-	withCookie := func(method, path string, body *bytes.Buffer, ctype string) int {
-		if body == nil {
-			body = &bytes.Buffer{}
-		}
-		req := httptest.NewRequest(method, path, body)
-		req.AddCookie(&http.Cookie{Name: tokenCookie, Value: "wt"})
-		if ctype != "" {
-			req.Header.Set("Content-Type", ctype)
-		}
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, req)
-		return rr.Code
+	if rr := withCookie(t, h, http.MethodGet, "/watch/messages", "", nil, ""); rr.Code != 200 {
+		t.Fatalf("cookie GET without origin = %d, want 200", rr.Code)
 	}
-	if c := withCookie(http.MethodGet, "/watch/messages", nil, ""); c != 200 {
-		t.Fatalf("cookie GET = %d", c)
-	}
-	if c := withCookie(http.MethodPost, "/watch/messages", bytes.NewBufferString(`{"text":"hi"}`), "application/json"); c != 202 {
-		t.Fatalf("cookie POST = %d", c)
+	body := `{"text":"hi"}`
+	// Same origin (the page's own fetch): accepted.
+	if rr := withCookie(t, h, http.MethodPost, "/watch/messages", "http://example.com", bytes.NewBufferString(body), "application/json"); rr.Code != 202 {
+		t.Fatalf("same-origin cookie POST = %d %s", rr.Code, rr.Body.String())
 	}
 	<-a.Inbound()
-
-	// The JSON API must not accept a token in the URL: it would leak through
-	// referrers, logs and history. Only /watch/ui consumes ?token=.
+	// A sibling host of the same site: same-site for the cookie, refused here.
+	if rr := withCookie(t, h, http.MethodPost, "/watch/messages", "https://site.example.com", bytes.NewBufferString(body), "application/json"); rr.Code != http.StatusForbidden {
+		t.Fatalf("sibling-origin cookie POST = %d, want 403", rr.Code)
+	}
+	// No Origin at all (a non-browser client that somehow has the cookie): refused.
+	if rr := withCookie(t, h, http.MethodPost, "/watch/messages", "", bytes.NewBufferString(body), "application/json"); rr.Code != http.StatusForbidden {
+		t.Fatalf("origin-less cookie POST = %d, want 403", rr.Code)
+	}
+	// The multipart form shape a hostile page would use is refused the same way.
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("text", "forged")
+	_ = mw.Close()
+	if rr := withCookie(t, h, http.MethodPost, "/watch/messages", "https://site.example.com", &buf, mw.FormDataContentType()); rr.Code != http.StatusForbidden {
+		t.Fatalf("sibling-origin multipart = %d, want 403", rr.Code)
+	}
+	// The bearer header is unaffected by all of this.
+	if rec := do(t, h, http.MethodPost, "/watch/messages", "wt", bytes.NewBufferString(body), "application/json"); rec.Code != 202 {
+		t.Fatalf("bearer POST = %d", rec.Code)
+	}
+	<-a.Inbound()
+	// And the JSON API never accepts a token in the URL.
 	if rec := do(t, h, http.MethodGet, "/watch/messages?token=wt", "", nil, ""); rec.Code != 401 {
 		t.Fatalf("query token on the API = %d, want 401", rec.Code)
 	}
-	// A bad cookie is still a 401.
-	req := httptest.NewRequest(http.MethodGet, "/watch/messages", nil)
-	req.AddCookie(&http.Cookie{Name: tokenCookie, Value: "wrong"})
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-	if rr.Code != 401 {
-		t.Fatalf("bad cookie = %d", rr.Code)
+}
+
+func TestAuthBrakeEngagesAfterRepeatedFailuresOnly(t *testing.T) {
+	a, _ := newAdapter(t)
+	h := a.Handler()
+	for i := 0; i < authFailLimit; i++ {
+		if rec := do(t, h, http.MethodGet, "/watch/ping", "wrong", nil, ""); rec.Code != 401 {
+			t.Fatalf("failure %d = %d", i, rec.Code)
+		}
+	}
+	if rec := do(t, h, http.MethodGet, "/watch/ping", "wrong", nil, ""); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("after %d failures = %d, want 429", authFailLimit, rec.Code)
+	}
+	// A valid token is never slowed by the brake.
+	if rec := do(t, h, http.MethodGet, "/watch/ping", "wt", nil, ""); rec.Code != 200 {
+		t.Fatalf("valid token while braked = %d", rec.Code)
+	}
+	// The window turns and guessing is answered with 401 again.
+	a.now = func() time.Time { return time.Now().UTC().Add(2 * authFailWindow) }
+	if rec := do(t, h, http.MethodGet, "/watch/ping", "wrong", nil, ""); rec.Code != 401 {
+		t.Fatalf("after the window = %d, want 401", rec.Code)
+	}
+}
+
+func TestPingIsReadOnly(t *testing.T) {
+	a, _ := newAdapter(t)
+	h := a.Handler()
+	for _, m := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
+		if rec := do(t, h, m, "/watch/ping", "wt", nil, ""); rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s /watch/ping = %d, want 405", m, rec.Code)
+		}
+	}
+	if rec := do(t, h, http.MethodGet, "/watch/ping", "wt", nil, ""); rec.Code != 200 {
+		t.Errorf("GET /watch/ping = %d", rec.Code)
+	}
+}
+
+// A huge text field must not become a store record that the next start
+// cannot read. Both request shapes are capped, and the store itself would
+// truncate anything that slipped through.
+func TestOversizedTextIsRefusedOnBothShapes(t *testing.T) {
+	a, _ := newAdapter(t)
+	h := a.Handler()
+	big := strings.Repeat("a", maxInboundText+10)
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("text", big)
+	_ = mw.Close()
+	if rec := do(t, h, http.MethodPost, "/watch/messages", "wt", &buf, mw.FormDataContentType()); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("multipart oversize = %d", rec.Code)
+	}
+	j, _ := json.Marshal(map[string]string{"text": big})
+	if rec := do(t, h, http.MethodPost, "/watch/messages", "wt", bytes.NewBuffer(j), "application/json"); rec.Code != http.StatusRequestEntityTooLarge && rec.Code != http.StatusBadRequest {
+		t.Fatalf("json oversize = %d", rec.Code)
+	}
+	if a.store.Pending() != 0 {
+		t.Fatal("an oversized message must not be stored")
+	}
+}
+
+func TestStoreSurvivesAnOversizedAndATornLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "w.jsonl")
+	st, _ := OpenStore(path)
+	good := st.Append(Message{Role: RoleUser, Kind: KindText, Text: "keep me", Status: StatusDone})
+	_ = st.Close()
+
+	// A record beyond the replay line limit, then a torn tail with no newline.
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	huge, _ := json.Marshal(Message{ID: "huge", Role: RoleAgent, Kind: KindReply, Text: strings.Repeat("x", maxLineBytes+1)})
+	_, _ = f.Write(append(huge, '\n'))
+	_, _ = f.Write([]byte(`{"seq":99,"id":"torn","role":"agent","kind":"reply","text":"cut off`))
+	_ = f.Close()
+
+	st2, err := OpenStore(path)
+	if err != nil {
+		t.Fatalf("a bad line must not prevent the store from opening: %v", err)
+	}
+	if _, ok := st2.Get(good.ID); !ok {
+		t.Fatal("the good record was lost")
+	}
+	if _, ok := st2.Get("huge"); ok {
+		t.Fatal("the oversized record should have been skipped")
+	}
+	// The next append lands on its own line, not glued to the torn fragment.
+	n := st2.Append(Message{Role: RoleSystem, Kind: KindNotice, Text: "after"})
+	_ = st2.Close()
+	st3, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st3.Get(n.ID); !ok {
+		t.Fatal("the record appended after a torn tail was not readable on the next open")
+	}
+	if _, ok := st3.Get("torn"); ok {
+		t.Fatal("the torn fragment must not resurrect as a record")
+	}
+}
+
+func TestAppendTruncatesAbsurdText(t *testing.T) {
+	st, _ := OpenStore("")
+	m := st.Append(Message{Role: RoleAgent, Kind: KindReply, Text: strings.Repeat("y", maxTextBytes*2)})
+	if len(m.Text) > maxTextBytes || !strings.HasSuffix(m.Text, "[truncated by agentd]") {
+		t.Fatalf("len=%d suffix=%q", len(m.Text), m.Text[len(m.Text)-30:])
+	}
+}
+
+func TestSummaryHalfIsStoredAsItsOwnKind(t *testing.T) {
+	a, _ := newAdapter(t)
+	h := a.Handler()
+	rec := do(t, h, http.MethodPost, "/watch/messages", "wt", bytes.NewBufferString(`{"text":"q"}`), "application/json")
+	if rec.Code != 202 {
+		t.Fatal(rec.Code)
+	}
+	in := <-a.Inbound()
+	_ = a.Ack(in.UserID, in.MsgID, channel.ReactionWorking)
+	_, _ = a.Send(context.Background(), channel.OutboundMsg{ChatID: in.UserID, Text: "long", Silent: true})
+	_, _ = a.Send(context.Background(), channel.OutboundMsg{ChatID: in.UserID, Text: "short", Summary: true})
+	tail := fetch(t, h, "")
+	kinds := []string{}
+	for _, m := range tail.Messages {
+		if m.Role == RoleAgent {
+			kinds = append(kinds, m.Kind)
+		}
+	}
+	if strings.Join(kinds, ",") != KindReply+","+KindSummary {
+		t.Fatalf("agent kinds = %v", kinds)
 	}
 }
 
