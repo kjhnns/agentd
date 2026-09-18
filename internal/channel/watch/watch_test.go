@@ -502,8 +502,8 @@ func TestUIRouteSignInFlow(t *testing.T) {
 	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/watch/ui" {
 		t.Fatalf("good token: %d -> %q %s", rec.Code, rec.Header().Get("Location"), rec.Body.String())
 	}
-	if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Referrer-Policy") != "no-referrer" {
-		t.Errorf("redirect lacks no-store/no-referrer: %v", rec.Header())
+	if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Referrer-Policy") != "same-origin" {
+		t.Errorf("redirect lacks no-store/same-origin referrer policy: %v", rec.Header())
 	}
 	cookies := rec.Result().Cookies()
 	if len(cookies) != 1 {
@@ -525,10 +525,20 @@ func TestUIRouteSignInFlow(t *testing.T) {
 		t.Fatalf("proxied HTTPS must set a Secure cookie: %d", rec.Code)
 	}
 
-	// A foreign page must not be able to sign this browser into ITS token.
-	rec = postForm(t, h, "/watch/ui", "https://evil.example", "token=wt", nil)
-	if rec.Code != http.StatusForbidden || len(rec.Result().Cookies()) != 0 {
-		t.Fatalf("cross-origin sign-in: %d cookies=%d", rec.Code, len(rec.Result().Cookies()))
+	// A foreign page must not be able to sign this browser into ITS token, and
+	// neither may an opaque `Origin: null` (what a no-referrer page sends).
+	for _, origin := range []string{"https://evil.example", "null"} {
+		rec = postForm(t, h, "/watch/ui", origin, "token=wt", nil)
+		if rec.Code != http.StatusForbidden || len(rec.Result().Cookies()) != 0 {
+			t.Fatalf("origin %q sign-in: %d cookies=%d", origin, rec.Code, len(rec.Result().Cookies()))
+		}
+	}
+	// Fetch Metadata alone proves same-origin, even without a usable Origin.
+	rec = postForm(t, h, "/watch/ui", "null", "token=wt", func(r *http.Request) {
+		r.Header.Set("Sec-Fetch-Site", "same-origin")
+	})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("Sec-Fetch-Site same-origin sign-in = %d", rec.Code)
 	}
 }
 
@@ -569,6 +579,19 @@ func TestCookieWritesRequireSameOrigin(t *testing.T) {
 	// A sibling host of the same site: same-site for the cookie, refused here.
 	if rr := withCookie(t, h, http.MethodPost, "/watch/messages", "https://site.example.com", bytes.NewBufferString(body), "application/json"); rr.Code != http.StatusForbidden {
 		t.Fatalf("sibling-origin cookie POST = %d, want 403", rr.Code)
+	}
+	// Fetch Metadata from a sibling site is refused too.
+	{
+		req := httptest.NewRequest(http.MethodPost, "/watch/messages", bytes.NewBufferString(body))
+		req.AddCookie(&http.Cookie{Name: tokenCookie, Value: "wt"})
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "null")
+		req.Header.Set("Sec-Fetch-Site", "same-site")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("same-site (not same-origin) fetch metadata = %d, want 403", rr.Code)
+		}
 	}
 	// No Origin at all (a non-browser client that somehow has the cookie): refused.
 	if rr := withCookie(t, h, http.MethodPost, "/watch/messages", "", bytes.NewBufferString(body), "application/json"); rr.Code != http.StatusForbidden {

@@ -252,12 +252,21 @@ func (a *Adapter) authed(r *http.Request) (ok, viaCookie bool) {
 	return false, false
 }
 
-// sameOrigin is the CSRF check for cookie-authenticated writes: the browser's
-// Origin header must name exactly this host, over the scheme the request used.
-// Browsers always send Origin on a POST, so a missing header is a refusal.
+// sameOrigin is the CSRF check for cookie-authenticated writes. Two signals
+// prove a same-origin browser request and either is enough: Fetch Metadata's
+// `Sec-Fetch-Site: same-origin`, or an Origin header naming exactly this host
+// over the scheme the request used. A missing or `null` Origin is a refusal.
+//
+// Referrer policy matters here: under `no-referrer` browsers send `Origin:
+// null` even on a same-origin form post, which is how this check once refused
+// the page's own sign-in. The UI therefore ships `Referrer-Policy:
+// same-origin`, and Sec-Fetch-Site is honoured because it is unaffected.
 func sameOrigin(r *http.Request) bool {
+	if strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "same-origin") {
+		return true
+	}
 	origin := r.Header.Get("Origin")
-	if origin == "" || r.Host == "" {
+	if origin == "" || origin == "null" || r.Host == "" {
 		return false
 	}
 	scheme := "http"
@@ -487,7 +496,10 @@ func (a *Adapter) handleUI(w http.ResponseWriter, r *http.Request) {
 // the redirect, which used to skip them.
 func noStore(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Referrer-Policy", "no-referrer")
+	// same-origin, NOT no-referrer: see sameOrigin. Nothing secret is in a URL
+	// any more, and no-referrer would blank the Origin header on the page's own
+	// form posts.
+	w.Header().Set("Referrer-Policy", "same-origin")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 }
 
