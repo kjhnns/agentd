@@ -299,23 +299,38 @@ type usageLine struct {
 
 // extractUsage parses the total context tokens from one stream-json line,
 // returning (0,false) when the line carries no usage. This is what makes Claude
-// pressure REAL rather than a proxy.
-func extractUsage(line []byte) (int, bool) {
+// pressure REAL rather than a proxy. fromResult tells the caller which kind of
+// line carried the figure, because the two mean different things:
+//
+//   - an assistant message's usage is ONE API request: prompt tokens (input +
+//     cache_read + cache_creation) plus its output, which is the live size of
+//     the context window at that step;
+//   - the turn's terminal result usage is the SUM over every request of the
+//     turn. A turn with a dozen tool calls against a 70k context reports
+//     800k+ there, which is not a window size at all.
+//
+// Reading the result figure as pressure made every multi-step turn look like
+// a full window (pressure 1.00 real) and reset the session after ONE turn: 59
+// of the last 100 sessions on the box died that way (measured 2026-09-27), so
+// nearly every message paid a cold start plus the agent's start-of-session
+// reads. The caller therefore takes the result figure only as a fallback when
+// no per-request usage was seen.
+func extractUsage(line []byte) (total int, ok bool, fromResult bool) {
 	var ul usageLine
 	if err := json.Unmarshal(line, &ul); err != nil {
-		return 0, false
-	}
-	if ul.Usage != nil {
-		if t := ul.Usage.total(); t > 0 {
-			return t, true
-		}
+		return 0, false, false
 	}
 	if ul.Message != nil && ul.Message.Usage != nil {
 		if t := ul.Message.Usage.total(); t > 0 {
-			return t, true
+			return t, true, false
 		}
 	}
-	return 0, false
+	if ul.Usage != nil {
+		if t := ul.Usage.total(); t > 0 {
+			return t, true, true
+		}
+	}
+	return 0, false, false
 }
 
 // resultDeduper blanks the redundant text on a turn's success result event when
@@ -366,12 +381,16 @@ func (h *handle) readLoop() {
 		copy(line, raw)
 
 		// Track I/O bytes (proxy backstop) and any measured token usage (real
-		// pressure). Usage appears on assistant + result lines; latest wins.
-		if total, ok := extractUsage(line); ok {
+		// pressure). Per-request usage (assistant lines) is the live window
+		// size and always wins; the result line's cumulative figure is only
+		// a fallback for a turn that streamed no assistant usage at all.
+		if total, ok, fromResult := extractUsage(line); ok {
 			h.mu.Lock()
 			h.bytes += int64(len(line))
-			h.lastTotalTokens = total
-			h.haveUsage = true
+			if !fromResult || !h.haveUsage {
+				h.lastTotalTokens = total
+				h.haveUsage = true
+			}
 			h.mu.Unlock()
 		} else {
 			h.mu.Lock()
