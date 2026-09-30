@@ -31,10 +31,13 @@ type ModelItem struct {
 
 // ModelOutput is the strict JSON the model returns.
 type ModelOutput struct {
-	Intent  string      `json:"intent"`
-	Items   []ModelItem `json:"items"`
-	Text    string      `json:"text"`
-	Widgets []string    `json:"widgets"`
+	// RawIntent is the intent as the model returned it, before the mixed
+	// "question with items" normalization to log.
+	RawIntent string      `json:"-"`
+	Intent    string      `json:"intent"`
+	Items     []ModelItem `json:"items"`
+	Text      string      `json:"text"`
+	Widgets   []string    `json:"widgets"`
 }
 
 // ModelInput is everything one call sees. Food text, transcripts and photos
@@ -44,6 +47,12 @@ type ModelInput struct {
 	Images   [][]byte // JPEG, already scaled
 	Staples  []Staple
 	Snapshot *Snapshot
+	// PhotoOnly: at least one photo and no text and no transcript. Such a
+	// request is ALWAYS a food log (spec 14 v3.1).
+	PhotoOnly bool
+	// ListFoods: the retry after a photo-only request came back with no
+	// items; the model is told explicitly to list the visible foods.
+	ListFoods bool
 }
 
 // Model is the provider interface ("openai" now, "anthropic" later).
@@ -59,7 +68,12 @@ var widgetNames = []string{"macros_today", "next_action", "weight_trend", "body_
 // validateOutput enforces the schema, the bounds and the intent rules (spec 8
 // and 14): at most 12 items; kcal 0..3000 and every gram field 0..300;
 // question requires zero items; log requires at least one.
-func validateOutput(raw json.RawMessage) (*ModelOutput, error) {
+func validateOutput(raw json.RawMessage) (*ModelOutput, error) { return validateOutputFor(raw, false) }
+
+// validateOutputFor validates model output; emptyLogOK accepts a log with
+// zero items (photo-only requests: the server retries, then answers no-food,
+// spec 14 v3.1) instead of treating it as invalid.
+func validateOutputFor(raw json.RawMessage, emptyLogOK bool) (*ModelOutput, error) {
 	if err := checkPresence(raw); err != nil {
 		return nil, err
 	}
@@ -70,13 +84,14 @@ func validateOutput(raw json.RawMessage) (*ModelOutput, error) {
 	if out.Intent != "log" && out.Intent != "question" {
 		return nil, errors.New("unknown intent")
 	}
+	out.RawIntent = out.Intent
 	if len(out.Items) > 0 {
 		out.Intent = "log" // a mixed "I had X, how am I doing?" logs X
 	}
 	switch out.Intent {
 	case "question":
 	case "log":
-		if len(out.Items) == 0 {
+		if len(out.Items) == 0 && !emptyLogOK {
 			return nil, errors.New("log intent with zero items")
 		}
 	default:
@@ -181,11 +196,25 @@ Task: decide whether the input logs food ("log") or only asks a question ("quest
 - log: return one item per distinct food eaten, at most 12. Estimate the portion in grams and the macros for THAT portion: kcal, protein_g, carbs_g, net_carbs_g (carbs minus fibre, or null if unsure), fat_g, sat_fat_g (always a number, estimate conservatively high), fiber_g (null if you cannot estimate it; round down). portion_basis: "stated" when the text gives an amount, "label" for a packaged food with known label values, "photo_estimate" when judged from a photo, "unspecified" otherwise.
 - If a food matches a staple (by key or alias), set staple_key to that key and portion_g to the stated grams (null if not stated); the server then uses the label values.
 - A photo shows what was SERVED, not what was eaten: set needs_fraction true for photo-estimated plates unless the text states how much was eaten (for example "half the pizza": then scale the item and set needs_fraction false). Otherwise needs_fraction is false.
+- A photo with NO caption and no transcript is ALWAYS a log, never a question: list every food visible in the photo.
 - question: items must be empty.
 - Mixed input ("I had X, how am I doing?") is a log of X.
 
 text: one or two short sentences of qualitative commentary on the FOOD only (quality, protein or fibre sources, one suggestion). Never state numbers, digits, totals, targets or whether a target is met; the app shows numbers itself. For a question, answer qualitatively from the snapshot without numbers.
 widgets: which dashboard widgets fit the reply, from: macros_today, next_action, weight_trend, body_fat_trend, week, streaks. A log always includes macros_today.`
+
+// systemFor adds the server's own per-request instructions to the system
+// message (the user message is data, never instructions).
+func systemFor(in ModelInput) string {
+	p := systemPrompt
+	if in.PhotoOnly {
+		p += "\n\nThis request is a photo with NO caption and no transcript: it is a food LOG (intent log). List every food and drink you can see in the photo as items."
+	}
+	if in.ListFoods {
+		p += "\n\nRetry for this request: inspect the photo again, return intent log and list each visible food or drink as an item with an estimated portion."
+	}
+	return p
+}
 
 func numOrNull() map[string]any { return map[string]any{"type": []string{"number", "null"}} }
 
@@ -246,6 +275,7 @@ func userContent(in ModelInput) []map[string]any {
 	if len(in.Images) > 0 {
 		text += fmt.Sprintf("\n%d photo(s) attached.", len(in.Images))
 	}
+
 	parts := []map[string]any{{"type": "text", "text": text}}
 	for _, img := range in.Images {
 		parts = append(parts, map[string]any{
@@ -260,7 +290,7 @@ func (o *OpenAI) Estimate(ctx context.Context, in ModelInput) (json.RawMessage, 
 	body := map[string]any{
 		"model": o.Model,
 		"messages": []map[string]any{
-			{"role": "system", "content": systemPrompt},
+			{"role": "system", "content": systemFor(in)},
 			{"role": "user", "content": userContent(in)},
 		},
 		"response_format": map[string]any{

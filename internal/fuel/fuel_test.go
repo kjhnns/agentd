@@ -2700,3 +2700,231 @@ func (s *Service) lifecycleCtxForTest() context.Context {
 	defer s.lcMu.Unlock()
 	return s.lctx
 }
+
+func photoOnlyLog(t *testing.T, h *harness, clientID string) *httptest.ResponseRecorder {
+	body, ct := multipartBody(t, map[string]string{"client_id": clientID}, []filePart{{"image", "a.jpg", "image/jpeg", testJPEG(400, 300)}})
+	return h.do("POST", "/fuel/log", body, ct)
+}
+
+func TestPhotoOnlyQuestionIsRetriedAsLog(t *testing.T) {
+	h := newHarness(t)
+	var inputs []ModelInput
+	h.model.fn = func(in ModelInput) string {
+		inputs = append(inputs, in)
+		if !in.ListFoods {
+			return `{"intent":"question","items":[],"text":"What is this?","widgets":[]}`
+		}
+		return pizzaPhoto
+	}
+	r := photoOnlyLog(t, h, "a1a1a1a1-0001")
+	if r.Code != 200 {
+		t.Fatalf("%d %s", r.Code, r.Body)
+	}
+	resp := decode[LogResponse](t, r)
+	if resp.Intent != "log" || len(resp.Items) != 1 || len(h.vars.rows("var-food")) != 1 {
+		t.Fatalf("intent %s items %d rows %d", resp.Intent, len(resp.Items), len(h.vars.rows("var-food")))
+	}
+	if len(inputs) != 2 || !inputs[0].PhotoOnly || inputs[0].ListFoods || !inputs[1].ListFoods {
+		t.Fatalf("model calls %+v", len(inputs))
+	}
+	// With a caption the model's question stands (no retry).
+	h.model.fn = func(in ModelInput) string {
+		if in.PhotoOnly {
+			t.Error("captioned photo marked photo-only")
+		}
+		return `{"intent":"question","items":[],"text":"Looks tasty.","widgets":[]}`
+	}
+	body, ct := multipartBody(t, map[string]string{"client_id": "a1a1a1a1-0002", "text": "is this healthy?"}, []filePart{{"image", "a.jpg", "image/jpeg", testJPEG(400, 300)}})
+	if q := decode[LogResponse](t, h.do("POST", "/fuel/log", body, ct)); q.Intent != "question" {
+		t.Fatalf("captioned question became %s", q.Intent)
+	}
+}
+
+func TestPhotoOnlyNoFoodAnswer(t *testing.T) {
+	h := newHarness(t)
+	calls := 0
+	h.model.fn = func(in ModelInput) string {
+		calls++
+		return `{"intent":"question","items":[],"text":"A picture of a wall.","widgets":[]}`
+	}
+	r := photoOnlyLog(t, h, "a2a2a2a2-0001")
+	if r.Code != 200 {
+		t.Fatalf("%d %s", r.Code, r.Body)
+	}
+	resp := decode[LogResponse](t, r)
+	if resp.Intent != "log" || len(resp.Items) != 0 || calls != 2 {
+		t.Fatalf("intent %s items %d calls %d", resp.Intent, len(resp.Items), calls)
+	}
+	if resp.Blocks[0].Type != "text" || resp.Blocks[0].Text != noFoodText {
+		t.Fatalf("first block %+v", resp.Blocks[0])
+	}
+	if h.vars.posts != 0 || resp.Snapshot.Revision != 0 {
+		t.Fatalf("posts %d revision %d", h.vars.posts, resp.Snapshot.Revision)
+	}
+	if !h.svc.feed.HasKey("r:"+resp.EntryID) || !h.svc.feed.HasKey("u:"+resp.EntryID) {
+		t.Fatal("feed items not recorded")
+	}
+	if h.svc.coachSeen[resp.EntryID] {
+		t.Fatal("coach event for a log with no items")
+	}
+	// Idempotent repeat answers the same, without a model call.
+	if r2 := decode[LogResponse](t, photoOnlyLog(t, h, "a2a2a2a2-0001")); r2.EntryID != resp.EntryID || calls != 2 {
+		t.Fatal("repeat not idempotent")
+	}
+}
+
+func TestPhotoOnlyEmptyLogOutputsTakeTheSamePaths(t *testing.T) {
+	emptyLog := `{"intent":"log","items":[],"text":"","widgets":[]}`
+	emptyQ := `{"intent":"question","items":[],"text":"?","widgets":[]}`
+	for i, seq := range [][2]string{{emptyLog, pizzaPhoto}, {emptyQ, emptyLog}, {emptyLog, emptyLog}, {emptyLog, emptyQ}} {
+		h := newHarness(t)
+		n := 0
+		seq := seq
+		h.model.fn = func(ModelInput) string { n++; return seq[(n-1)%2] }
+		r := photoOnlyLog(t, h, fmt.Sprintf("a3a3a3a3-%04d", i))
+		if r.Code != 200 {
+			t.Fatalf("seq %d: %d %s", i, r.Code, r.Body)
+		}
+		resp := decode[LogResponse](t, r)
+		wantItems := 0
+		if i == 0 {
+			wantItems = 1
+		}
+		if resp.Intent != "log" || len(resp.Items) != wantItems || n != 2 {
+			t.Fatalf("seq %d: intent %s items %d calls %d", i, resp.Intent, len(resp.Items), n)
+		}
+		if wantItems == 0 && resp.Blocks[0].Text != noFoodText {
+			t.Fatalf("seq %d: %q", i, resp.Blocks[0].Text)
+		}
+	}
+	// A non-photo empty log is still invalid output.
+	if _, err := validateOutput(json.RawMessage(emptyLog)); err == nil {
+		t.Fatal("empty log accepted outside the photo-only path")
+	}
+}
+
+func TestNoFoodEntrySurvivesRecovery(t *testing.T) {
+	h := newHarness(t)
+	h.model.fn = func(ModelInput) string { return `{"intent":"question","items":[],"text":"?","widgets":[]}` }
+	resp := decode[LogResponse](t, photoOnlyLog(t, h, "a4a4a4a4-0001"))
+	e := decode[entryResponse](t, h.do("GET", "/fuel/entry/"+resp.EntryID, nil, ""))
+	if e.Blocks[0].Text != noFoodText {
+		t.Fatalf("entry fetch %q", e.Blocks[0].Text)
+	}
+	// Crash after the journal txn: lose the feed and the final response.
+	h.svc.Close()
+	_ = os.Remove(filepath.Join(h.opts.StateDir, "feed.jsonl"))
+	_ = os.Remove(filepath.Join(h.opts.StateDir, "idem.jsonl"))
+	h.start()
+	for i := 0; i < 2; i++ {
+		h.clk.Add(time.Minute)
+		h.svc.reconcileOnce(context.Background())
+	}
+	if !h.svc.feed.HasKey("u:"+resp.EntryID) || !h.svc.feed.HasKey("r:"+resp.EntryID) {
+		t.Fatal("feed not rebuilt")
+	}
+	feed := decode[struct {
+		Items []feedOut `json:"items"`
+	}](t, h.do("GET", "/fuel/feed", nil, ""))
+	if len(feed.Items) != 2 || feed.Items[1].Blocks[0].Text != noFoodText {
+		t.Fatalf("feed %+v", feed.Items)
+	}
+	rec, ok := h.svc.idem.Get("a4a4a4a4-0001")
+	if !ok || !strings.Contains(string(rec.Response), "could not see any food") {
+		t.Fatal("final response not recovered with the no-food text")
+	}
+	if h.vars.posts != 0 || h.svc.coachSeen[resp.EntryID] {
+		t.Fatalf("posts %d coach %v", h.vars.posts, h.svc.coachSeen[resp.EntryID])
+	}
+}
+
+func TestPhotoOnlyQuestionWithItemsIsRetriedAndKeepsFoods(t *testing.T) {
+	qWithItems := strings.Replace(pizzaPhoto, `"intent":"log"`, `"intent":"question"`, 1)
+	oatsQ := strings.Replace(oatsFibre10, `"intent":"log"`, `"intent":"question"`, 1)
+	for i, second := range []string{`{"intent":"log","items":[],"text":"","widgets":[]}`, oatsFibre10, oatsQ} {
+		h := newHarness(t)
+		n := 0
+		second := second
+		h.model.fn = func(in ModelInput) string {
+			n++
+			if n == 1 {
+				return qWithItems
+			}
+			return second
+		}
+		r := photoOnlyLog(t, h, fmt.Sprintf("a5a5a5a5-%04d", i))
+		resp := decode[LogResponse](t, r)
+		if r.Code != 200 || n != 2 || resp.Intent != "log" || len(resp.Items) != 1 {
+			t.Fatalf("case %d: code %d calls %d intent %s items %d", i, r.Code, n, resp.Intent, len(resp.Items))
+		}
+		want := []string{"pizza margherita", "oats", "oats"}[i]
+		rows := h.vars.rows("var-food")
+		if resp.Items[0].Item != want || len(rows) != 1 || rows[0]["item"] != want {
+			t.Fatalf("case %d: logged %q rows %d, want %q", i, resp.Items[0].Item, len(rows), want)
+		}
+		photoOnlyLog(t, h, fmt.Sprintf("a5a5a5a5-%04d", i)) // repeat: idempotent
+		if n != 2 || len(h.vars.rows("var-food")) != 1 {
+			t.Fatalf("case %d: repeat made calls %d rows %d", i, n, len(h.vars.rows("var-food")))
+		}
+	}
+}
+
+func TestRetryInstructionIsInTheSystemMessage(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{}"}}]}`))
+	}))
+	defer srv.Close()
+	o := &OpenAI{Key: "k", Model: "m", BaseURL: srv.URL, Client: loopbackClient()}
+	_, _ = o.Estimate(context.Background(), ModelInput{Images: [][]byte{{0xff, 0xd8}}, PhotoOnly: true, ListFoods: true})
+	msgs := body["messages"].([]any)
+	sys := msgs[0].(map[string]any)["content"].(string)
+	user, _ := json.Marshal(msgs[1])
+	if !strings.Contains(sys, "Retry for this request") || !strings.Contains(sys, "NO caption") {
+		t.Fatal("retry instructions not in the system message")
+	}
+	if strings.Contains(string(user), "Retry for this request") || !strings.Contains(string(user), "image_url") {
+		t.Fatal("user message carries the instruction or lacks the image")
+	}
+}
+
+func TestPhotoOnlyClassificationBoundaries(t *testing.T) {
+	for i, c := range []struct {
+		asr, text string
+		audio     bool
+		photoOnly bool
+	}{
+		{"", "", true, true},
+		{"   ", "", true, true},
+		{"two eggs", "", true, false},
+		{"", "   ", false, true},
+		{"", "lunch", false, false},
+	} {
+		c := c
+		h := newHarness(t, func(o *Options) { o.ASR = fakeASR{text: c.asr} })
+		var saw *bool
+		h.model.fn = func(in ModelInput) string {
+			if saw == nil {
+				v := in.PhotoOnly
+				saw = &v
+			}
+			return pizzaPhoto
+		}
+		fields := map[string]string{"client_id": fmt.Sprintf("a6a6a6a6-%04d", i)}
+		if c.text != "" {
+			fields["text"] = c.text
+		}
+		files := []filePart{{"image", "a.jpg", "image/jpeg", testJPEG(200, 200)}}
+		if c.audio {
+			files = append(files, filePart{"audio", "a.m4a", "audio/m4a", fixture(t, "tone.m4a")})
+		}
+		body, ct := multipartBody(t, fields, files)
+		if r := h.do("POST", "/fuel/log", body, ct); r.Code != 200 {
+			t.Fatalf("case %d: %d %s", i, r.Code, r.Body)
+		}
+		if saw == nil || *saw != c.photoOnly {
+			t.Fatalf("case %d: photoOnly %v, want %v", i, saw, c.photoOnly)
+		}
+	}
+}

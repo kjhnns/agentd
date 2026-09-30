@@ -66,6 +66,7 @@ type Entry struct {
 	// What the conversation needs to rebuild this entry's feed lines.
 	UserText  string   `json:"user_text,omitempty"`
 	ModelText string   `json:"model_text,omitempty"`
+	NoFood    bool     `json:"no_food,omitempty"` // a photo-only log where no food was seen
 	Widgets   []string `json:"widgets,omitempty"`
 }
 

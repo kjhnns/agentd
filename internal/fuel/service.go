@@ -208,7 +208,7 @@ func (s *Service) materializeFeed(ctx context.Context, minAge time.Duration) {
 		}
 		needFeed := !s.feed.HasKey("u:"+e.ID) || !s.feed.HasKey("r:"+e.ID)
 		s.coachMu.Lock()
-		needCoach := e.Intent == "log" && !s.coachSeen[e.ID]
+		needCoach := e.Intent == "log" && len(e.ItemIDs) > 0 && !s.coachSeen[e.ID]
 		s.coachMu.Unlock()
 		needFinal := s.needsFinal(e.ClientID, e.CreatedAt, now)
 		if !needFeed && !needCoach && !needFinal {
@@ -643,7 +643,7 @@ func (s *Service) reconcileOnce(ctx context.Context) {
 // done after its response (spec 11: one line per log, with real macros).
 func (s *Service) coachCatchUp(ctx context.Context, now time.Time) {
 	for _, e := range s.journal.Entries() {
-		if e.Intent != "log" || now.Sub(e.CreatedAt) > idemRetention {
+		if e.Intent != "log" || len(e.ItemIDs) == 0 || now.Sub(e.CreatedAt) > idemRetention {
 			continue
 		}
 		s.coachMu.Lock()

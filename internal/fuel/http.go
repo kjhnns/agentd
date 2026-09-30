@@ -582,7 +582,27 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 	for _, p := range imgs {
 		mi.Images = append(mi.Images, p.Model)
 	}
+	mi.PhotoOnly = len(imgs) > 0 && in.Text == "" && (transcript == nil || strings.TrimSpace(*transcript) == "")
 	out, e := s.callModel(ctx, mi)
+	noFood := false
+	if e == nil && mi.PhotoOnly && (out.RawIntent == "question" || len(out.Items) == 0) {
+		// A caption-less photo is always a log (spec 14 v3.1): one retry
+		// that asks explicitly for the visible foods. Foods the first answer
+		// already listed are never thrown away by an empty retry.
+		log.Printf("fuel: photo-only request came back as %s with %d item(s); retrying once", out.RawIntent, len(out.Items))
+		first := out
+		retry := mi
+		retry.ListFoods = true
+		out, e = s.callModel(ctx, retry)
+		if e == nil && len(out.Items) == 0 {
+			if len(first.Items) > 0 {
+				out = first
+			} else {
+				noFood = true
+				out = &ModelOutput{Intent: "log", RawIntent: "log"}
+			}
+		}
+	}
 	modelD := time.Since(tModel)
 	if e != nil {
 		writeErr(w, e)
@@ -638,6 +658,7 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	entry.UserText, entry.ModelText, entry.Widgets = foodText, modelText, out.Widgets
+	entry.NoFood = noFood
 	if err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: items, Ops: ops}); err != nil {
 		switch {
 		case errors.Is(err, ErrDeadline):
@@ -691,7 +712,7 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body, _ := json.Marshal(resp)
-	if out.Intent == "log" && status == StatusDone && ready {
+	if out.Intent == "log" && len(items) > 0 && status == StatusDone && ready {
 		// Before the final response is stored; a pending entry gets its
 		// event from the reconciler once it is done, with its real macros.
 		s.coachEvent(entry, states, snap)
@@ -799,6 +820,9 @@ func (s *Service) journalHas(entryID string) bool {
 	return ok
 }
 
+// noFoodText answers a caption-less photo in which no food was seen.
+const noFoodText = "I could not see any food in that photo. Add a word about what it is."
+
 // buildLogResponse renders an entry's current state: code-generated status
 // sentence first, the model's food commentary, then the widgets.
 func (s *Service) buildLogResponse(e Entry) (LogResponse, string) {
@@ -817,6 +841,9 @@ func (s *Service) buildLogResponse(e Entry) (LogResponse, string) {
 		effs = append(effs, st.Effective)
 	}
 	blocks := []Block{textBlock(statusSentence(snap))}
+	if e.NoFood {
+		blocks = []Block{textBlock(noFoodText)}
+	}
 	if e.ModelText != "" {
 		blocks = append(blocks, textBlock(e.ModelText))
 	}
@@ -908,7 +935,7 @@ func (s *Service) callModel(ctx context.Context, mi ModelInput) (*ModelOutput, *
 			log.Printf("fuel: model call failed (%s)", errClass(err))
 			return nil, errf(http.StatusBadGateway, "upstream_failed", true, "the model call failed")
 		}
-		out, verr := validateOutput(raw)
+		out, verr := validateOutputFor(raw, mi.PhotoOnly)
 		if verr == nil {
 			return out, nil
 		}
@@ -1380,6 +1407,9 @@ func (s *Service) writeEntry(w http.ResponseWriter, e Entry) {
 		effs = append(effs, st.Effective)
 	}
 	blocks := []Block{textBlock(statusSentence(snap))}
+	if e.NoFood {
+		blocks = []Block{textBlock(noFoodText)}
+	}
 	if b, ok := widgetBlock("macros_today", snap, addedOf(effs)); ok {
 		blocks = append(blocks, b)
 	}
