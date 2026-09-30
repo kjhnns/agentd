@@ -152,12 +152,53 @@ func DefaultMedia() Media {
 	}
 }
 
+// Fuel is the [fuel] table: the Fuel fast path (internal/fuel,
+// docs/specs/2026-10-fuel-api.md). Present is true when the section appears;
+// validation happens in internal/fuel at startup, so a bad section leaves the
+// routes unmounted instead of failing the daemon.
+type Fuel struct {
+	Present       bool
+	Token         string // literal or "env:VAR"
+	VariablesURL  string
+	VariablesKey  string // literal or "env:VAR"
+	FoodLogVar    string // json variable NAME, resolved to an id at startup
+	BodyVar       string // json variable NAME (read only)
+	ModelProvider string // "openai"
+	Model         string
+	ModelKey      string // literal or "env:VAR"
+	ModelEffort   string // optional reasoning effort hint ("" = provider default)
+	TargetsFile   string
+	StaplesFile   string
+	StateDir      string // "" = <server state_dir>/fuel
+	StravaDir     string
+	TestMode      bool
+	// Err holds the first problem in the [fuel] section. A bad [fuel]
+	// section never stops the daemon: it leaves only the Fuel routes
+	// unmounted (spec section 1).
+	Err string
+}
+
+// DefaultFuel returns the built-in [fuel] values applied to a present section.
+func DefaultFuel() Fuel {
+	return Fuel{
+		VariablesURL:  "https://app.logvariables.com/api/ext",
+		FoodLogVar:    "Food log",
+		BodyVar:       "Body composition",
+		ModelProvider: "openai",
+		Model:         "gpt-5.1",
+		TargetsFile:   "~/.agentd/fuel-targets.json",
+		StaplesFile:   "~/.agentd/fuel-staples.json",
+		StravaDir:     "~/warehouse/raw-sources/strava",
+	}
+}
+
 // Config is the whole parsed file.
 type Config struct {
 	Server    Server
 	Workspace Workspace
 	Session   Session
 	Media     Media
+	Fuel      Fuel
 	Harness   []Harness
 	Channel   []Channel
 	Job       []Job
@@ -206,6 +247,7 @@ func Parse(data []byte) (*Config, error) {
 		Workspace: Workspace{GitAutocommit: true}, // Root/Default resolved by workspace.NewStore
 		Session:   DefaultSession(),
 		Media:     DefaultMedia(),
+		Fuel:      DefaultFuel(),
 	}
 	section := "" // "server" or "" (top-level)
 	var curHarness *Harness
@@ -251,6 +293,9 @@ func Parse(data []byte) (*Config, error) {
 		// Table header: [name]
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = strings.TrimSpace(line[1 : len(line)-1])
+			if section == "fuel" {
+				cfg.Fuel.Present = true
+			}
 			curHarness = nil
 			curChannel = nil
 			curJob = nil
@@ -259,11 +304,23 @@ func Parse(data []byte) (*Config, error) {
 		// key = value
 		eq := strings.IndexByte(line, '=')
 		if eq < 0 {
+			if section == "fuel" {
+				if cfg.Fuel.Err == "" {
+					cfg.Fuel.Err = fmt.Sprintf("config line %d: expected key = value", lineNo)
+				}
+				continue
+			}
 			return nil, fmt.Errorf("config line %d: expected key = value, got %q", lineNo, line)
 		}
 		key := strings.TrimSpace(line[:eq])
 		raw := strings.TrimSpace(line[eq+1:])
 		if err := assign(cfg, section, curHarness, curChannel, curJob, key, raw); err != nil {
+			if section == "fuel" {
+				if cfg.Fuel.Err == "" {
+					cfg.Fuel.Err = fmt.Sprintf("config line %d: %v", lineNo, err)
+				}
+				continue
+			}
 			return nil, fmt.Errorf("config line %d: %w", lineNo, err)
 		}
 	}
@@ -419,6 +476,49 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 			cfg.Media.Dir = s
 		default:
 			return fmt.Errorf("unknown [media] key %q", key)
+		}
+	case "fuel":
+		if key == "test_mode" {
+			b, err := asBool(raw)
+			if err != nil {
+				return fmt.Errorf("test_mode: expected a boolean") // value-free
+			}
+			cfg.Fuel.TestMode = b
+			return nil
+		}
+		s, err := asString(raw)
+		if err != nil {
+			return err
+		}
+		switch key {
+		case "token":
+			cfg.Fuel.Token = s
+		case "variables_url":
+			cfg.Fuel.VariablesURL = s
+		case "variables_key":
+			cfg.Fuel.VariablesKey = s
+		case "food_log_var":
+			cfg.Fuel.FoodLogVar = s
+		case "body_var":
+			cfg.Fuel.BodyVar = s
+		case "model_provider":
+			cfg.Fuel.ModelProvider = s
+		case "model":
+			cfg.Fuel.Model = s
+		case "model_key":
+			cfg.Fuel.ModelKey = s
+		case "model_effort":
+			cfg.Fuel.ModelEffort = s
+		case "targets_file":
+			cfg.Fuel.TargetsFile = s
+		case "staples_file":
+			cfg.Fuel.StaplesFile = s
+		case "state_dir":
+			cfg.Fuel.StateDir = s
+		case "strava_dir":
+			cfg.Fuel.StravaDir = s
+		default:
+			return fmt.Errorf("unknown [fuel] key %q", key)
 		}
 	case "harness":
 		if key == "skip_permissions" {
@@ -620,7 +720,8 @@ func asString(raw string) (string, error) {
 		return raw[1 : len(raw)-1], nil
 	}
 	// tolerate bare booleans/ints coerced to string context? No: require quotes.
-	return "", fmt.Errorf("expected quoted string, got %q", raw)
+	// The value is NOT echoed: it may be a token or key with a typo.
+	return "", fmt.Errorf("expected a quoted string")
 }
 
 func asStringArray(raw string) ([]string, error) {

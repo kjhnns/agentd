@@ -12,7 +12,8 @@ Deploy target: Joe's Mac, LaunchDaemon com.joe_pa.agentd, runtime home
 ## Layout
 cmd/agentd/           the single binary (serve, run, chat, smoke, memory, init-workspace)
 internal/             config, eventbus, runlog, harness/claudecode, channel/{telegram,web,whatsapp},
-                      session, scheduler, notify, media, api, cli, workspace
+                      session, scheduler, notify, media, api, cli, workspace,
+                      fuel (the Fuel fast path, docs/specs/2026-10-fuel-api.md)
 config.example.toml   the only config committed; the real config.toml is gitignored
 
 ## Commands
