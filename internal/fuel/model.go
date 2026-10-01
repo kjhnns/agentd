@@ -39,7 +39,11 @@ type ModelItem struct {
 // first water with 250 ml"). Ref is an item id / row key, "last" or a name;
 // Which, VolumeML and PortionG disambiguate.
 type ModelUndoTarget struct {
-	Ref      string   `json:"ref"`
+	Ref string `json:"ref"`
+	// Names are the item names from LAST LOGGED ITEMS the user's words mean
+	// ("the water" -> ["water"]; the model may map synonyms such as
+	// ["water", "sparkling water"]). Empty when the user names no food.
+	Names    []string `json:"names"`
 	Which    *string  `json:"which"` // "first" | "last" | null
 	VolumeML *float64 `json:"volume_ml"`
 	PortionG *float64 `json:"portion_g"`
@@ -140,6 +144,14 @@ func validateOutputFor(raw json.RawMessage, emptyLogOK bool) (*ModelOutput, erro
 		for i, t := range out.Targets {
 			if strings.TrimSpace(t.Ref) == "" || len(t.Ref) > 200 {
 				return nil, fmt.Errorf("target %d: bad ref", i)
+			}
+			if len(t.Names) > 10 {
+				return nil, fmt.Errorf("target %d: too many names", i)
+			}
+			for _, n := range t.Names {
+				if strings.TrimSpace(n) == "" || len(n) > 200 {
+					return nil, fmt.Errorf("target %d: bad name", i)
+				}
 			}
 			if t.Which != nil && *t.Which != "first" && *t.Which != "last" {
 				return nil, fmt.Errorf("target %d: which must be first, last or null", i)
@@ -314,10 +326,11 @@ Task: decide whether the input logs what was eaten or drunk ("log"), corrects an
 - For each item estimate the portion in grams and the macros for THAT portion: kcal, protein_g, carbs_g, net_carbs_g (carbs minus fibre, or null if unsure), fat_g, sat_fat_g (always a number, estimate conservatively high), fiber_g (null if you cannot estimate it; round down). Macros are always numbers; water and black coffee are all 0. portion_basis: "stated" when the text gives an amount, "label" for a packaged food with known label values, "photo_estimate" when judged from a photo, "unspecified" otherwise.
 - Drinks: volume_ml (a glass of water is 250 ml unless stated, a cup of coffee 200 ml, an espresso 30 ml, a beer 330 ml, a glass of wine 150 ml); portion_g may be null. caffeine_mg for coffee, tea, cola and energy drinks (espresso about 65, a cup of filter coffee about 95, black tea about 45), else null. alcohol_g: about 10 g per standard drink (beer 330 ml 5 % = 13 g, wine 150 ml = 14 g), else null. For foods volume_ml, caffeine_mg and alcohol_g are null.
 - If an item matches a staple (by key or alias), set staple_key to that key and portion_g to the stated grams (null if not stated); the server then uses the label values.
+- Several photos in ONE request are views of the SAME meal or item (other angles, the package front, the nutrition label, the menu line), never separate servings: list each food ONCE, never once per photo. A readable nutrition label or a printed package weight overrides visual estimates: use its values per 100 g / per serving scaled to the portion, and portion_basis "label". Combine the evidence of all photos for the portion.
 - A photo shows what was SERVED, not what was eaten: set needs_fraction true for photo-estimated plates unless the text states how much was eaten (for example "half the pizza": then scale the item and set needs_fraction false). Otherwise needs_fraction is false.
 - A photo with NO caption and no transcript is ALWAYS a log, never a question: list every food visible in the photo.
 - correct: the input changes the amount of something already logged ("no, that was 100 g", "only half", "300 ml not 500", "it was only 300 ml"). Return items empty and corrections: one per item; exactly one of portion_g, volume_ml or share is set, the others null. Keep the UNIT the user said: an amount in grams is portion_g and only corrects an item whose units include "g" in LAST LOGGED ITEMS; an amount in ml is volume_ml and only corrects an item whose units include "ml"; "only half" is share 0.5. Never turn grams into ml or ml into grams. ref = the item name when the user names it, else "last" (the server then picks the newest item with that unit; a share without a name only reaches items with newest_entry true). A correction never logs a new food.
-- undo: the input asks to REMOVE, delete, cancel or undo something already logged ("remove that one", "delete the first water", "I logged the coffee twice, take one out", "I did not eat the banana"). A removal is NEVER a correction: do not turn it into an amount. Return items and corrections empty and targets: one per thing to remove; ref = the item_id from LAST LOGGED ITEMS when clear, else the item name, else "last"; which = "first" or "last" when the user says which of several (by order or time), else null; volume_ml or portion_g = the amount the user uses to identify it ("the one with 250 ml" is volume_ml 250), else null.
+- undo: the input asks to REMOVE, delete, cancel or undo something already logged ("remove that one", "delete the first water", "I logged the coffee twice, take one out", "I did not eat the banana"). A removal is NEVER a correction: do not turn it into an amount. Return items and corrections empty and targets: one per thing to remove; ref = the item_id from LAST LOGGED ITEMS when clear, else the item name, else "last"; names = the exact item names from LAST LOGGED ITEMS that the user's words refer to ("remove the water" -> ["water"]; include a synonym such as "sparkling water" only if the user's words plausibly mean it), empty only if the user names no food; which = "first" or "last" when the user says which of several by order or time ("I just logged", "the last one" = "last"), else null; volume_ml or portion_g = the amount the user uses to identify it ("the one with 250 ml" is volume_ml 250), else null.
 - question: items, corrections and targets must be empty.
 - Mixed input ("I had X, how am I doing?") is a log of X. For log and question, corrections and targets are empty; for correct, targets is empty.
 
@@ -330,6 +343,9 @@ func systemFor(in ModelInput) string {
 	p := systemPrompt
 	if in.PhotoOnly {
 		p += "\n\nThis request is a photo with NO caption and no transcript: it is a food LOG (intent log). List every food and drink you can see in the photo as items."
+	}
+	if len(in.Images) > 1 {
+		p += fmt.Sprintf("\n\nThis request has %d photos. They all show the SAME meal or item (different angles, package, nutrition label, menu): every food appears once in items, however many photos show it. Prefer label values where a label is readable.", len(in.Images))
 	}
 	if in.ListFoods {
 		p += "\n\nRetry for this request: inspect the photo again, return intent log and list each visible food or drink as an item with an estimated portion."
@@ -368,11 +384,12 @@ func outputSchema() map[string]any {
 		"type": "object",
 		"properties": map[string]any{
 			"ref":       map[string]any{"type": "string"},
+			"names":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 			"which":     map[string]any{"type": []string{"string", "null"}, "enum": []any{"first", "last", nil}},
 			"volume_ml": numOrNull(),
 			"portion_g": numOrNull(),
 		},
-		"required":             []string{"ref", "which", "volume_ml", "portion_g"},
+		"required":             []string{"ref", "names", "which", "volume_ml", "portion_g"},
 		"additionalProperties": false,
 	}
 	correction := map[string]any{

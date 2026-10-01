@@ -143,28 +143,48 @@ func shareWords(f float64) string {
 // lastItems are the active items of the newest log entry with items (the
 // model's reference list for "no, that was 100 g").
 func (s *Service) lastItems() []LastItem {
-	items := s.todaysActiveItems()
+	items := s.todaysActiveItems() // Fuel items, newest first
 	newest, _ := s.newestLogEntry()
-	if len(items) > 20 {
-		items = items[:20] // the 20 newest
+	type timed struct {
+		li LastItem
+		at time.Time
 	}
-	var out []LastItem
-	for i := len(items) - 1; i >= 0; i-- { // newest last
+	var all []timed
+	fuel := map[string]bool{}
+	for i := len(items) - 1; i >= 0; i-- { // oldest first
 		it := items[i]
+		fuel[it.ID] = true
 		li := LastItem{ItemID: it.ID, Item: it.Name, Kind: it.KindOr(), PortionG: it.PortionG, NewestEntry: it.EntryID == newest.ID, At: s.localHHMM(it.EatenAt)}
 		if it.Orig.VolumeML.OK && it.Orig.VolumeML.V > 0 {
 			v := it.Orig.VolumeML.float()
 			li.VolumeML = &v
 		}
-		// The units this item can be corrected in, exactly as the server
-		// checks them (fitsUnit).
 		if fitsUnit(it, unitGrams) {
 			li.Units = append(li.Units, "g")
 		}
 		if fitsUnit(it, unitML) {
 			li.Units = append(li.Units, "ml")
 		}
-		out = append(out, li)
+		all = append(all, timed{li, it.EatenAt})
+	}
+	// Today's rows of OTHER writers (Telegram), so a removal can name them.
+	s.stateMu.RLock()
+	day := s.dayItems(s.today())
+	s.stateMu.RUnlock()
+	for i := len(day) - 1; i >= 0; i-- {
+		d := day[i]
+		if fuel[d.RowKey] || !isExternalKey(d.RowKey) {
+			continue
+		}
+		all = append(all, timed{LastItem{ItemID: d.RowKey, Item: d.Item, Kind: d.Kind, PortionG: d.PortionG, VolumeML: d.VolumeML, At: s.localHHMM(d.EatenAt)}, d.EatenAt})
+	}
+	sort.SliceStable(all, func(a, b int) bool { return all[a].at.Before(all[b].at) })
+	var out []LastItem
+	for _, t := range all {
+		out = append(out, t.li)
+	}
+	if len(out) > 20 {
+		out = out[len(out)-20:] // the 20 newest, newest last
 	}
 	return out
 }

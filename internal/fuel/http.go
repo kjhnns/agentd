@@ -649,11 +649,15 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Photos are stored only for an accepted request.
+	// ALL photos or none (spec 15.5): a failed save removes the saved ones
+	// and nothing is journaled, so a retry with the same client_id works.
 	for _, p := range imgs {
 		id, err := s.photos.save(p.Stored)
 		if err != nil {
-			log.Printf("fuel: photo save failed")
-			continue
+			log.Printf("fuel: photo save failed; nothing written")
+			s.photos.remove(entry.PhotoIDs)
+			writeErr(w, errf(http.StatusInternalServerError, "internal", true, "could not store the photos; nothing was written, retry"))
+			return
 		}
 		entry.PhotoIDs = append(entry.PhotoIDs, id)
 	}
@@ -1590,6 +1594,7 @@ func (s *Service) appendMutationFeed(key, entryID string, blocks []Block) {
 type entryResponse struct {
 	Status   string      `json:"status"`
 	EntryID  string      `json:"entry_id"`
+	PhotoIDs []string    `json:"photo_ids"`
 	Items    []ItemState `json:"items"`
 	Blocks   []Block     `json:"blocks"`
 	Snapshot Snapshot    `json:"snapshot"`
@@ -1626,7 +1631,11 @@ func (s *Service) writeEntry(w http.ResponseWriter, e Entry) {
 	if status == StatusPending {
 		code = http.StatusAccepted
 	}
-	writeJSON(w, code, entryResponse{Status: status, EntryID: e.ID, Items: states, Blocks: blocks, Snapshot: snap})
+	photos := e.PhotoIDs
+	if photos == nil {
+		photos = []string{}
+	}
+	writeJSON(w, code, entryResponse{Status: status, EntryID: e.ID, PhotoIDs: photos, Items: states, Blocks: blocks, Snapshot: snap})
 }
 
 func (s *Service) handleEntry(w http.ResponseWriter, r *http.Request) {

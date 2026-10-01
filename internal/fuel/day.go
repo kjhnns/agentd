@@ -20,7 +20,8 @@ type DayItem struct {
 	AlcoholG   *float64  `json:"alcohol_g"`
 	EatenAt    time.Time `json:"eaten_at"`
 	Source     string    `json:"source"`
-	PhotoID    *string   `json:"photo_id"`
+	PhotoID    *string   `json:"photo_id"`  // the first stored photo (compatibility)
+	PhotoIDs   []string  `json:"photo_ids"` // every stored photo of the entry
 	Actions    []string  `json:"actions"`
 	RecentKey  string    `json:"recent_key"`
 
@@ -83,13 +84,16 @@ func (s *Service) dayItems(date string) []DayItem {
 		if v, ok := d["volume_ml"].(float64); ok && v > 0 {
 			it.origVolume = &v
 		}
+		it.PhotoIDs = []string{}
 		if ref, _ := d["photo_ref"].(string); ref != "" {
 			for _, p := range strings.Split(ref, ",") {
 				if s.photos.path(p) != "" {
-					id := p
-					it.PhotoID = &id
-					break
+					it.PhotoIDs = append(it.PhotoIDs, p)
 				}
+			}
+			if len(it.PhotoIDs) > 0 {
+				id := it.PhotoIDs[0]
+				it.PhotoID = &id
 			}
 		}
 		out = append(out, it)

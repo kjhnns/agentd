@@ -50,13 +50,31 @@ func (s *Service) describeDayItem(d DayItem) string {
 func (s *Service) resolveUndoTarget(t ModelUndoTarget, items []DayItem) (DayItem, string) {
 	ref := strings.TrimSpace(t.Ref)
 	var cands []DayItem
+	want := map[string]bool{}
+	for _, n := range t.Names {
+		want[normName(n)] = true
+	}
 	for _, d := range items {
-		if d.RowKey == ref {
+		// An id match counts only if it is one of the named foods: names
+		// constrain every path (an id the model got wrong must not remove
+		// another food).
+		if d.RowKey == ref && (len(want) == 0 || want[normName(d.Item)]) {
 			cands = []DayItem{d}
 			break
 		}
 	}
-	if len(cands) == 0 {
+	if len(cands) == 0 && len(t.Names) > 0 {
+		// The named food(s) first, exact (case-insensitive) names only: a
+		// synonym counts only when the model listed it.
+		for _, d := range items {
+			if want[normName(d.Item)] {
+				cands = append(cands, d)
+			}
+		}
+		if len(cands) == 0 {
+			return DayItem{}, "I could not find " + strings.Join(t.Names, " or ") + " in today's log to remove."
+		}
+	} else if len(cands) == 0 {
 		if strings.EqualFold(ref, "last") {
 			cands = append(cands, items...)
 		} else {

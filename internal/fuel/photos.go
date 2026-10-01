@@ -2,6 +2,7 @@ package fuel
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -17,6 +18,9 @@ type photoStore struct {
 	idx  string
 	meta map[string]photoMeta
 	now  func() time.Time
+	// failSave lets tests make a save fail.
+	failSave func() bool
+	failIdx  func() bool
 }
 
 type photoMeta struct {
@@ -46,19 +50,33 @@ func openPhotoStore(dir string, now func() time.Time) (*photoStore, error) {
 }
 
 func (p *photoStore) save(jpeg []byte) (string, error) {
+	if p.failSave != nil && p.failSave() {
+		return "", errors.New("injected save failure")
+	}
 	id := newID("ph_")
 	file := id + ".jpg"
-	if err := os.WriteFile(filepath.Join(p.dir, file), jpeg, 0o600); err != nil {
+	full := filepath.Join(p.dir, file)
+	if err := os.WriteFile(full, jpeg, 0o600); err != nil {
+		_ = os.Remove(full) // a partial file must not stay behind
 		return "", err
 	}
 	m := photoMeta{ID: id, File: file, At: p.now()}
-	if err := appendJSONLine(p.idx, m); err != nil {
+	if err := p.appendIdx(m); err != nil {
+		_ = os.Remove(full) // no metadata = no way to serve or prune it
 		return "", err
 	}
 	p.mu.Lock()
 	p.meta[id] = m
 	p.mu.Unlock()
 	return id, nil
+}
+
+// appendIdx writes one metadata line (a test can make it fail).
+func (p *photoStore) appendIdx(m photoMeta) error {
+	if p.failIdx != nil && p.failIdx() {
+		return errors.New("injected index failure")
+	}
+	return appendJSONLine(p.idx, m)
 }
 
 // path returns the stored file for an id, or "" when unknown or pruned.
