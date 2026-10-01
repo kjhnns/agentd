@@ -17,11 +17,14 @@ import (
 
 // RecentItem is one row of GET /fuel/recent (spec section 15).
 type RecentItem struct {
-	Key         string    `json:"key"`
-	Item        string    `json:"item"`
-	Kind        string    `json:"kind"` // food | drink | supplement
-	PortionG    *float64  `json:"portion_g"`
-	VolumeML    *float64  `json:"volume_ml"`
+	Key      string   `json:"key"`
+	Item     string   `json:"item"`
+	Kind     string   `json:"kind"` // food | drink | supplement
+	PortionG *float64 `json:"portion_g"`
+	VolumeML *float64 `json:"volume_ml"`
+	// Current effective amounts, scaled like the macros (null = unknown).
+	CaffeineMG  *float64  `json:"caffeine_mg"`
+	AlcoholG    *float64  `json:"alcohol_g"`
 	Macros      Macros    `json:"macros"`
 	LastEatenAt time.Time `json:"last_eaten_at"`
 	Times       int       `json:"times"`
@@ -270,6 +273,7 @@ func (s *Service) recentAll() []RecentItem {
 		sort.SliceStable(os, func(a, b int) bool { return os[a].at.After(os[b].at) })
 		last := os[0]
 		it := RecentItem{Key: k, Item: last.name, Kind: last.kind, PortionG: last.portion, VolumeML: last.volume, Macros: last.macros,
+			CaffeineMG: last.macros.CaffeineMG.ptr(), AlcoholG: last.macros.AlcoholG.ptr(),
 			LastEatenAt: last.at, Times: len(os), Source: last.source}
 		for _, o := range os {
 			for _, p := range o.photos {

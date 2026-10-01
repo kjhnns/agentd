@@ -384,9 +384,6 @@ func TestLastAfterANoFoodPhotoIsUnresolved(t *testing.T) {
 	h.model.fn = func(ModelInput) string { return `{"intent":"question","items":[],"text":"","widgets":[]}` }
 	photoOnlyLog(t, h, "e0000001-0002")
 	h.model.fn = func(in ModelInput) string {
-		if len(in.LastItems) != 0 {
-			t.Errorf("last items %+v", in.LastItems)
-		}
 		return `{"intent":"correct","items":[],"corrections":[{"ref":"last","portion_g":null,"volume_ml":null,"share":0.5}],"text":"","widgets":[]}`
 	}
 	n := len(h.vars.rows("var-food"))
@@ -584,5 +581,326 @@ func TestPendingCorrectionThatFailsUpdatesTheFeed(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("feed reply not re-rendered after the pending correction failed")
+	}
+}
+
+func correctOut(ref string, g, ml, share string) string {
+	return fmt.Sprintf(`{"intent":"correct","items":[],"corrections":[{"ref":%q,"portion_g":%s,"volume_ml":%s,"share":%s}],"text":"","widgets":[]}`, ref, g, ml, share)
+}
+
+func TestUnitAwareLastFoodThenWaterRelogThenGrams(t *testing.T) {
+	h := newHarness(t)
+	h.model.fn = func(ModelInput) string { return oneItem("Skyr", 250, 157.5, 27.5, false) }
+	skyr := decode[LogResponse](t, h.logText("u0000001-0001", "250 g skyr")).Items[0]
+	h.clk.Add(time.Minute)
+	h.model.fn = func(ModelInput) string { return drink("Water", 250, 0, 0, 0, false) }
+	h.logText("u0000001-0002", "water")
+	h.clk.Add(time.Minute)
+	key := ""
+	for _, r := range h.recent("").Items {
+		if r.Item == "Water" {
+			key = r.Key
+		}
+	}
+	h.relog("u0000001-0003", key, nil) // "+ water" relog: newest entry
+	h.clk.Add(time.Minute)
+	var seen []LastItem
+	h.model.fn = func(in ModelInput) string { seen = in.LastItems; return correctOut("last", "100", "null", "null") }
+	r := decode[LogResponse](t, h.logText("u0000001-0004", "no, that was 100 g"))
+	if len(r.Items) != 1 || r.Items[0].ItemID != skyr.ItemID || r.Items[0].Effective.Kcal.float() != 63 {
+		t.Fatalf("corrected %+v", r.Items)
+	}
+	units := map[string]string{}
+	for _, li := range seen {
+		units[li.Item] = strings.Join(li.Units, ",")
+	}
+	if units["Skyr"] != "g" || units["Water"] != "ml" || len(seen) != 3 || !seen[2].NewestEntry || seen[0].NewestEntry {
+		t.Fatalf("model saw %+v", seen)
+	}
+	// The model pointing at the WATER with grams is overruled in code.
+	h.model.fn = func(ModelInput) string {
+		var waterID string
+		for _, e := range h.svc.journal.Entries() {
+			for _, id := range e.ItemIDs {
+				if it, _ := h.svc.journal.Item(id); it.Name == "Water" {
+					waterID = id
+				}
+			}
+		}
+		return correctOut(waterID, "200", "null", "null")
+	}
+	r2 := decode[LogResponse](t, h.logText("u0000001-0005", "the skyr was 200 g"))
+	if len(r2.Items) != 1 || r2.Items[0].ItemID != skyr.ItemID {
+		t.Fatalf("grams on a drink not redirected: %+v", r2.Items)
+	}
+}
+
+func TestUnitAwareLastWaterThenFoodThenML(t *testing.T) {
+	h := newHarness(t)
+	h.model.fn = func(ModelInput) string { return drink("Water", 500, 0, 0, 0, false) }
+	water := decode[LogResponse](t, h.logText("u0000002-0001", "500 ml water")).Items[0]
+	h.clk.Add(time.Minute)
+	h.model.fn = func(ModelInput) string { return oneItem("Rice", 200, 260, 5, false) }
+	h.logText("u0000002-0002", "rice")
+	h.clk.Add(time.Minute)
+	h.model.fn = func(ModelInput) string { return correctOut("last", "null", "300", "null") }
+	r := decode[LogResponse](t, h.logText("u0000002-0003", "it was only 300 ml"))
+	if len(r.Items) != 1 || r.Items[0].ItemID != water.ItemID || r.Items[0].Effective.VolumeML.float() != 300 {
+		t.Fatalf("corrected %+v", r.Items)
+	}
+}
+
+func TestUnitAwareLastShareFixesTheNewest(t *testing.T) {
+	h := newHarness(t)
+	h.model.fn = func(ModelInput) string { return oneItem("Rice", 200, 260, 5, false) }
+	h.logText("u0000003-0001", "rice")
+	h.clk.Add(time.Minute)
+	h.model.fn = func(ModelInput) string { return drink("Juice", 300, 130, 0, 0, false) }
+	juice := decode[LogResponse](t, h.logText("u0000003-0002", "juice")).Items[0]
+	h.clk.Add(time.Minute)
+	h.model.fn = func(ModelInput) string { return correctOut("last", "null", "null", "0.5") }
+	r := decode[LogResponse](t, h.logText("u0000003-0003", "only half"))
+	if len(r.Items) != 1 || r.Items[0].ItemID != juice.ItemID || r.Items[0].Effective.VolumeML.float() != 150 {
+		t.Fatalf("corrected %+v", r.Items)
+	}
+}
+
+func TestUnitAwareLastNoMatchWritesNothing(t *testing.T) {
+	h := newHarness(t)
+	h.model.fn = func(ModelInput) string { return drink("Water", 500, 0, 0, 0, false) }
+	h.logText("u0000004-0001", "water")
+	h.clk.Add(time.Minute)
+	n := len(h.vars.rows("var-food"))
+	h.model.fn = func(ModelInput) string { return correctOut("last", "100", "null", "null") }
+	r := decode[LogResponse](t, h.logText("u0000004-0002", "no, that was 100 g"))
+	if len(r.Items) != 0 || len(h.vars.rows("var-food")) != n || !strings.HasPrefix(r.Blocks[0].Text, "Which item do you mean?") {
+		t.Fatalf("items %+v text %q", r.Items, r.Blocks[0].Text)
+	}
+	// Yesterday's food is not "today": grams still find nothing.
+	h2 := newHarness(t)
+	h2.model.fn = func(ModelInput) string { return oneItem("Rice", 200, 260, 5, false) }
+	b, _ := json.Marshal(map[string]string{"client_id": "u0000004-0003", "text": "rice", "local_time": "2026-09-30T19:00:00+02:00"})
+	h2.do("POST", "/fuel/log", bytes.NewReader(b), "application/json")
+	h2.model.fn = func(ModelInput) string { return correctOut("last", "100", "null", "null") }
+	n2 := len(h2.vars.rows("var-food"))
+	if r := decode[LogResponse](t, h2.logText("u0000004-0004", "that was 100 g")); len(r.Items) != 0 || len(h2.vars.rows("var-food")) != n2 {
+		t.Fatalf("reached yesterday: %+v", r.Items)
+	}
+}
+
+func TestRecentCarriesIntakeAmounts(t *testing.T) {
+	h := newHarness(t)
+	h.model.fn = func(ModelInput) string { return drink("Beer", 330, 140, 0, 13, true) }
+	b := decode[LogResponse](t, h.logText("u0000005-0001", "a beer")).Items[0]
+	h.model.fn = func(ModelInput) string { return drink("Flat white", 200, 120, 130, 0, false) }
+	h.logText("u0000005-0002", "flat white")
+	h.mutate("fraction", "u0000005-0003", b.ItemID, f64(0.5))
+	raw := h.do("GET", "/fuel/recent", nil, "").Body.String()
+	got := map[string]RecentItem{}
+	for _, it := range decode[recentResp](t, h.do("GET", "/fuel/recent", nil, "")).Items {
+		got[it.Item] = it
+	}
+	beer, fw := got["Beer"], got["Flat white"]
+	if beer.AlcoholG == nil || *beer.AlcoholG != 6.5 || *beer.VolumeML != 165 || beer.CaffeineMG != nil {
+		t.Fatalf("beer %+v", beer)
+	}
+	if fw.CaffeineMG == nil || *fw.CaffeineMG != 130 || fw.AlcoholG != nil || *fw.VolumeML != 200 {
+		t.Fatalf("flat white %+v", fw)
+	}
+	for _, k := range []string{`"caffeine_mg":`, `"alcohol_g":`, `"volume_ml":`, `"macros":`} {
+		if !strings.Contains(raw, k) {
+			t.Fatalf("recent JSON lacks %s", k)
+		}
+	}
+}
+
+func TestShareByItemIDCannotReachPastAnEmptyNewestEntry(t *testing.T) {
+	h := newHarness(t)
+	h.model.fn = func(ModelInput) string { return oneItem("Rice", 200, 260, 5, false) }
+	rice := decode[LogResponse](t, h.logText("u1000001-0001", "rice")).Items[0]
+	h.clk.Add(time.Minute)
+	h.model.fn = func(ModelInput) string { return `{"intent":"question","items":[],"text":"","widgets":[]}` }
+	photoOnlyLog(t, h, "u1000001-0002")
+	h.clk.Add(time.Minute)
+	h.model.fn = func(ModelInput) string { return correctOut(rice.ItemID, "null", "null", "0.5") }
+	n := len(h.vars.rows("var-food"))
+	if r := decode[LogResponse](t, h.logText("u1000001-0003", "only half")); len(r.Items) != 0 || len(h.vars.rows("var-food")) != n {
+		t.Fatalf("share by id reached the older rice: %+v", r.Items)
+	}
+	// Naming it still works.
+	h.model.fn = func(ModelInput) string { return correctOut("rice", "null", "null", "0.5") }
+	if r := decode[LogResponse](t, h.logText("u1000001-0004", "only half of the rice")); len(r.Items) != 1 || r.Items[0].ItemID != rice.ItemID {
+		t.Fatalf("named share: %+v", r.Items)
+	}
+}
+
+func TestUnitsForSupplements(t *testing.T) {
+	h := newHarness(t)
+	h.model.fn = func(ModelInput) string {
+		return `{"intent":"log","items":[
+ {"item":"Fish oil","kind":"supplement","staple_key":null,"portion_g":null,"portion_basis":"stated","kcal":45,"protein_g":0,"carbs_g":0,"net_carbs_g":null,"fat_g":5,"sat_fat_g":1,"fiber_g":0,"needs_fraction":false,"volume_ml":5,"caffeine_mg":null,"alcohol_g":null},
+ {"item":"Creatine","kind":"supplement","staple_key":null,"portion_g":5,"portion_basis":"stated","kcal":0,"protein_g":0,"carbs_g":0,"net_carbs_g":null,"fat_g":0,"sat_fat_g":0,"fiber_g":0,"needs_fraction":false,"volume_ml":null,"caffeine_mg":null,"alcohol_g":null}],"text":"","widgets":[]}`
+	}
+	l := decode[LogResponse](t, h.logText("u1000002-0001", "fish oil and creatine"))
+	h.clk.Add(time.Minute)
+	var seen []LastItem
+	h.model.fn = func(in ModelInput) string { seen = in.LastItems; return correctOut("last", "null", "10", "null") }
+	r := decode[LogResponse](t, h.logText("u1000002-0002", "the oil was 10 ml"))
+	if len(r.Items) != 1 || r.Items[0].ItemID != l.Items[0].ItemID {
+		t.Fatalf("ml went to %+v", r.Items)
+	}
+	u := map[string]string{}
+	for _, li := range seen {
+		u[li.Item] = strings.Join(li.Units, ",")
+	}
+	if u["Fish oil"] != "ml" || u["Creatine"] != "g" {
+		t.Fatalf("units %v", u)
+	}
+	h.model.fn = func(ModelInput) string { return correctOut("last", "3", "null", "null") }
+	if r := decode[LogResponse](t, h.logText("u1000002-0003", "creatine was 3 g")); len(r.Items) != 1 || r.Items[0].ItemID != l.Items[1].ItemID {
+		t.Fatalf("grams went to %+v", r.Items)
+	}
+}
+
+func TestResolutionBoundaries(t *testing.T) {
+	// Food in entry 9 (counting back) is out of reach; in entry 8 it is found.
+	for _, drinksAfter := range []int{7, 8} {
+		h := newHarness(t)
+		h.model.fn = func(ModelInput) string { return oneItem("Rice", 200, 260, 5, false) }
+		rice := decode[LogResponse](t, h.logText(fmt.Sprintf("u10003%02d-0000", drinksAfter), "rice")).Items[0]
+		h.model.fn = func(ModelInput) string { return drink("Water", 250, 0, 0, 0, false) }
+		for i := 0; i < drinksAfter; i++ {
+			h.clk.Add(time.Minute)
+			h.logText(fmt.Sprintf("u10003%02d-%04d", drinksAfter, i+1), "water")
+		}
+		h.clk.Add(time.Minute)
+		h.model.fn = func(ModelInput) string { return correctOut("last", "100", "null", "null") }
+		r := decode[LogResponse](t, h.logText(fmt.Sprintf("u10003%02d-9999", drinksAfter), "100 g"))
+		found := len(r.Items) == 1 && r.Items[0].ItemID == rice.ItemID
+		if found != (drinksAfter == 7) {
+			t.Fatalf("rice behind %d drink entries: found=%v", drinksAfter, found)
+		}
+	}
+	// A wrong unit by NAME and a food id with ml are re-picked by unit.
+	h := newHarness(t)
+	h.model.fn = func(ModelInput) string { return drink("Water", 500, 0, 0, 0, false) }
+	water := decode[LogResponse](t, h.logText("u1000004-0001", "water")).Items[0]
+	h.clk.Add(time.Minute)
+	h.model.fn = func(ModelInput) string { return oneItem("Rice", 200, 260, 5, false) }
+	rice := decode[LogResponse](t, h.logText("u1000004-0002", "rice")).Items[0]
+	h.clk.Add(time.Minute)
+	h.model.fn = func(ModelInput) string { return correctOut("water", "100", "null", "null") }
+	if r := decode[LogResponse](t, h.logText("u1000004-0003", "100 g")); len(r.Items) != 1 || r.Items[0].ItemID != rice.ItemID {
+		t.Fatalf("grams by drink name: %+v", r.Items)
+	}
+	h.model.fn = func(ModelInput) string { return correctOut(rice.ItemID, "null", "300", "null") }
+	if r := decode[LogResponse](t, h.logText("u1000004-0004", "300 ml")); len(r.Items) != 1 || r.Items[0].ItemID != water.ItemID {
+		t.Fatalf("ml by food id: %+v", r.Items)
+	}
+	// The prompt list: at most 20 items, newest last.
+	h.model.fn = func(ModelInput) string { return drink("Water", 250, 0, 0, 0, false) }
+	for i := 0; i < 3; i++ {
+		h.clk.Add(time.Minute)
+		h.logText(fmt.Sprintf("u1000004-01%02d", i), "water")
+	}
+	li := h.svc.lastItems()
+	if li[len(li)-1].Item != "Water" || li[0].ItemID != water.ItemID || len(li) > 20 {
+		t.Fatalf("order %+v", li)
+	}
+}
+
+func TestRecentIntakeJSONNullVersusZero(t *testing.T) {
+	h := newHarness(t)
+	h.model.fn = func(ModelInput) string { return drink("Cold brew", 300, 10, 200, 0, true) }
+	c := decode[LogResponse](t, h.logText("u1000005-0001", "cold brew")).Items[0]
+	h.mutate("fraction", "u1000005-0002", c.ItemID, f64(0.5))
+	h.model.fn = func(ModelInput) string { return oneItem("Rice", 200, 260, 5, false) }
+	h.logText("u1000005-0003", "rice")
+	var out struct {
+		Items []map[string]json.RawMessage `json:"items"`
+	}
+	_ = json.Unmarshal(h.do("GET", "/fuel/recent", nil, "").Body.Bytes(), &out)
+	for _, it := range out.Items {
+		var name string
+		_ = json.Unmarshal(it["item"], &name)
+		for _, k := range []string{"caffeine_mg", "alcohol_g", "volume_ml"} {
+			if _, ok := it[k]; !ok {
+				t.Fatalf("%s lacks top-level %s", name, k)
+			}
+		}
+		switch name {
+		case "Cold brew":
+			if string(it["caffeine_mg"]) != "100" || string(it["volume_ml"]) != "150" || string(it["alcohol_g"]) != "null" {
+				t.Fatalf("cold brew %s %s %s", it["caffeine_mg"], it["volume_ml"], it["alcohol_g"])
+			}
+		case "Rice":
+			if string(it["caffeine_mg"]) != "null" || string(it["volume_ml"]) != "null" {
+				t.Fatalf("rice %s %s", it["caffeine_mg"], it["volume_ml"])
+			}
+		}
+	}
+}
+
+func TestLastItemsKeepsTheNewest20InOrder(t *testing.T) {
+	h := newHarness(t)
+	var all []string
+	for e := 0; e < 3; e++ {
+		var parts []string
+		for i := 0; i < 8; i++ {
+			parts = append(parts, fmt.Sprintf(`{"item":"Food %d-%d","kind":"food","staple_key":null,"portion_g":100,"portion_basis":"stated","kcal":100,"protein_g":5,"carbs_g":10,"net_carbs_g":null,"fat_g":2,"sat_fat_g":1,"fiber_g":1,"needs_fraction":false,"volume_ml":null,"caffeine_mg":null,"alcohol_g":null}`, e, i))
+		}
+		out := `{"intent":"log","items":[` + strings.Join(parts, ",") + `],"text":"","widgets":[]}`
+		h.model.fn = func(ModelInput) string { return out }
+		r := decode[LogResponse](t, h.logText(fmt.Sprintf("u2000001-%04d", e), "eight foods"))
+		for _, it := range r.Items {
+			all = append(all, it.ItemID)
+		}
+		h.clk.Add(time.Minute)
+	}
+	li := h.svc.lastItems()
+	want := all[len(all)-20:]
+	if len(li) != 20 {
+		t.Fatalf("%d items", len(li))
+	}
+	for i := range want {
+		if li[i].ItemID != want[i] {
+			t.Fatalf("position %d: %s want %s", i, li[i].ItemID, want[i])
+		}
+	}
+}
+
+func TestRecentZeroStaysZeroUnknownStaysNull(t *testing.T) {
+	h := newHarness(t)
+	h.model.fn = func(ModelInput) string {
+		return `{"intent":"log","items":[{"item":"Decaf","kind":"drink","staple_key":null,"portion_g":null,"portion_basis":"stated","kcal":5,"protein_g":0,"carbs_g":0,"net_carbs_g":null,"fat_g":0,"sat_fat_g":0,"fiber_g":0,"needs_fraction":false,"volume_ml":200,"caffeine_mg":0,"alcohol_g":0}],"text":"","widgets":[]}`
+	}
+	h.logText("u2000002-0001", "decaf")
+	h.model.fn = func(ModelInput) string { return oneItem("Rice", 200, 260, 5, false) }
+	h.logText("u2000002-0002", "rice")
+	rec := h.do("GET", "/fuel/recent", nil, "")
+	if rec.Code != 200 {
+		t.Fatal(rec.Code)
+	}
+	var out struct {
+		Items []map[string]json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]map[string]json.RawMessage{}
+	for _, it := range out.Items {
+		var n string
+		_ = json.Unmarshal(it["item"], &n)
+		got[n] = it
+	}
+	d, r := got["Decaf"], got["Rice"]
+	if d == nil || r == nil {
+		t.Fatalf("items %v", got)
+	}
+	if string(d["caffeine_mg"]) != "0" || string(d["alcohol_g"]) != "0" || string(d["volume_ml"]) != "200" {
+		t.Fatalf("decaf %s %s %s", d["caffeine_mg"], d["alcohol_g"], d["volume_ml"])
+	}
+	if string(r["caffeine_mg"]) != "null" || string(r["alcohol_g"]) != "null" || string(r["volume_ml"]) != "null" {
+		t.Fatalf("rice %s %s %s", r["caffeine_mg"], r["alcohol_g"], r["volume_ml"])
 	}
 }

@@ -143,20 +143,26 @@ func shareWords(f float64) string {
 // lastItems are the active items of the newest log entry with items (the
 // model's reference list for "no, that was 100 g").
 func (s *Service) lastItems() []LastItem {
-	newest, ok := s.newestLogEntry()
-	if !ok {
-		return nil
+	items := s.todaysActiveItems()
+	newest, _ := s.newestLogEntry()
+	if len(items) > 20 {
+		items = items[:20] // the 20 newest
 	}
 	var out []LastItem
-	for _, id := range newest.ItemIDs {
-		it, ok := s.journal.Item(id)
-		if !ok || !s.itemActive(it) {
-			continue
-		}
-		li := LastItem{ItemID: it.ID, Item: it.Name, Kind: it.KindOr(), PortionG: it.PortionG}
-		if it.Orig.VolumeML.OK {
+	for i := len(items) - 1; i >= 0; i-- { // newest last
+		it := items[i]
+		li := LastItem{ItemID: it.ID, Item: it.Name, Kind: it.KindOr(), PortionG: it.PortionG, NewestEntry: it.EntryID == newest.ID}
+		if it.Orig.VolumeML.OK && it.Orig.VolumeML.V > 0 {
 			v := it.Orig.VolumeML.float()
 			li.VolumeML = &v
+		}
+		// The units this item can be corrected in, exactly as the server
+		// checks them (fitsUnit).
+		if fitsUnit(it, unitGrams) {
+			li.Units = append(li.Units, "g")
+		}
+		if fitsUnit(it, unitML) {
+			li.Units = append(li.Units, "ml")
 		}
 		out = append(out, li)
 	}
@@ -195,14 +201,90 @@ func (s *Service) itemActive(it Item) bool {
 	return true
 }
 
-// resolveRef finds the item a chat correction means: "last" = the newest
-// active item of the newest log entry; an item_id; else an item name among
-// the active items of recent log entries (exact normalized match first,
-// then containment), newest first.
-func (s *Service) resolveRef(ref string) (Item, bool) {
+// Units of a chat correction (spec 15.2, v4.1).
+const (
+	unitGrams = "g"
+	unitML    = "ml"
+	unitShare = "share"
+)
+
+func correctionUnit(c ModelCorrection) string {
+	switch {
+	case c.PortionG != nil:
+		return unitGrams
+	case c.VolumeML != nil:
+		return unitML
+	}
+	return unitShare
+}
+
+// fitsUnit: a grams correction needs an item with a portion in grams that
+// is not a drink; a ml correction needs an item with a volume; a share fits
+// anything.
+func fitsUnit(it Item, unit string) bool {
+	switch unit {
+	case unitShareAnyName:
+		return true
+	case unitGrams:
+		return it.PortionG != nil && *it.PortionG > 0 && it.KindOr() != "drink"
+	case unitML:
+		return it.Orig.VolumeML.OK && it.Orig.VolumeML.V > 0
+	}
+	return true
+}
+
+const lastSearchEntries = 8
+
+// todaysActiveItems are the active items of today's newest log entries
+// (at most lastSearchEntries entries), newest first.
+func (s *Service) todaysActiveItems() []Item {
+	today := s.today()
+	entries := s.journal.Entries()
+	sort.Slice(entries, func(a, b int) bool { return entries[a].CreatedAt.After(entries[b].CreatedAt) })
+	var out []Item
+	n := 0
+	for _, e := range entries {
+		if e.Intent != "log" || e.Date != today {
+			continue
+		}
+		n++
+		if n > lastSearchEntries {
+			break
+		}
+		for i := len(e.ItemIDs) - 1; i >= 0; i-- {
+			if it, ok := s.journal.Item(e.ItemIDs[i]); ok && s.itemActive(it) {
+				out = append(out, it)
+			}
+		}
+	}
+	return out
+}
+
+// resolveRef finds the item a chat correction means, UNIT-AWARE (v4.1):
+//   - "last" with grams: the newest active item of today's last entries that
+//     has a portion in grams (not a drink); with ml: the newest that has a
+//     volume; share only: the newest active item of the newest log entry.
+//   - an item_id, else an item name among recent active items (exact
+//     normalized match, then containment), newest first; a named item whose
+//     unit does not fit falls back to the unit-aware "last".
+func (s *Service) resolveRef(ref, unit string) (Item, bool) {
 	ref = strings.TrimSpace(ref)
+	if strings.EqualFold(ref, "last") {
+		return s.resolveLast(unit)
+	}
 	if it, ok := s.journal.Item(ref); ok && s.itemActive(it) {
-		return it, true
+		// An item_id is how the model points at an item it was shown; for a
+		// share-only ("only half") it must still be in the newest entry,
+		// otherwise "only half" could reach past a newer, empty entry.
+		if unit == unitShare {
+			if e, ok := s.newestLogEntry(); !ok || e.ID != it.EntryID {
+				return s.resolveLast(unit)
+			}
+		}
+		if fitsUnit(it, unit) {
+			return it, true
+		}
+		return s.resolveLast(unit)
 	}
 	entries := s.journal.Entries()
 	sort.Slice(entries, func(a, b int) bool { return entries[a].CreatedAt.After(entries[b].CreatedAt) })
@@ -221,9 +303,43 @@ func (s *Service) resolveRef(ref string) (Item, bool) {
 			break
 		}
 	}
-	if strings.EqualFold(ref, "last") {
-		// Only the newest log entry (even an empty one): its newest active
-		// item, else nothing.
+	n := normName(ref)
+	match := func(exact bool) (Item, bool) {
+		for _, it := range cands {
+			in := normName(it.Name)
+			if (exact && in == n) || (!exact && (strings.Contains(in, n) || strings.Contains(n, in))) {
+				return it, true
+			}
+		}
+		return Item{}, false
+	}
+	it, ok := match(true)
+	if !ok {
+		it, ok = match(false)
+	}
+	if !ok {
+		return Item{}, false
+	}
+	if !fitsUnit(it, unit) {
+		return s.resolveLast(unit)
+	}
+	return it, true
+}
+
+// refKnown reports whether a ref names an existing active item at all
+// (ignoring units).
+func (s *Service) refKnown(ref string) bool {
+	_, ok := s.resolveRef(ref, unitShareAnyName)
+	return ok
+}
+
+// unitShareAnyName resolves names and ids without a unit check.
+const unitShareAnyName = "any"
+
+func (s *Service) resolveLast(unit string) (Item, bool) {
+	if unit == unitShare {
+		// The newest active item of the newest log entry (an empty newest
+		// entry, such as a no-food photo, resolves to nothing).
 		e, ok := s.newestLogEntry()
 		if !ok {
 			return Item{}, false
@@ -235,19 +351,23 @@ func (s *Service) resolveRef(ref string) (Item, bool) {
 		}
 		return Item{}, false
 	}
-	n := normName(ref)
-	for _, it := range cands {
-		if normName(it.Name) == n {
-			return it, true
-		}
-	}
-	for _, it := range cands {
-		in := normName(it.Name)
-		if strings.Contains(in, n) || strings.Contains(n, in) {
+	for _, it := range s.todaysActiveItems() {
+		if fitsUnit(it, unit) {
 			return it, true
 		}
 	}
 	return Item{}, false
+}
+
+// whichItemText asks back when no item fits the correction (no write).
+func whichItemText(unit string) string {
+	switch unit {
+	case unitGrams:
+		return "Which item do you mean? I found no food in grams today; name it, for example \"the rice was 100 g\"."
+	case unitML:
+		return "Which drink do you mean? I found no drink with a volume today; name it, for example \"the water was 300 ml\"."
+	}
+	return "Which item do you mean? Name it, for example \"only half of the pasta\"."
 }
 
 // chatFix is one resolved correction of a chat message.
@@ -276,9 +396,14 @@ func (s *Service) planChatCorrections(ctx context.Context, cs []ModelCorrection)
 	seen := map[string]bool{}
 	var notes []string
 	for _, c := range cs {
-		it, ok := s.resolveRef(c.Ref)
+		unit := correctionUnit(c)
+		it, ok := s.resolveRef(c.Ref, unit)
 		if !ok {
-			notes = append(notes, "I could not find "+c.Ref+" to correct.")
+			if strings.EqualFold(strings.TrimSpace(c.Ref), "last") || s.refKnown(c.Ref) {
+				notes = append(notes, whichItemText(unit)) // no item fits the unit
+			} else {
+				notes = append(notes, "I could not find "+c.Ref+" to correct.")
+			}
 			continue
 		}
 		if seen[it.ID] {
