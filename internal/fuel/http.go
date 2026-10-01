@@ -50,6 +50,8 @@ func errf(status int, code string, retry bool, format string, a ...any) *apiErro
 	return &apiError{status: status, code: code, msg: fmt.Sprintf(format, a...), retryable: retry}
 }
 
+func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -150,10 +152,13 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("POST /fuel/log", s.handleLog)
 	mux.HandleFunc("POST /fuel/undo", func(w http.ResponseWriter, r *http.Request) { s.handleMutation(w, r, "undo") })
 	mux.HandleFunc("POST /fuel/fraction", func(w http.ResponseWriter, r *http.Request) { s.handleMutation(w, r, "fraction") })
+	mux.HandleFunc("POST /fuel/fix", func(w http.ResponseWriter, r *http.Request) { s.handleMutation(w, r, "fix") })
 	mux.HandleFunc("GET /fuel/entry/{id}", s.handleEntry)
 	mux.HandleFunc("GET /fuel/feed", s.handleFeed)
 	mux.HandleFunc("GET /fuel/photo/{id}", s.handlePhoto)
 	mux.HandleFunc("GET /fuel/snapshot", s.handleSnapshot)
+	mux.HandleFunc("GET /fuel/recent", s.handleRecent)
+	mux.HandleFunc("POST /fuel/relog", s.handleRelog)
 	mux.HandleFunc("/fuel/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errf(http.StatusNotFound, "not_found", false, "no such route"))
 	})
@@ -578,7 +583,7 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 	tModel := time.Now()
 	fresh.Wait() // the model sees the refreshed day (questions answer from it)
 	preSnap, _ := s.snapshotFor(date)
-	mi := ModelInput{Text: foodText, Staples: s.staples, Snapshot: &preSnap}
+	mi := ModelInput{Text: foodText, Staples: s.staples, Snapshot: &preSnap, LastItems: s.lastItems()}
 	for _, p := range imgs {
 		mi.Images = append(mi.Images, p.Model)
 	}
@@ -612,6 +617,11 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 		// Before the first Variables write: nothing is journaled, a retry with
 		// the same client_id runs again.
 		writeErr(w, errf(http.StatusGatewayTimeout, "timeout", true, "took too long; nothing was written, retry"))
+		return
+	}
+	if out.Intent == "correct" {
+		s.finishCorrect(ctx, w, out, in.ClientID, hash, foodText, date, now, t0,
+			map[string]int{"upload": ms(upload), "asr": ms(asrD), "model": ms(modelD)})
 		return
 	}
 
@@ -820,6 +830,25 @@ func (s *Service) journalHas(entryID string) bool {
 	return ok
 }
 
+// correctBlocks renders a chat correction: the code-generated summary with
+// the status line, then macros_today with what the corrections changed.
+func correctBlocks(s *Service, e Entry, snap Snapshot) []Block {
+	var ms []Macros
+	for _, id := range e.FixOps {
+		// Only the deltas of the displayed day; others are named in the text.
+		if op, ok := s.journal.Op(id); ok && op.State != OpFailed && op.Date == snap.Date {
+			ms = append(ms, op.Macros)
+		}
+	}
+	// The summary is its own block (re-rendered from the ops' current state
+	// wherever it is shown, the feed included), then the status line.
+	blocks := []Block{textBlock(s.correctSummary(e)), textBlock(statusSentence(snap))}
+	if b, ok := widgetBlock("macros_today", snap, addedOf(ms)); ok {
+		blocks = append(blocks, b)
+	}
+	return blocks
+}
+
 // noFoodText answers a caption-less photo in which no food was seen.
 const noFoodText = "I could not see any food in that photo. Add a word about what it is."
 
@@ -843,6 +872,15 @@ func (s *Service) buildLogResponse(e Entry) (LogResponse, string) {
 	blocks := []Block{textBlock(statusSentence(snap))}
 	if e.NoFood {
 		blocks = []Block{textBlock(noFoodText)}
+	}
+	if e.Intent == "correct" {
+		blocks = correctBlocks(s, e, snap)
+		photos := e.PhotoIDs
+		if photos == nil {
+			photos = []string{}
+		}
+		return LogResponse{Status: s.entryStatus(e), EntryID: e.ID, Intent: e.Intent, Transcript: e.Transcript, PhotoIDs: photos,
+			Items: states, Blocks: blocks, Snapshot: snap}, s.entryStatus(e)
 	}
 	if e.ModelText != "" {
 		blocks = append(blocks, textBlock(e.ModelText))
@@ -950,7 +988,7 @@ func (s *Service) buildItems(out *ModelOutput, e Entry) []Item {
 	var items []Item
 	for _, mi := range out.Items {
 		it := Item{ID: newID("it_"), EntryID: e.ID, Date: e.Date, Name: strings.TrimSpace(mi.Item),
-			PortionG: mi.PortionG, Basis: mi.PortionBasis, NeedsFraction: mi.NeedsFraction, EatenAt: e.EatenAt}
+			PortionG: mi.PortionG, Basis: mi.PortionBasis, NeedsFraction: mi.NeedsFraction, EatenAt: e.EatenAt, Kind: mi.Kind}
 		// net_carbs_g is derived from the UNROUNDED carbs and fibre, then every
 		// field is rounded once.
 		net := mi.NetCarbsG
@@ -973,11 +1011,16 @@ func (s *Service) buildItems(out *ModelOutput, e Entry) []Item {
 					it.PortionG = &g
 					it.StapleKey = st.Key
 					m = st.macros(g)
+					it.Kind = "food"
 					break
 				}
 			}
 		}
 		m.normalizeNetCarbs()
+		m.VolumeML, m.CaffeineMG, m.AlcoholG = tenthFromPtr(mi.VolumeML), tenthFromPtr(mi.CaffeineMG), tenthFromPtr(mi.AlcoholG)
+		if it.Kind == "" {
+			it.Kind = "food"
+		}
 		it.Orig = m
 		items = append(items, it)
 	}
@@ -988,12 +1031,16 @@ func (s *Service) buildItems(out *ModelOutput, e Entry) []Item {
 // that outlives the budget continues durably; the status is then pending.
 func (s *Service) runOps(ctx context.Context, ops []Op) string {
 	done := make(chan struct{})
+	// Registered synchronously, before any goroutine runs: Close always
+	// waits for these writes, even if the request returns at once.
+	s.writers.Add(len(ops))
 	go func() {
 		var wg sync.WaitGroup
 		for _, op := range ops {
 			wg.Add(1)
 			go func(op Op) {
 				defer wg.Done()
+				defer s.writers.Done()
 				s.postOp(context.Background(), op, true)
 			}(op)
 		}
@@ -1021,6 +1068,16 @@ func (s *Service) runOps(ctx context.Context, ops []Op) string {
 		return StatusPending
 	}
 	return StatusDone
+}
+
+func fixTgtString(t FixTarget) string {
+	f := func(p *float64) string {
+		if p == nil {
+			return "-"
+		}
+		return fmt.Sprintf("%g", *p)
+	}
+	return f(t.Share) + "|" + f(t.PortionG) + "|" + f(t.VolumeML)
 }
 
 // requiredKnown fills a null in a field the Food log schema requires with 0
@@ -1057,6 +1114,9 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		ClientID string   `json:"client_id"`
 		ItemID   string   `json:"item_id"`
 		Fraction *float64 `json:"fraction"`
+		PortionG *float64 `json:"portion_g"`
+		VolumeML *float64 `json:"volume_ml"`
+		Share    *float64 `json:"share"`
 	}
 	err := decodeStrict(r.Body, &body)
 	_ = rc.SetReadDeadline(time.Time{})
@@ -1086,12 +1146,31 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		}
 		f = *body.Fraction
 	} else if body.Fraction != nil {
-		writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "undo takes no fraction"))
+		writeErr(w, errf(http.StatusBadRequest, "bad_input", false, kind+" takes no fraction"))
+		return
+	}
+	fixTgt := FixTarget{Share: body.Share, PortionG: body.PortionG, VolumeML: body.VolumeML}
+	if kind == "fix" {
+		if fixTgt.count() != 1 {
+			writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "give exactly one of portion_g, volume_ml or share"))
+			return
+		}
+		for _, p := range []*float64{fixTgt.Share, fixTgt.PortionG, fixTgt.VolumeML} {
+			if p != nil && (*p <= 0 || *p > 5000 || (fixTgt.Share != nil && *p > 4)) {
+				writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "amount out of range"))
+				return
+			}
+		}
+	} else if fixTgt.count() != 0 {
+		writeErr(w, errf(http.StatusBadRequest, "bad_input", false, kind+" takes no amount"))
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.o.Budget)
 	defer cancel()
 	hash := fmt.Sprintf("%s|%s|%g", kind, body.ItemID, f)
+	if kind == "fix" {
+		hash = fmt.Sprintf("fix|%s|%s", body.ItemID, fixTgtString(fixTgt))
+	}
 	claim, ce := s.claim(ctx, body.ClientID, kind, hash)
 	if ce != nil {
 		writeErr(w, ce)
@@ -1158,22 +1237,56 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 	}
 	dayRows, _, _ := s.cache.Rows(it.Date)
 	ic, origRow, _ := itemContrib(dayRows, it.ID)
-	if kind == "undo" {
+	switch kind {
+	case "undo":
 		// Cancels the known sum of every field; deleted outside = zeros.
 		o := s.newCorrectionOp(it, requiredKnown(ic.cancel()), "undo", nil)
 		op = &o
-	} else {
+	case "fix":
+		o, ae := s.absoluteCorrection(it, dayRows, fixTgt, "fix", nil)
+		if ae != nil {
+			l.Unlock()
+			writeErr(w, ae)
+			return
+		}
+		if o == nil {
+			// Already counted at that amount: nothing to write, but the
+			// request identity is journaled so a retry replays this answer
+			// (and never writes later, after other changes).
+			ir := &IdentRec{ClientID: body.ClientID, Kind: kind, Hash: hash, ItemID: it.ID, EntryID: it.EntryID, At: now}
+			if err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Ident: ir, At: now}); err != nil {
+				l.Unlock()
+				writeErr(w, errf(http.StatusInternalServerError, "internal", true, "could not persist the request"))
+				return
+			}
+			l.Unlock()
+			resp := s.mutationResponse(it, kind, 0, nil)
+			if resp.renderErr != nil {
+				writeErr(w, errf(http.StatusServiceUnavailable, "targets_invalid", false, "targets invalid"))
+				return
+			}
+			b, _ := json.Marshal(resp)
+			_ = s.idem.Put(idemRec{ClientID: body.ClientID, Hash: hash, Kind: kind, At: now, EntryID: it.EntryID, ItemID: it.ID, Status: http.StatusOK, Response: b})
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+		op = o
+	default:
 		choice = &FractionChoice{ItemID: it.ID, F: f, ClientID: body.ClientID, Hash: hash, At: now}
-		// f < 1 corrects the authoritative original; if that row was deleted
-		// outside, the choice is recorded without a row (nothing to scale).
-		if f < 1 && origRow.Data != nil {
-			base := macrosFromData(origRow.Data)
-			base.normalizeNetCarbs()
+		// Absolute against the authoritative original (share f); if that
+		// row was deleted outside, the choice is recorded without a row.
+		if origRow.Data != nil {
 			fc := f
-			o := s.newCorrectionOp(it, requiredKnown(base.Scale(-(1 - f))), "fraction", &fc)
-			op = &o
+			o, ae := s.absoluteCorrection(it, dayRows, FixTarget{Share: &fc}, "fraction", &fc)
+			if ae != nil {
+				l.Unlock()
+				writeErr(w, ae) // e.g. undone by the agentd food-log: nothing journaled
+				return
+			}
+			op = o
 		}
 	}
+	_ = ic
 	rec := journalRec{T: "txn", Fraction: choice, At: now}
 	if op != nil {
 		op.ClientID, op.ReqHash = body.ClientID, hash
@@ -1257,9 +1370,12 @@ func (s *Service) mutationResponseLocked(it Item, kind string, f float64, op *Op
 		added = addedOf(nil)
 	}
 	var lead string
-	if kind == "undo" {
+	switch kind {
+	case "undo":
 		lead = "Removed " + it.Name + "."
-	} else {
+	case "fix":
+		lead = describeFix(it, op)
+	default:
 		lead = fmt.Sprintf("Counted %s of %s.", fractionWords(f), it.Name)
 	}
 	blocks := []Block{textBlock(lead + " " + statusSentence(snap))}
@@ -1410,7 +1526,9 @@ func (s *Service) writeEntry(w http.ResponseWriter, e Entry) {
 	if e.NoFood {
 		blocks = []Block{textBlock(noFoodText)}
 	}
-	if b, ok := widgetBlock("macros_today", snap, addedOf(effs)); ok {
+	if e.Intent == "correct" {
+		blocks = correctBlocks(s, e, snap)
+	} else if b, ok := widgetBlock("macros_today", snap, addedOf(effs)); ok {
 		blocks = append(blocks, b)
 	}
 	status := s.entryStatus(e)
@@ -1513,6 +1631,14 @@ func (s *Service) handleFeed(w http.ResponseWriter, r *http.Request) {
 	out := make([]feedOut, 0, len(page))
 	for _, it := range page {
 		fo := feedOut{ID: it.ID, At: it.At, Role: it.Role, Text: it.Text, PhotoIDs: it.PhotoIDs, EntryID: it.EntryID, Items: []ItemState{}, Blocks: it.Blocks}
+		if it.EntryID != nil && it.Role == "fuel" && len(fo.Blocks) > 0 && fo.Blocks[0].Type == "text" {
+			if e, ok := s.journal.Entry(*it.EntryID); ok && e.Intent == "correct" && it.Key == "r:"+e.ID {
+				// A correction reply shows its ops' CURRENT state.
+				blocks := append([]Block(nil), fo.Blocks...)
+				blocks[0].Text = s.correctSummary(e)
+				fo.Blocks = blocks
+			}
+		}
 		if it.ShowItems && it.EntryID != nil {
 			if e, ok := s.journal.Entry(*it.EntryID); ok {
 				fo.Items = s.itemStates(e) // CURRENT state

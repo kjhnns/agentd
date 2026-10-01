@@ -86,6 +86,14 @@ func (t *tenth) UnmarshalJSON(b []byte) error {
 // MacroKeys is the fixed order of the macro fields a row carries.
 var MacroKeys = []string{"kcal", "protein_g", "carbs_g", "net_carbs_g", "fat_g", "sat_fat_g", "fiber_g"}
 
+// IntakeKeys are the additive non-macro amounts a row may carry (drinks and
+// supplements, spec section 15): omitted when unknown, negated in
+// corrections like macros.
+var IntakeKeys = []string{"volume_ml", "caffeine_mg", "alcohol_g"}
+
+// AllKeys is MacroKeys then IntakeKeys, the order of Macros.fields().
+var AllKeys = append(append([]string{}, MacroKeys...), IntakeKeys...)
+
 // Macros is one row's (or one contribution's) macro set.
 type Macros struct {
 	Kcal     tenth `json:"kcal"`
@@ -95,10 +103,14 @@ type Macros struct {
 	Fat      tenth `json:"fat_g"`
 	SatFat   tenth `json:"sat_fat_g"`
 	Fiber    tenth `json:"fiber_g"`
+	// Intake amounts (drinks, supplements); null when unknown.
+	VolumeML   tenth `json:"volume_ml"`
+	CaffeineMG tenth `json:"caffeine_mg"`
+	AlcoholG   tenth `json:"alcohol_g"`
 }
 
 func (m *Macros) fields() []*tenth {
-	return []*tenth{&m.Kcal, &m.Protein, &m.Carbs, &m.NetCarbs, &m.Fat, &m.SatFat, &m.Fiber}
+	return []*tenth{&m.Kcal, &m.Protein, &m.Carbs, &m.NetCarbs, &m.Fat, &m.SatFat, &m.Fiber, &m.VolumeML, &m.CaffeineMG, &m.AlcoholG}
 }
 
 // Get returns one macro by key.
@@ -118,6 +130,12 @@ func (m Macros) Get(key string) tenth {
 		return m.SatFat
 	case "fiber_g":
 		return m.Fiber
+	case "volume_ml":
+		return m.VolumeML
+	case "caffeine_mg":
+		return m.CaffeineMG
+	case "alcohol_g":
+		return m.AlcoholG
 	}
 	return tenth{}
 }
@@ -174,7 +192,7 @@ func (m *Macros) normalizeNetCarbs() {
 // Food log schema types net_carbs_g (and portion_g) as number only, so a null
 // value there is OMITTED; only fiber_g may be written as null.
 func (m Macros) putInto(d map[string]any) {
-	for _, k := range MacroKeys {
+	for _, k := range AllKeys {
 		v := m.Get(k)
 		if !v.OK {
 			if k == "fiber_g" {
@@ -204,5 +222,6 @@ func macrosFromData(d map[string]any) Macros {
 	}
 	m.Kcal, m.Protein, m.Carbs, m.NetCarbs = get("kcal"), get("protein_g"), get("carbs_g"), get("net_carbs_g")
 	m.Fat, m.SatFat, m.Fiber = get("fat_g"), get("sat_fat_g"), get("fiber_g")
+	m.VolumeML, m.CaffeineMG, m.AlcoholG = get("volume_ml"), get("caffeine_mg"), get("alcohol_g")
 	return m
 }

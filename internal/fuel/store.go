@@ -46,8 +46,25 @@ type Item struct {
 	Basis         string    `json:"portion_basis"`
 	NeedsFraction bool      `json:"needs_fraction"`
 	StapleKey     string    `json:"staple_key,omitempty"`
+	Kind          string    `json:"kind,omitempty"` // food | drink | supplement
 	Orig          Macros    `json:"macros"`
 	EatenAt       time.Time `json:"eaten_at"`
+}
+
+// FixLine is one line of a chat correction reply: the success text of an
+// op (rendered by the op's CURRENT state), or a note with no op.
+type FixLine struct {
+	OpID   string `json:"op_id,omitempty"`
+	ItemID string `json:"item_id,omitempty"`
+	Text   string `json:"text"`
+}
+
+// KindOr is the item's kind, "food" when unset (items journaled before kinds).
+func (it Item) KindOr() string {
+	if it.Kind == "" {
+		return "food"
+	}
+	return it.Kind
 }
 
 // Entry is one log request's result.
@@ -64,10 +81,14 @@ type Entry struct {
 	Failed     bool      `json:"failed,omitempty"`
 	ReqHash    string    `json:"req_hash,omitempty"` // idempotency hash of the request
 	// What the conversation needs to rebuild this entry's feed lines.
-	UserText  string   `json:"user_text,omitempty"`
-	ModelText string   `json:"model_text,omitempty"`
-	NoFood    bool     `json:"no_food,omitempty"` // a photo-only log where no food was seen
-	Widgets   []string `json:"widgets,omitempty"`
+	UserText  string `json:"user_text,omitempty"`
+	ModelText string `json:"model_text,omitempty"`
+	NoFood    bool   `json:"no_food,omitempty"` // a photo-only log where no food was seen
+	// Intent "correct": the code-generated reply and the correction ops.
+	FixText  string    `json:"fix_text,omitempty"`
+	FixOps   []string  `json:"fix_ops,omitempty"`
+	FixLines []FixLine `json:"fix_lines,omitempty"`
+	Widgets  []string  `json:"widgets,omitempty"`
 }
 
 // Op is one journaled row write.
@@ -105,6 +126,16 @@ type FractionChoice struct {
 	At       time.Time `json:"at"`
 }
 
+// IdentRec is a request identity journaled without a row.
+type IdentRec struct {
+	ClientID string    `json:"client_id"`
+	Kind     string    `json:"kind"`
+	Hash     string    `json:"hash"`
+	ItemID   string    `json:"item_id"`
+	EntryID  string    `json:"entry_id"`
+	At       time.Time `json:"at"`
+}
+
 // journalRec is one line of journal.jsonl. A "txn" line carries everything a
 // request creates (entry, items, ops, fraction choice) so it is durable as a
 // whole or not at all; "attempt" and "state" lines move one op.
@@ -115,10 +146,13 @@ type journalRec struct {
 	Items    []Item          `json:"items,omitempty"`
 	Ops      []Op            `json:"ops,omitempty"`
 	Fraction *FractionChoice `json:"fraction,omitempty"`
-	OpID     string          `json:"op_id,omitempty"`
-	State    string          `json:"state,omitempty"`
-	ValueID  string          `json:"value_id,omitempty"`
-	Attempts int             `json:"attempts,omitempty"`
+	// Ident records a request that wrote nothing (a no-op fix), so its
+	// client_id is durable and replays.
+	Ident    *IdentRec `json:"ident,omitempty"`
+	OpID     string    `json:"op_id,omitempty"`
+	State    string    `json:"state,omitempty"`
+	ValueID  string    `json:"value_id,omitempty"`
+	Attempts int       `json:"attempts,omitempty"`
 }
 
 // Journal is the source of truth for entries, items and ops (spec 14 [C2]).
@@ -287,6 +321,10 @@ func (j *Journal) apply(r journalRec) {
 			}
 		}
 
+		if r.Ident != nil && r.Ident.ClientID != "" {
+			id := r.Ident
+			j.idents[id.ClientID] = Identity{Kind: id.Kind, Hash: id.Hash, At: id.At, EntryID: id.EntryID, ItemID: id.ItemID}
+		}
 	case "attempt":
 		if op := j.ops[r.OpID]; op != nil && !terminal(op.State) {
 			op.Attempts = r.Attempts
@@ -308,9 +346,11 @@ func (j *Journal) apply(r journalRec) {
 			op.DoneAt = r.At
 			j.doneByDay[op.Date]++
 		case OpFailed:
-			// Entry failure is DERIVED from a failed op, so no second record
-			// can be lost between the two.
-			if e := j.entries[op.EntryID]; e != nil {
+			// Entry failure is DERIVED from a failed ORIGINAL op, so no
+			// second record can be lost between the two. A failed
+			// correction (undo, fraction, fix, compensation) fails only
+			// itself: it must never cancel the rest of the meal.
+			if e := j.entries[op.EntryID]; e != nil && op.Kind == "original" {
 				e.Failed = true
 			}
 		}
@@ -493,7 +533,17 @@ func (j *Journal) Fraction(itemID string) (float64, bool) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	f, ok := j.fractions[itemID]
-	return f.F, ok
+	if !ok {
+		return 0, false
+	}
+	// A choice whose correction row was definitively rejected does not
+	// count: the original amount is still what is logged.
+	for _, id := range j.itemOps[itemID] {
+		if op := j.ops[id]; op != nil && op.Reason == "fraction" && op.ClientID == f.ClientID && op.State == OpFailed {
+			return 0, false
+		}
+	}
+	return f.F, true
 }
 
 // Fractions returns every recorded fraction choice.

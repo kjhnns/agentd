@@ -80,6 +80,7 @@ type Service struct {
 	closed    bool
 	stop      context.CancelFunc
 	workers   sync.WaitGroup
+	writers   sync.WaitGroup  // detached Variables writes of requests
 	lctx      context.Context // the lifecycle context (cancelled by Stop)
 	coachSeen map[string]bool
 	inflight  sync.Map // op id -> struct{}
@@ -288,9 +289,11 @@ func (s *Service) loadTargets() (*Targets, error) {
 	return t, err
 }
 
-// Close stops the loop and releases the stores.
+// Close stops the loop, waits for detached request writes (so their
+// outcome is journaled) and releases the stores.
 func (s *Service) Close() {
 	s.Stop()
+	s.writers.Wait()
 	_ = s.journal.Close()
 	_ = s.idem.Close()
 	_ = s.feed.Close()
@@ -416,6 +419,8 @@ func (s *Service) hydrate(ctx context.Context) {
 
 func (s *Service) loop(ctx context.Context) {
 	day := time.NewTicker(2 * time.Minute)
+	window := time.NewTicker(10 * time.Minute)
+	defer window.Stop()
 	body := time.NewTicker(20 * time.Minute)
 	rec := time.NewTicker(s.o.ReconcileEvery)
 	prune := time.NewTicker(time.Hour)
@@ -434,6 +439,8 @@ func (s *Service) loop(ctx context.Context) {
 					log.Printf("fuel: refresh %s: %v", d, err)
 				}
 			}
+		case <-window.C:
+			s.refreshWindowSlice(ctx, 6)
 		case <-body.C:
 			if err := s.cache.RefreshBody(ctx); err != nil {
 				log.Printf("fuel: refresh body composition: %v", err)
@@ -484,6 +491,7 @@ func (m *itemMutex) LockCtx(ctx context.Context) bool {
 func originalRowData(it Item, opID string, photoRef string) map[string]any {
 	d := map[string]any{
 		"item":          it.Name,
+		"kind":          it.KindOr(),
 		"portion_basis": it.Basis,
 		"source":        "fuel",
 		"op_id":         opID,
@@ -546,6 +554,7 @@ func (s *Service) postOp(ctx context.Context, op Op, preJournaled bool) string {
 		// The obligation stays open: retried with the same op_id.
 		log.Printf("fuel: compensation %s rejected by Variables (HTTP %d); will retry", op.ID, pe.Status)
 		_ = s.journal.Append(journalRec{T: "state", OpID: op.ID, State: OpUncertain, Attempts: attempts, At: now})
+		s.failureNotice(op, now) // reported once; the obligation stays open
 		return OpUncertain
 	case errors.As(err, &pe):
 		log.Printf("fuel: op %s rejected by Variables (HTTP %d); entry %s fails", op.ID, pe.Status, op.EntryID)
@@ -599,7 +608,10 @@ func (s *Service) failureNotice(op Op, now time.Time) {
 	}
 	it, _ := s.journal.Item(op.ItemID)
 	msg := "could not save " + it.Name
-	if op.Kind == "correction" {
+	switch {
+	case op.Reason == "compensation":
+		msg = "could not cancel " + it.Name + " yet; retrying"
+	case op.Kind == "correction":
 		msg = "could not save the " + op.Reason + " of " + it.Name
 	}
 	eid := op.EntryID
@@ -795,7 +807,7 @@ func (s *Service) rowPresent(op Op) bool {
 }
 
 func nonZero(m Macros) bool {
-	for _, k := range MacroKeys {
+	for _, k := range AllKeys {
 		if v := m.Get(k); v.OK && v.V != 0 {
 			return true
 		}
@@ -842,7 +854,7 @@ func doneContribution(ops []Op) (Macros, bool) {
 	if !init {
 		return Macros{}, false
 	}
-	for _, k := range MacroKeys {
+	for _, k := range AllKeys {
 		if v := sum.Get(k); v.OK && v.V != 0 {
 			return sum, true
 		}
@@ -868,6 +880,7 @@ type ItemState struct {
 	ItemID       string   `json:"item_id"`
 	ValueID      *string  `json:"value_id"`
 	Item         string   `json:"item"`
+	Kind         string   `json:"kind"` // food | drink | supplement
 	PortionG     *float64 `json:"portion_g"`
 	PortionBasis string   `json:"portion_basis"`
 	Macros
@@ -889,7 +902,7 @@ func (s *Service) viewItem(it Item) itemView {
 	ops := s.journal.ItemOps(it.ID)
 	e, _ := s.journal.Entry(it.EntryID)
 	v := itemView{failed: e.Failed}
-	st := ItemState{ItemID: it.ID, Item: it.Name, PortionG: it.PortionG, PortionBasis: it.Basis,
+	st := ItemState{ItemID: it.ID, Item: it.Name, Kind: it.KindOr(), PortionG: it.PortionG, PortionBasis: it.Basis,
 		Macros: it.Orig, NeedsFraction: it.NeedsFraction, Actions: []string{}}
 	var eff Macros
 	init := false
@@ -946,6 +959,22 @@ func (s *Service) viewItem(it Item) itemView {
 // entryStatus: failed if the entry failed, pending while any op is not
 // terminal, else done.
 func (s *Service) entryStatus(e Entry) string {
+	if e.Intent == "correct" {
+		// A chat correction's status is its OWN ops (they carry the
+		// original entry's id, so e.Failed never moves for them).
+		st := StatusDone
+		for _, id := range e.FixOps {
+			op, ok := s.journal.Op(id)
+			switch {
+			case !ok:
+			case op.State == OpFailed:
+				return StatusFailed
+			case !terminal(op.State):
+				st = StatusPending
+			}
+		}
+		return st
+	}
 	if e.Failed {
 		return StatusFailed
 	}
@@ -1195,6 +1224,8 @@ func widgetBlock(name string, snap Snapshot, added map[string]*float64) (Block, 
 		b.Data = snap.Week
 	case "streaks":
 		b.Data = snap.Streaks
+	case "fluids":
+		b.Data = snap.Intake
 	default:
 		return b, false
 	}

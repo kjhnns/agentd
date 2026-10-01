@@ -252,25 +252,3 @@ enabled   = false                # parked; fire manually with `agentd jobs run h
 # name    = "deploy-check"        # fire via: POST /hooks/deploy-check (API bearer)
 # trigger = "webhook"
 # prompt  = "A deploy just finished. Verify the service health endpoints and summarize."
-
-# ------------------------------------------------------------------------------
-# [fuel]: the Fuel fast path (internal/fuel, docs/specs/2026-10-fuel-api.md).
-# Public, token-gated routes under /fuel/ (mounted like /watch/). Leave the
-# section out to keep the routes unmounted. food_log_var and body_var are json
-# variable NAMES resolved at startup. test_mode refuses the production "Food log".
-# ------------------------------------------------------------------------------
-# [fuel]
-# token          = "env:FUEL_TOKEN"          # pass agentd/fuel-token
-# variables_url  = "https://app.logvariables.com/api/ext"
-# variables_key  = "env:VARIABLES_KEY"       # pass variables/api-key
-# food_log_var   = "Food log"
-# body_var       = "Body composition"
-# model_provider = "openai"
-# model          = "gpt-5.1"
-# model_effort   = ""                        # optional reasoning_effort hint
-# model_key      = "env:OPENAI_API_KEY"      # pass openai/api-key
-# targets_file   = "~/.agentd/fuel-targets.json"
-# staples_file   = "~/.agentd/fuel-staples.json"
-# state_dir      = ""                        # default <server state_dir>/fuel
-# strava_dir     = "~/warehouse/raw-sources/strava"
-# test_mode      = false

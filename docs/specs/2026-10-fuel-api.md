@@ -355,3 +355,39 @@ the token, image bytes, audio or model output text.
   writes) or `audio/wav`; 0.5 to 120 s; validated by container sniffing, 415
   otherwise. Empty transcript with no text and no images: 400 `empty_input`.
 - v3.1 (2026-10-01, from the iOS live test): a log request with at least one image and no text and no transcript is ALWAYS a food log. The prompt says so; if the model still returns intent `question` or zero items, the server retries once with an explicit instruction (in the system message) to list the visible foods; if the retry returns zero items but the first answer listed foods, those are logged; if neither listed any, the answer is 200 with intent `log`, zero items, and the code-generated text block "I could not see any food in that photo. Add a word about what it is." No rows are written; the feed records the exchange; no coach event.
+
+## 15. v4 (2026-10-01, Joe): fueld, recent and relog
+
+Overrides sections 1 and 3 where they say "inside agentd".
+
+- Process: Fuel runs as its own service `fueld` (cmd/fueld, same repo, reusing internal/fuel and internal/media). agentd no longer mounts /fuel/* and has no [fuel] section. fueld serves ONLY /fuel/* (everything else 404), recovers a panic per request (500, logged without the body), and shuts down gracefully (in-flight requests finish; the background loop stops).
+- Config: its own flat TOML file, default ~/.config/fueld/config.toml, refused unless mode 0600; the keys of section 1 plus `listen` (default "100.120.65.8:8796") and `whisper_model`; state_dir default ~/.local/state/fueld. Sample: deploy/fueld.example.toml; systemd user unit: deploy/fueld.service (Restart=on-failure).
+- Grouping fix that recent depends on: a correction joins its original by item_id (rows written by Fuel) OR by value id (rows written by ~/clawd/scripts/food-log, `corrects: <value_id>`).
+
+`GET /fuel/recent?limit=1..100` (default 50):
+```
+{"items":[{"key":string,"item":string,"portion_g":number|null,
+  "macros":{"kcal","protein_g","carbs_g","net_carbs_g","fat_g","sat_fat_g","fiber_g": number|null},
+  "last_eaten_at":RFC3339,"times":int,"photo_id":string|null,"source":"fuel"|"agentd"|"other"}]}
+```
+Built from every Food log row in the 35-day cache window (any writer). Only ACTIVE contributions: an undone item (undo or compensation row) is excluded; a fraction-adjusted item contributes its effective macros and its portion scaled by the eaten fraction. Group key = normalized item name (lowercase, trimmed, inner spaces collapsed) + portion_g rounded to 5 g ("none" when unknown); `key` = first 16 hex of SHA-256 of that, stable. Per group: `times` = number of contributions; item, portion, macros and source of the most recent one; `photo_id` = a stored photo of the most recent contribution that has one, else null. Sorted by last_eaten_at, newest first.
+
+`POST /fuel/relog {"client_id","key","scale"?: 0.5|1|1.5|2 (default 1),"local_time"?}`: no model call. Writes ONE Food log row: the recent item's macros times scale (rounded once; required macros never null), portion_g times scale, portion_basis "repeat", source "fuel", op_id, entry_id, item_id, eaten_at as usual. Idempotent by client_id (same client_id with a different key, scale or local_time: 409). Unknown key: 404. Response = the POST /fuel/log shape (intent "log", items, blocks: status line + macros_today with `added`, snapshot, latency_ms with model 0). The feed records the user turn "again: <item>" and the reply. Target latency under 1 s.
+
+### 15.1 Everything that enters the mouth (Joe, 2026-10-01)
+
+- Drinks (water, coffee, tea, juice, alcohol) and supplements are logged like food, in the same Food log variable. New optional row keys: `kind` "food"|"drink"|"supplement" (always written by Fuel; missing = food), `volume_ml`, `caffeine_mg`, `alcohol_g` (non-negative numbers, omitted when unknown). Macros stay required (water = all 0). Corrections negate these amounts like macros.
+- Model item schema adds `kind`, `volume_ml`, `caffeine_mg`, `alcohol_g` (number|null). Prompt: a glass of water is 250 ml unless stated; about 10 g alcohol per standard drink.
+- Snapshot adds `intake` (MacroState list): `fluids_ml` (known volume of drinks; floor `water_ml` with rest/training, paced like a floor), `caffeine_mg` (cap), `alcohol_g` (today, no target), `alcohol_g_week` (ISO week up to the date; cap `alcohol_g_week`). For intake a missing amount counts as 0. New widget `fluids` (data = `intake`).
+- fuel-targets.json accepts the OPTIONAL keys `water_ml` {"kind":"floor","rest":2500,"training":3000}, `caffeine_mg` {"kind":"cap","value":400}, `alcohol_g_week` {"kind":"cap","value":30}; absent = no target (built-in defaults include them).
+- Rows from ~/clawd/scripts/food-log (source "agentd") are read with the same rules: corrections `reason` "undo" | "fix", `corrects` = the ORIGINAL's value id, absolute `share_after`, `portion_g_after`, `volume_ml_after`; duplicates by op_id count once, and a correction that names a duplicate copy of an original belongs to that original.
+- /fuel/recent items add `kind` and `volume_ml`; the group key includes the kind and, when the portion is unknown, the volume rounded to 5 ml. Current portion and volume come from the newest correction's `*_after` metadata; only without metadata from the ratio of effective to original macros.
+
+### 15.2 Corrections in one message (Joe, 2026-10-01)
+
+- New model intent `correct`: {"intent":"correct","items":[],"corrections":[{"ref":"last"|item_id|item name,"portion_g":number|null,"volume_ml":number|null,"share":number|null}],...}, exactly one amount per correction, 1 to 12 corrections. The prompt carries LAST LOGGED ITEMS (item_id, item, kind, portion_g, volume_ml of the newest log entry's active items).
+- The server resolves `last` to the newest active item of the newest log entry, an item_id directly, else a name among recent log entries (exact normalized match, then containment). Per item it writes ONE correction row (reason "fix", `share_after`, `portion_g_after`, `volume_ml_after`) whose delta makes the item count as target = ORIGINAL row x share (share = portion_g / original portion or volume_ml / original volume). Absolute, so a repeated correction writes nothing. Pending, undone or unresolvable items are skipped with a code-generated note; nothing is written for them.
+- Reply in the POST /fuel/log shape with intent "correct": items = the corrected items, blocks = the code-generated summary ("Corrected Water to 300 ml.") plus the status line, and macros_today with `added` = the deltas. Idempotent by client_id like any log.
+- `POST /fuel/fix {"client_id","item_id", exactly one of "portion_g"|"volume_ml"|"share"}`: the same correction for the app's "Fix portion" sheet; answer in the undo/fraction shape. 404 if the original row was deleted, 409 portion_unknown / volume_unknown when the original has no portion / volume, 409 already_undone, 409 pending.
+- POST /fuel/fraction is now absolute in the same way (target = original x fraction) and writes `share_after`.
+- Failure scope (overrides 14 [C2] for corrections): only a failed ORIGINAL row fails its entry and triggers compensation. A failed correction (undo, fraction, fix, compensation) fails only itself and is reported (502 / "could not save the ..."); it never cancels the rest of the meal. A chat correction's status is derived from its own correction ops. `last` means the newest log entry only (also one with no items); an item undone by any writer is not active. macros_today `added` of a correction reply counts only the deltas of the displayed day; corrections of other days are named in the text.

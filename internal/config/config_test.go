@@ -447,34 +447,3 @@ func TestShippedExampleParses(t *testing.T) {
 		t.Error("the example allow list must show an @lid entry alongside the phone JID")
 	}
 }
-
-func TestParseFuelSection(t *testing.T) {
-	cfg, err := Parse([]byte("[fuel]\ntoken = \"env:FUEL_TOKEN\"\nfood_log_var = \"Fuel e2e food log\"\ntest_mode = true\nmodel = \"gpt-5.1\"\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	f := cfg.Fuel
-	if !f.Present || !f.TestMode || f.FoodLogVar != "Fuel e2e food log" || f.BodyVar != "Body composition" || f.VariablesURL == "" {
-		t.Fatalf("%+v", f)
-	}
-	// A bad [fuel] section never stops the daemon; it is recorded instead.
-	for _, bad := range []string{"[fuel]\nbogus = \"x\"\n", "[fuel]\ntest_mode = \"false\"\n", "[fuel]\ntest_mode true\n"} {
-		cfg, err := Parse([]byte(bad + "[server]\nbind = \"127.0.0.1:1\"\n"))
-		if err != nil || cfg.Fuel.Err == "" || cfg.Server.Bind != "127.0.0.1:1" {
-			t.Fatalf("%q: err=%v fuel.Err=%q", bad, err, cfg.Fuel.Err)
-		}
-	}
-	cfg, _ = Parse([]byte("[server]\nbind = \"127.0.0.1:1\"\n"))
-	if cfg.Fuel.Present {
-		t.Fatal("fuel present without a section")
-	}
-}
-
-func TestFuelErrorsNeverEchoSecrets(t *testing.T) {
-	for _, doc := range []string{"[fuel]\ntoken = \"SECRET-TOKEN-123\n", "[fuel]\ntest_mode = SECRET-TOKEN-123\n"} {
-		cfg, err := Parse([]byte(doc))
-		if err != nil || cfg.Fuel.Err == "" || strings.Contains(cfg.Fuel.Err, "SECRET-TOKEN-123") {
-			t.Fatalf("err=%v fuel.Err=%q", err, cfg.Fuel.Err)
-		}
-	}
-}

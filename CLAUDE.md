@@ -10,10 +10,11 @@ Deploy target: Joe's Mac, LaunchDaemon com.joe_pa.agentd, runtime home
 ~/.agentd/, listening on 127.0.0.1:8788. This checkout is source only.
 
 ## Layout
-cmd/agentd/           the single binary (serve, run, chat, smoke, memory, init-workspace)
+cmd/agentd/           the agentd binary (serve, run, chat, smoke, memory, init-workspace)
+cmd/fueld/            the Fuel service: /fuel/* only, own config + state (deploy/fueld.service)
 internal/             config, eventbus, runlog, harness/claudecode, channel/{telegram,web,whatsapp},
                       session, scheduler, notify, media, api, cli, workspace,
-                      fuel (the Fuel fast path, docs/specs/2026-10-fuel-api.md)
+                      fuel (used by cmd/fueld only; docs/specs/2026-10-fuel-api.md)
 config.example.toml   the only config committed; the real config.toml is gitignored
 
 ## Commands

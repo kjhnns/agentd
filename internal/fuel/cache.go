@@ -231,6 +231,14 @@ func (c *Cache) Body() ([]Value, time.Time) {
 // dedupeRows keeps the first value per op_id (spec 14 [C1]): Variables has no
 // server-side dedup, so a duplicate row is made harmless, not impossible.
 func dedupeRows(rows []Value) []Value {
+	out, _ := dedupeRowsMap(rows)
+	return out
+}
+
+// dedupeRowsMap is dedupeRows plus a map from every dropped duplicate's
+// value id to the kept row's value id (a correction may name a copy).
+func dedupeRowsMap(rows []Value) ([]Value, map[string]string) {
+	dup := map[string]string{}
 	sorted := append([]Value(nil), rows...)
 	sort.SliceStable(sorted, func(a, b int) bool {
 		if !sorted[a].CreatedAt.Equal(sorted[b].CreatedAt) {
@@ -238,21 +246,22 @@ func dedupeRows(rows []Value) []Value {
 		}
 		return sorted[a].ID < sorted[b].ID
 	})
-	seen := map[string]bool{}
+	seen := map[string]string{} // op_id -> kept value id
 	var out []Value
 	for _, r := range sorted {
 		if r.Data == nil {
 			continue
 		}
 		if op, _ := r.Data["op_id"].(string); op != "" {
-			if seen[op] {
+			if kept, ok := seen[op]; ok {
+				dup[r.ID] = kept
 				continue
 			}
-			seen[op] = true
+			seen[op] = r.ID
 		}
 		out = append(out, r)
 	}
-	return out
+	return out, dup
 }
 
 // DayTotals is the consumed sum per macro and the unknown-contribution count.
@@ -290,7 +299,7 @@ func (c *contrib) add(r Value) {
 		c.undone = true
 	}
 	c.rows++
-	for _, k := range MacroKeys {
+	for _, k := range AllKeys {
 		if v := m.Get(k); v.OK {
 			c.sum[k] += v.V
 			c.known[k] = true
@@ -313,7 +322,7 @@ func (c *contrib) value(k string) tenth {
 func (c *contrib) effective() Macros {
 	var m Macros
 	for i, f := range m.fields() {
-		*f = c.value(MacroKeys[i])
+		*f = c.value(AllKeys[i])
 	}
 	return m
 }
@@ -323,7 +332,7 @@ func (c *contrib) effective() Macros {
 func (c *contrib) cancel() Macros {
 	var m Macros
 	for i, f := range m.fields() {
-		k := MacroKeys[i]
+		k := AllKeys[i]
 		if c.known[k] {
 			*f = known(-c.sum[k])
 		}
@@ -333,7 +342,7 @@ func (c *contrib) cancel() Macros {
 
 // residual reports whether any known sum is non-zero.
 func (c *contrib) residual() bool {
-	for _, k := range MacroKeys {
+	for _, k := range AllKeys {
 		if c.sum[k] != 0 {
 			return true
 		}
@@ -341,35 +350,77 @@ func (c *contrib) residual() bool {
 	return false
 }
 
-func groupKey(r Value) string {
-	if s, _ := r.Data["corrects"].(string); s != "" {
-		return "i:" + s
+// group is one contribution with its original row (zero Value when only
+// corrections are present).
+type group struct {
+	key  string
+	orig Value
+	c    *contrib
+	last Value   // the newest row of the group
+	rows []Value // every row, oldest first
+}
+
+// groupRows dedupes rows and groups them into contributions: an original
+// row plus every correction of it. A correction names its original by
+// item_id (rows written by Fuel) or by value id (rows written by the agentd
+// food-log script, `corrects: <value_id>`); both join the same group.
+func groupRows(rows []Value) []*group {
+	rows, dup := dedupeRowsMap(rows)
+	byKey := map[string]*group{}
+	alias := map[string]string{} // item_id or value id -> group key
+	var order []*group
+	get := func(key string) *group {
+		g := byKey[key]
+		if g == nil {
+			g = &group{key: key, c: newContrib()}
+			byKey[key] = g
+			order = append(order, g)
+		}
+		return g
 	}
-	if s, _ := r.Data["item_id"].(string); s != "" {
-		return "i:" + s
+	// Originals first, so a correction can find its original by either id.
+	for _, r := range rows {
+		if c, _ := r.Data["corrects"].(string); c != "" {
+			continue
+		}
+		key := "v:" + r.ID
+		if id, _ := r.Data["item_id"].(string); id != "" {
+			key = "i:" + id
+			alias[id] = key
+		}
+		alias[r.ID] = key
+		g := get(key)
+		g.orig = r
 	}
-	return "v:" + r.ID
+	for _, r := range rows {
+		key := ""
+		if c, _ := r.Data["corrects"].(string); c != "" {
+			if kept, ok := dup[c]; ok {
+				c = kept // it names a duplicate copy of its original
+			}
+			if k, ok := alias[c]; ok {
+				key = k
+			} else {
+				key = "i:" + c // its original is not in these rows
+			}
+		} else {
+			key = alias[r.ID]
+		}
+		g := get(key)
+		g.c.add(r)
+		g.rows = append(g.rows, r)
+		if g.last.Data == nil || !r.CreatedAt.Before(g.last.CreatedAt) {
+			g.last = r
+		}
+	}
+	return order
 }
 
 func totalsFromRows(rows []Value) DayTotals {
-	rows = dedupeRows(rows)
-	groups := map[string]*contrib{}
-	var order []string
-	for _, r := range rows {
-		key := groupKey(r)
-		g := groups[key]
-		if g == nil {
-			g = newContrib()
-			groups[key] = g
-			order = append(order, key)
-		}
-		g.add(r)
-	}
-	t := DayTotals{Sum: map[string]int64{}, Unknown: map[string]int{}, Rows: len(rows)}
-	for _, k := range order {
-		g := groups[k]
-		for _, key := range MacroKeys {
-			if v := g.value(key); v.OK {
+	t := DayTotals{Sum: map[string]int64{}, Unknown: map[string]int{}, Rows: len(dedupeRows(rows))}
+	for _, g := range groupRows(rows) {
+		for _, key := range AllKeys {
+			if v := g.c.value(key); v.OK {
 				t.Sum[key] += v.V
 			} else {
 				t.Unknown[key]++
@@ -379,20 +430,24 @@ func totalsFromRows(rows []Value) DayTotals {
 	return t
 }
 
+// itemGroup returns the contribution group of one item (nil when absent).
+func itemGroup(rows []Value, itemID string) *group {
+	for _, g := range groupRows(rows) {
+		if g.key == "i:"+itemID {
+			return g
+		}
+	}
+	return nil
+}
+
 // itemContrib reduces the authoritative (deduplicated) rows of one item: its
 // original row and every correction of it. orig is the original row (zero
 // Value when absent); ok is false when no row of the item is present.
 func itemContrib(rows []Value, itemID string) (*contrib, Value, bool) {
-	c := newContrib()
-	var orig Value
-	for _, r := range dedupeRows(rows) {
-		if groupKey(r) != "i:"+itemID {
-			continue
+	for _, g := range groupRows(rows) {
+		if g.key == "i:"+itemID {
+			return g.c, g.orig, g.c.rows > 0
 		}
-		if _, isCorr := r.Data["corrects"]; !isCorr {
-			orig = r
-		}
-		c.add(r)
 	}
-	return c, orig, c.rows > 0
+	return newContrib(), Value{}, false
 }

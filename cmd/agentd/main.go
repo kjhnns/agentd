@@ -818,18 +818,6 @@ func serve(args []string) {
 	}
 	log.Printf("agentd: notification hub has %d sink(s)", hub.Count())
 
-	// Fuel fast path (internal/fuel): public, token-gated /fuel/* next to
-	// /watch/*. A missing or invalid [fuel] section leaves the routes unmounted.
-	if cfg.Fuel.Present {
-		if fsvc, err := buildFuel(cfg); err != nil {
-			log.Printf("agentd: fuel NOT mounted: %v", err)
-		} else if startFuel(ctx, fsvc) {
-			defer fsvc.Close()
-			srv.MountPublic("/fuel/", fsvc.Handler())
-			log.Printf("agentd: fuel routes mounted (/fuel/*, test_mode=%v, food_log_var=%q)", cfg.Fuel.TestMode, cfg.Fuel.FoodLogVar)
-		}
-	}
-
 	httpSrv := &http.Server{Addr: cfg.Server.Bind, Handler: srv.Handler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second}
 	go func() {
 		log.Printf("agentd: API listening on http://%s (bearer %s)", cfg.Server.Bind, redact(apiBearer))

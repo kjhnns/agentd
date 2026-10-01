@@ -63,11 +63,15 @@ func (t Target) For(dayType string) *float64 {
 
 // Targets is fuel-targets.json (spec section 14 [C17]).
 type Targets struct {
-	Protein         Target    `json:"protein_g"`
-	SatFat          Target    `json:"sat_fat_g"`
-	Fiber           Target    `json:"fiber_g"`
-	Kcal            Target    `json:"kcal"`
-	NetCarbs        Target    `json:"net_carbs_g"`
+	Protein  Target `json:"protein_g"`
+	SatFat   Target `json:"sat_fat_g"`
+	Fiber    Target `json:"fiber_g"`
+	Kcal     Target `json:"kcal"`
+	NetCarbs Target `json:"net_carbs_g"`
+	// Optional (spec section 15); nil when absent, then the check is skipped.
+	WaterML         *Target   `json:"water_ml,omitempty"`
+	CaffeineMG      *Target   `json:"caffeine_mg,omitempty"`
+	AlcoholGWeek    *Target   `json:"alcohol_g_week,omitempty"`
 	StrengthPerWeek int       `json:"strength_per_week"`
 	WeightBandKg    []float64 `json:"weight_band_kg"`
 	EatingWindow    struct {
@@ -91,6 +95,9 @@ const DefaultTargetsJSON = `{
   "fiber_g":     {"kind": "floor", "value": 35},
   "kcal":        {"kind": "pace",  "rest": 2300, "training": 2600},
   "net_carbs_g": {"kind": "pace",  "rest": 120,  "training": null},
+  "water_ml":    {"kind": "floor", "rest": 2500, "training": 3000},
+  "caffeine_mg": {"kind": "cap",   "value": 400},
+  "alcohol_g_week": {"kind": "cap", "value": 30},
   "strength_per_week": 3,
   "weight_band_kg": [78, 82],
   "eating_window": {"start": "07:00", "end": "20:30"},
@@ -98,6 +105,9 @@ const DefaultTargetsJSON = `{
 }`
 
 var requiredTargetKeys = []string{"protein_g", "sat_fat_g", "fiber_g", "kcal", "net_carbs_g", "strength_per_week", "weight_band_kg", "eating_window", "tz"}
+
+// optionalTargetKeys may be absent (files from before section 15 stay valid).
+var optionalTargetKeys = []string{"water_ml", "caffeine_mg", "alcohol_g_week"}
 
 // ParseTargets validates a targets document: every key required, kinds valid.
 func ParseTargets(b []byte) (*Targets, error) {
@@ -112,7 +122,7 @@ func ParseTargets(b []byte) (*Targets, error) {
 	}
 	for k := range raw {
 		found := false
-		for _, r := range requiredTargetKeys {
+		for _, r := range append(append([]string{}, requiredTargetKeys...), optionalTargetKeys...) {
 			found = found || r == k
 		}
 		if !found {
@@ -123,7 +133,13 @@ func ParseTargets(b []byte) (*Targets, error) {
 	if err := json.Unmarshal(b, &t); err != nil {
 		return nil, fmt.Errorf("targets: %w", err)
 	}
-	for name, tg := range map[string]Target{"protein_g": t.Protein, "sat_fat_g": t.SatFat, "fiber_g": t.Fiber, "kcal": t.Kcal, "net_carbs_g": t.NetCarbs} {
+	all := map[string]Target{"protein_g": t.Protein, "sat_fat_g": t.SatFat, "fiber_g": t.Fiber, "kcal": t.Kcal, "net_carbs_g": t.NetCarbs}
+	for name, p := range map[string]*Target{"water_ml": t.WaterML, "caffeine_mg": t.CaffeineMG, "alcohol_g_week": t.AlcoholGWeek} {
+		if p != nil {
+			all[name] = *p
+		}
+	}
+	for name, tg := range all {
 		switch tg.Kind {
 		case "floor", "cap", "pace":
 		default:

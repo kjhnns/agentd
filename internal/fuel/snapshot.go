@@ -10,12 +10,15 @@ import (
 
 // Snapshot is the deterministic day state (spec section 9 and 14).
 type Snapshot struct {
-	Revision   int          `json:"revision"`
-	AsOf       time.Time    `json:"as_of"`
-	DataAsOf   time.Time    `json:"data_as_of"`
-	Date       string       `json:"date"`
-	DayType    string       `json:"day_type"`
-	Macros     []MacroState `json:"macros"`
+	Revision int          `json:"revision"`
+	AsOf     time.Time    `json:"as_of"`
+	DataAsOf time.Time    `json:"data_as_of"`
+	Date     string       `json:"date"`
+	DayType  string       `json:"day_type"`
+	Macros   []MacroState `json:"macros"`
+	// Intake: fluids_ml, caffeine_mg, alcohol_g (today), alcohol_g_week
+	// (this ISO week up to the date). Spec section 15.
+	Intake     []MacroState `json:"intake"`
 	NextAction *NextAction  `json:"next_action"`
 	DayScore   DayScore     `json:"day_score"`
 	Week       Week         `json:"week"`
@@ -333,6 +336,8 @@ func computeSnapshot(in snapInput) Snapshot {
 		s.Week.StravaAsOf = &st
 	}
 
+	s.Intake = intakeStates(in, t, targetDay, el, rows)
+
 	s.Weight, s.BodyFat = bodyTrends(in.body, in.date, loc)
 	if s.Weight.Avg7Kg == nil {
 		s.Missing = append(s.Missing, "weight")
@@ -476,4 +481,63 @@ func fmtNum(f float64) string {
 		return fmt.Sprintf("%.0f", f)
 	}
 	return fmt.Sprintf("%.1f", f)
+}
+
+// intakeSums returns, for one day's rows, the fluids (known volume of
+// drinks), caffeine and alcohol of the active contributions (corrections
+// included; an undone item sums to 0). Missing amounts count as 0 here: a
+// food without caffeine_mg has no caffeine.
+func intakeSums(rows []Value) (fluids, caffeine, alcohol int64) {
+	for _, g := range groupRows(rows) {
+		kind := "food"
+		if g.orig.Data != nil {
+			if k, _ := g.orig.Data["kind"].(string); k != "" {
+				kind = k
+			}
+		}
+		if kind == "drink" {
+			fluids += g.c.sum["volume_ml"]
+		}
+		caffeine += g.c.sum["caffeine_mg"]
+		alcohol += g.c.sum["alcohol_g"]
+	}
+	return
+}
+
+func intakeStates(in snapInput, t *Targets, dayType string, el float64, rows []Value) []MacroState {
+	fl, caf, alc := intakeSums(rows)
+	d0, _ := time.ParseInLocation("2006-01-02", in.date, t.loc)
+	wd := (int(d0.Weekday()) + 6) % 7
+	var week int64
+	for i := 0; i <= wd; i++ {
+		d := dateAdd(in.date, -i)
+		r := rows
+		if i > 0 {
+			r, _ = in.rowsFor(d)
+		}
+		_, _, a := intakeSums(r)
+		week += a
+	}
+	mk := func(key, label, unit string, tg *Target, consumed int64) MacroState {
+		ms := MacroState{Key: key, Label: label, Unit: unit, Kind: "cap", Consumed: round1(float64(consumed) / 10)}
+		if tg != nil {
+			ms.Kind = tg.Kind
+			ms.Target = tg.For(dayType)
+		}
+		if ms.Target != nil && ms.Kind != "cap" {
+			ms.PaceTargetNow = fptr(round1(*ms.Target * el))
+		}
+		ms.Status = statusFor(ms.Kind, ms.Consumed, ms.Target, ms.PaceTargetNow)
+		return ms
+	}
+	water := mk("fluids_ml", "Fluids", "ml", t.WaterML, fl)
+	if t.WaterML == nil {
+		water.Kind = "floor"
+	}
+	return []MacroState{
+		water,
+		mk("caffeine_mg", "Caffeine", "mg", t.CaffeineMG, caf),
+		mk("alcohol_g", "Alcohol today", "g", nil, alc),
+		mk("alcohol_g_week", "Alcohol this week", "g", t.AlcoholGWeek, week),
+	}
 }

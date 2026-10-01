@@ -1,0 +1,21 @@
+# fueld config (docs/specs/2026-10-fuel-api.md section 15).
+# Default path ~/.config/fueld/config.toml; must be mode 0600 (fueld refuses
+# a file readable by group or others). Flat keys, no sections.
+# Values: "env:VAR" reads the environment, anything else is a literal.
+
+listen         = "100.120.65.8:8796"           # tailnet address; the HTTPS proxy forwards here
+token          = "env:FUEL_TOKEN"              # pass agentd/fuel-token
+variables_url  = "https://app.logvariables.com/api/ext"
+variables_key  = "env:VARIABLES_KEY"           # pass variables/api-key
+food_log_var   = "Food log"                    # json variable NAMES, resolved at startup
+body_var       = "Body composition"
+model_provider = "openai"
+model          = "gpt-5.1"
+model_key      = "env:OPENAI_API_KEY"          # pass openai/api-key (also used for Whisper)
+# model_effort = ""                            # optional reasoning_effort
+whisper_model  = "whisper-1"
+targets_file   = "~/.agentd/fuel-targets.json" # missing = built-in defaults
+staples_file   = "~/.agentd/fuel-staples.json" # shared with ~/clawd/scripts/food-log
+state_dir      = "~/.local/state/fueld"
+strava_dir     = "~/warehouse/raw-sources/strava"
+test_mode      = false                         # true refuses food_log_var "Food log"

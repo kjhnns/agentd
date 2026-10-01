@@ -1,0 +1,23 @@
+# systemd USER unit for fueld (the Fuel service). Not installed by the repo.
+# Install: cp deploy/fueld.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#          && systemctl --user enable --now fueld
+# Secrets: the config may use "env:VAR"; put the variables in
+# ~/.config/fueld/env (mode 0600), never in this file.
+[Unit]
+Description=fueld (Fuel fast food-logging API, /fuel/*)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/fueld/env
+ExecStart=%h/.local/bin/fueld -config %h/.config/fueld/config.toml
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

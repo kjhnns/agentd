@@ -1233,7 +1233,7 @@ func TestFailedOpDerivesEntryFailureOnReplay(t *testing.T) {
 	// pending op instead via a txn, then its failure.
 	path := filepath.Join(h.opts.StateDir, "journal.jsonl")
 	it := resp.Items[1]
-	extra := Op{ID: "op_extra", Kind: "correction", EntryID: resp.EntryID, ItemID: it.ItemID, RowItemID: "it_x", Reason: "undo", Date: "2026-10-01", State: OpPending, CreatedAt: h.clk.Now()}
+	extra := Op{ID: "op_extra", Kind: "original", EntryID: resp.EntryID, ItemID: it.ItemID, RowItemID: "it_x", Reason: "undo", Date: "2026-10-01", State: OpPending, CreatedAt: h.clk.Now()}
 	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
 	b1, _ := json.Marshal(journalRec{T: "txn", Ops: []Op{extra}, At: h.clk.Now()})
 	b2, _ := json.Marshal(journalRec{T: "state", OpID: "op_extra", State: OpFailed, At: h.clk.Now()})
@@ -2266,27 +2266,49 @@ func TestRenderNeverMixesTwoViews(t *testing.T) {
 }
 
 func TestOldEntryFailedCorrectionIsCompensatedAfterRestart(t *testing.T) {
+	// A rejected CORRECTION fails only itself (the meal stays counted); a
+	// failed ORIGINAL on an entry older than 35 days is still compensated.
 	h := newHarness(t)
 	h.model.fn = func(ModelInput) string { return pizzaPhoto }
 	p := decode[LogResponse](t, h.logText("90909090-0001", "pizza"))
 	h.clk.Add(36 * 24 * time.Hour)
+	h.vars.mu.Lock()
 	h.vars.onPost = func(_ int, data map[string]any) (bool, int) {
 		if data["reason"] == "fraction" {
 			return false, 400
 		}
 		return true, 201
 	}
+	h.vars.mu.Unlock()
 	if r := h.mutate("fraction", "90909090-0002", p.Items[0].ItemID, f64(0.5)); r.Code != 502 {
 		t.Fatalf("fraction %d", r.Code)
 	}
-	h.vars.mu.Lock()
-	h.vars.onPost = nil
-	h.vars.mu.Unlock()
 	h.restart()
 	h.clk.Add(7 * time.Hour)
 	h.svc.reconcileOnce(context.Background())
 	sum := 0.0
 	for _, r := range h.vars.rows("var-food") {
+		sum += r["kcal"].(float64)
+	}
+	if e, _ := h.svc.journal.Entry(p.EntryID); e.Failed || sum != 801 {
+		t.Fatalf("failed=%v kcal %v: a failed correction cancelled the meal", e.Failed, sum)
+	}
+
+	h2 := newHarness(t)
+	h2.vars.onPost = func(n int, data map[string]any) (bool, int) {
+		if data["item"] == "walnuts" {
+			return false, 500
+		}
+		return true, 201
+	}
+	h2.logText("90909090-0101", "250 g skyr and 30 g walnuts")
+	h2.clk.Add(36 * 24 * time.Hour)
+	h2.restart()
+	h2.clk.Add(7 * time.Hour)
+	h2.svc.reconcileOnce(context.Background())
+	h2.svc.reconcileOnce(context.Background())
+	sum = 0
+	for _, r := range h2.vars.rows("var-food") {
 		sum += r["kcal"].(float64)
 	}
 	if toTenth(sum) != 0 {
