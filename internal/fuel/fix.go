@@ -519,6 +519,9 @@ func fixLines(fixes []chatFix, shownDate string) []FixLine {
 
 // correctSummary renders each line by its op's CURRENT state.
 func (s *Service) correctSummary(e Entry) string {
+	if e.Intent == "move" {
+		return s.moveSummary(e)
+	}
 	if len(e.FixLines) == 0 {
 		return e.FixText
 	}

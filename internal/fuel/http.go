@@ -585,7 +585,7 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 	tModel := time.Now()
 	fresh.Wait() // the model sees the refreshed day (questions answer from it)
 	preSnap, _ := s.snapshotFor(date)
-	mi := ModelInput{Text: foodText, Staples: s.staples, Snapshot: &preSnap, LastItems: s.lastItems()}
+	mi := ModelInput{Text: foodText, Staples: s.staples, Snapshot: &preSnap, LastItems: s.lastItems(), Now: now.In(targets.loc)}
 	for _, p := range imgs {
 		mi.Images = append(mi.Images, p.Model)
 	}
@@ -631,9 +631,33 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 			map[string]int{"upload": ms(upload), "asr": ms(asrD), "model": ms(modelD)})
 		return
 	}
+	if out.Intent == "move" {
+		s.finishMove(ctx, w, out, in.ClientID, hash, foodText, now, t0,
+			map[string]int{"upload": ms(upload), "asr": ms(asrD), "model": ms(modelD)})
+		return
+	}
+	// The day the food was consumed, when the user states one (spec 15.6).
+	note := ""
+	requestDate := date // the request's own day, before the model's day
+	if out.Intent == "log" && (out.Day != nil || out.Time != nil) {
+		d, at, refuse := resolveDay(out.Day, out.Time, now, targets.loc, date, eatenAt)
+		if refuse != "" {
+			note = refuse
+			out = &ModelOutput{Intent: "log", RawIntent: "log"}
+		} else {
+			if d != date {
+				// The reply shows THAT day: make sure it is loaded and fresh.
+				s.freshen(ctx, d)
+			}
+			date, eatenAt = d, at
+		}
+	}
 
 	entry := Entry{ID: newID("en_"), ClientID: in.ClientID, Date: date, EatenAt: eatenAt, CreatedAt: now,
-		Intent: out.Intent, Transcript: transcript, PhotoIDs: []string{}, ReqHash: hash}
+		Intent: out.Intent, Transcript: transcript, PhotoIDs: []string{}, ReqHash: hash, Note: note}
+	if out.Intent == "log" && (date != now.In(targets.loc).Format("2006-01-02") || date != requestDate) {
+		entry.DayLabel = dayLabel(date)
+	}
 	items := s.buildItems(out, entry)
 	for _, it := range items {
 		entry.ItemIDs = append(entry.ItemIDs, it.ID)
@@ -860,6 +884,26 @@ func correctBlocks(s *Service, e Entry, snap Snapshot) []Block {
 	return blocks
 }
 
+// leadText is the code-generated first block of a log reply: the status
+// line; for a log on another day "Logged for Wed 30 Sep: a, b and c." plus
+// that day's status; a refusal note or the no-food text when nothing was
+// written.
+func (s *Service) leadText(e Entry, states []ItemState, snap Snapshot) string {
+	switch {
+	case e.Note != "":
+		return e.Note
+	case e.NoFood:
+		return noFoodText
+	case e.DayLabel != "" && e.Intent == "log" && len(states) > 0:
+		var names []string
+		for _, st := range states {
+			names = append(names, st.Item)
+		}
+		return "Logged for " + e.DayLabel + ": " + joinAnd(names) + ". " + e.DayLabel + ": " + statusSentence(snap)
+	}
+	return statusSentence(snap)
+}
+
 // noFoodText answers a caption-less photo in which no food was seen.
 const noFoodText = "I could not see any food in that photo. Add a word about what it is."
 
@@ -880,10 +924,7 @@ func (s *Service) buildLogResponse(e Entry) (LogResponse, string) {
 	for _, st := range states {
 		effs = append(effs, st.Effective)
 	}
-	blocks := []Block{textBlock(statusSentence(snap))}
-	if e.NoFood {
-		blocks = []Block{textBlock(noFoodText)}
-	}
+	blocks := []Block{textBlock(s.leadText(e, states, snap))}
 	if isChatFix(e) {
 		blocks = correctBlocks(s, e, snap)
 		photos := e.PhotoIDs
@@ -1616,10 +1657,7 @@ func (s *Service) writeEntry(w http.ResponseWriter, e Entry) {
 	for _, st := range states {
 		effs = append(effs, st.Effective)
 	}
-	blocks := []Block{textBlock(statusSentence(snap))}
-	if e.NoFood {
-		blocks = []Block{textBlock(noFoodText)}
-	}
+	blocks := []Block{textBlock(s.leadText(e, states, snap))}
 	if isChatFix(e) {
 		blocks = correctBlocks(s, e, snap)
 	} else if b, ok := widgetBlock("macros_today", snap, addedOf(effs)); ok {

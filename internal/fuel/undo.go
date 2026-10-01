@@ -12,7 +12,9 @@ import (
 
 // isChatFix reports a chat entry that only changes earlier items: a
 // correction ("correct") or a removal ("undo"). Both render from FixLines.
-func isChatFix(e Entry) bool { return e.Intent == "correct" || e.Intent == "undo" }
+func isChatFix(e Entry) bool {
+	return e.Intent == "correct" || e.Intent == "undo" || e.Intent == "move"
+}
 
 // amountMatches: an item matches a stated amount when its current or its
 // originally logged amount is within 2 % (at least 1 unit) of it.

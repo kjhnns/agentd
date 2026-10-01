@@ -154,7 +154,100 @@ func (c *Cache) Rows(date string) ([]Value, time.Time, bool) {
 	return c.rowsLocked(date)
 }
 
+// rowsLocked is the day as it COUNTS (spec 15.6). The destination row of a
+// move (`moved_from`) counts only once the SOURCE item is undone in the rows
+// of its own day; until then the source counts and the destination group
+// (its original, duplicates and every correction of it, by item id or value
+// id) is left out. The rule reads only rows, so both sides switch in the
+// same instant: when the undo row becomes known.
 func (c *Cache) rowsLocked(date string) ([]Value, time.Time, bool) {
+	rows, fetched, ok := c.rawRowsLocked(date)
+	moved := false
+	for _, r := range rows {
+		if _, has := r.Data["moved_from"]; has {
+			moved = true
+			break
+		}
+	}
+	if !moved {
+		return rows, fetched, ok
+	}
+	srcGroups := map[string][]*group{} // source date -> groups
+	// Rows of the groups that do not count, by value id and by op_id (so
+	// their duplicate copies go too). Every other row stays as it is,
+	// duplicates included: later grouping still resolves a correction that
+	// names a duplicate copy.
+	dropID, dropOp := map[string]bool{}, map[string]bool{}
+	for _, g := range groupRows(rows) {
+		if c.destinationCounts(g, srcGroups) {
+			continue
+		}
+		for _, r := range g.rows {
+			dropID[r.ID] = true
+			if op, _ := r.Data["op_id"].(string); op != "" {
+				dropOp[op] = true
+			}
+		}
+	}
+	if len(dropID) == 0 {
+		return rows, fetched, ok
+	}
+	out := rows[:0]
+	for _, r := range rows {
+		op, _ := r.Data["op_id"].(string)
+		if dropID[r.ID] || (op != "" && dropOp[op]) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out, fetched, ok
+}
+
+// destinationCounts: a group that is not a move destination always counts;
+// a destination counts when its source is undone, deleted, or on a day that
+// is not cached (nothing to compare with).
+func (c *Cache) destinationCounts(g *group, srcGroups map[string][]*group) bool {
+	if g.orig.Data == nil {
+		return true
+	}
+	from, _ := g.orig.Data["moved_from"].(string)
+	srcDate, _ := g.orig.Data["moved_from_date"].(string)
+	if from == "" || srcDate == "" {
+		return true
+	}
+	gs, seen := srcGroups[srcDate]
+	if !seen {
+		raw, _, loaded := c.rawRowsLocked(srcDate)
+		if !loaded {
+			srcGroups[srcDate] = nil
+			return true
+		}
+		gs = groupRows(raw)
+		if gs == nil {
+			gs = []*group{}
+		}
+		srcGroups[srcDate] = gs
+	}
+	if gs == nil {
+		return true
+	}
+	for _, sg := range gs {
+		if sg.key == "i:"+from || sg.key == "v:"+from {
+			return sg.c.undone
+		}
+	}
+	return true // the source row is gone
+}
+
+// RowsRaw returns every cached row of a day (reconciliation and
+// compensation look for rows by op_id, hidden or not).
+func (c *Cache) RowsRaw(date string) ([]Value, time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.rawRowsLocked(date)
+}
+
+func (c *Cache) rawRowsLocked(date string) ([]Value, time.Time, bool) {
 	dc := c.days[date]
 	if dc == nil {
 		return nil, time.Time{}, false

@@ -71,6 +71,7 @@ type Service struct {
 
 	itemLocks   sync.Map // item id -> *sync.Mutex
 	reconcileMu sync.Mutex
+	repairMu    sync.Mutex
 	// stateMu makes a rendered response consistent: op state changes that
 	// move status, rows and revision (done, failed) take it exclusively; a
 	// render (status + items + snapshot) holds it shared.
@@ -566,6 +567,14 @@ func (s *Service) postOp(ctx context.Context, op Op, preJournaled bool) string {
 	case err == nil:
 		s.markDone(op.ID, vid, attempts, now)
 		return OpDone
+	case errors.As(err, &pe) && (op.PairOp != "" || isMoveRow(op)) && attempts > 1:
+		// The undo half of a move: an EARLIER attempt was uncertain and may
+		// still land, so this rejection proves nothing about the row. Keep
+		// it open (re-read, re-post with backoff); failing it now could
+		// cancel the destination while the source undo lands later.
+		log.Printf("fuel: move op %s rejected on attempt %d (HTTP %d); kept open", op.ID, attempts, pe.Status)
+		_ = s.journal.Append(journalRec{T: "state", OpID: op.ID, State: OpUncertain, Attempts: attempts, At: now})
+		return OpUncertain
 	case errors.As(err, &pe) && op.Reason == "compensation":
 		// The obligation stays open: retried with the same op_id.
 		log.Printf("fuel: compensation %s rejected by Variables (HTTP %d); will retry", op.ID, pe.Status)
@@ -613,6 +622,10 @@ func (s *Service) failOp(op Op, now time.Time) {
 		return
 	}
 	s.failureNotice(op, now)
+	// A failed undo half of a move: its new row (if written) is cancelled
+	// by repairMoves, which derives the obligation from the journal, so a
+	// crash right here cannot lose it.
+	s.repairMoves()
 	s.kickReconcile()
 }
 
@@ -632,6 +645,45 @@ func (s *Service) failureNotice(op Op, now time.Time) {
 	}
 	eid := op.EntryID
 	_, _ = s.feed.Append(FeedItem{At: now, Role: "fuel", Text: &msg, EntryID: &eid, NoticeOp: op.ID})
+}
+
+// repairMoves writes the compensation of every move whose undo half FAILED
+// after its new row was written (derived from the journal: a failed op with
+// PairOp, a done pair, no compensation of the pair yet). Idempotent.
+func (s *Service) repairMoves() {
+	s.repairMu.Lock() // check and insert are one step
+	defer s.repairMu.Unlock()
+	for _, op := range s.journal.Ops() {
+		if op.PairOp == "" || op.State != OpFailed {
+			continue
+		}
+		pair, ok := s.journal.Op(op.PairOp)
+		if !ok || pair.State != OpDone {
+			continue
+		}
+		has := false
+		for _, c := range s.journal.ItemOps(pair.ItemID) {
+			has = has || c.Compensates == pair.ID
+		}
+		if has {
+			continue
+		}
+		ni, ok := s.journal.Item(pair.ItemID)
+		if !ok {
+			continue
+		}
+		c := s.newCorrectionOp(ni, requiredKnown(pair.Macros.Neg()), "compensation", nil)
+		c.Compensates = pair.ID
+		// ONE identity per destination row: a second writer of the same
+		// cancellation would count once.
+		c.ID = "op_cmp_" + pair.ID
+		c.Data["op_id"] = c.ID
+		if err := s.journal.Append(journalRec{T: "txn", Ops: []Op{c}}); err != nil {
+			log.Printf("fuel: journal compensation for move %s failed", op.ID)
+			continue
+		}
+		s.postOp(context.Background(), c, false) // retried by the reconciler if uncertain
+	}
 }
 
 // reconcileOnce finishes or compensates every non-terminal op by op_id, then
@@ -661,6 +713,7 @@ func (s *Service) reconcileOnce(ctx context.Context) {
 		s.reconcileOp(ctx, op.ID, now, readDays)
 		l.Unlock()
 	}
+	s.repairMoves()
 	s.refreshFailedDays(ctx, now, readDays)
 	s.compensate(ctx, readDays)
 	s.coachCatchUp(ctx, now)
@@ -715,19 +768,22 @@ func (s *Service) reconcileOp(ctx context.Context, opID string, now time.Time, r
 	if !ok || terminal(op.State) {
 		return
 	}
+	if op.PairOp != "" && !s.pairReady(op) {
+		return // the undo half of a move waits for its new row
+	}
 	if !readDays[op.Date] {
 		if err := s.cache.RefreshDay(ctx, op.Date); err != nil {
 			log.Printf("fuel: reconcile read %s: %s", op.Date, errClass(err))
 			// The 24 h deadline does not depend on reads working; the op's
 			// identity stays in the journal, and a late row is compensated.
-			if op.Reason != "compensation" && now.Sub(op.CreatedAt) >= s.o.FailAfter {
+			if op.Reason != "compensation" && op.PairOp == "" && !isMoveRow(op) && now.Sub(op.CreatedAt) >= s.o.FailAfter {
 				s.failOp(op, now)
 			}
 			return
 		}
 		readDays[op.Date] = true
 	}
-	rows, _, _ := s.cache.Rows(op.Date)
+	rows, _, _ := s.cache.RowsRaw(op.Date)
 	for _, r := range dedupeRows(rows) {
 		if id, _ := r.Data["op_id"].(string); id == op.WireID() {
 			s.markDone(op.ID, r.ID, op.Attempts, now)
@@ -735,7 +791,7 @@ func (s *Service) reconcileOp(ctx context.Context, opID string, now time.Time, r
 			return
 		}
 	}
-	if op.Reason == "compensation" {
+	if op.Reason == "compensation" || op.PairOp != "" || isMoveRow(op) {
 		// A compensation keeps ONE identity forever: it is re-posted with
 		// the same op_id (duplicates count once) and never fails, so a late
 		// row can never add to a replacement. Backoff: 60 s for the first
@@ -772,6 +828,9 @@ func (s *Service) compensate(ctx context.Context, readDays map[string]bool) {
 			continue // no view of the day yet: refreshFailedDays reads it
 		}
 		for _, itemID := range e.ItemIDs {
+			if e.Intent == "move" && !s.journal.OriginalFailed(itemID) {
+				continue // only the items whose new row failed (a late row)
+			}
 			l := s.itemLock(itemID)
 			if !l.LockCtx(ctx) {
 				return
@@ -781,7 +840,7 @@ func (s *Service) compensate(ctx context.Context, readDays map[string]bool) {
 				outstanding = outstanding || !terminal(op.State)
 			}
 			residual := func() (Macros, bool) {
-				rows, _, _ := s.cache.Rows(e.Date)
+				rows, _, _ := s.cache.RowsRaw(e.Date)
 				c, _, found := itemContrib(rows, itemID)
 				return c.cancel(), found && c.residual()
 			}
@@ -813,7 +872,7 @@ func (s *Service) compensate(ctx context.Context, readDays map[string]bool) {
 
 // rowPresent reports whether a row with the op's op_id is in the cache.
 func (s *Service) rowPresent(op Op) bool {
-	rows, _, _ := s.cache.Rows(op.Date)
+	rows, _, _ := s.cache.RowsRaw(op.Date)
 	for _, r := range rows {
 		if id, _ := r.Data["op_id"].(string); id == op.WireID() {
 			return true
@@ -945,6 +1004,37 @@ func (s *Service) viewItem(it Item) itemView {
 			eff = eff.Add(op.Macros)
 		}
 	}
+	// The SOURCE of a failed move stays pending until the cancellation of
+	// its written destination row exists and is done (otherwise a second
+	// move or an undo of the source would expose that destination).
+	for _, op := range ops {
+		if op.PairOp == "" || op.State != OpFailed {
+			continue
+		}
+		if pair, ok := s.journal.Op(op.PairOp); ok && pair.State == OpDone {
+			settled := false
+			for _, c := range s.journal.ItemOps(pair.ItemID) {
+				settled = settled || (c.Compensates == pair.ID && c.State == OpDone)
+			}
+			if !settled {
+				v.pending = true
+			}
+		}
+	}
+	// The destination of a move stays pending until the source undo is done
+	// (or, if that failed, until its cancellation is done).
+	for _, op := range ops {
+		if op.Kind != "original" {
+			continue
+		}
+		if u, ok := s.journal.PairUndo(op.ID); ok && u.State != OpDone {
+			if u.State != OpFailed {
+				v.pending = true
+			} else if !st.Undone {
+				v.pending = true // its compensation is not journaled yet
+			}
+		}
+	}
 	if f, ok := s.journal.Fraction(it.ID); ok {
 		st.Fraction = &f
 	}
@@ -975,6 +1065,43 @@ func (s *Service) viewItem(it Item) itemView {
 // entryStatus: failed if the entry failed, pending while any op is not
 // terminal, else done.
 func (s *Service) entryStatus(e Entry) string {
+	if e.Intent == "move" {
+		// A move never fails as a whole: pending while any of its ops (or a
+		// cancellation they caused) is unsettled, then done; the per-item
+		// outcome is in the summary.
+		for _, id := range e.FixOps {
+			if op, ok := s.journal.Op(id); ok && !terminal(op.State) {
+				return StatusPending
+			}
+		}
+		for _, itemID := range e.ItemIDs {
+			for _, op := range s.journal.ItemOps(itemID) {
+				if !terminal(op.State) {
+					return StatusPending
+				}
+			}
+		}
+		// A failed undo half whose new row was written needs its
+		// cancellation to exist and be done.
+		for _, id := range e.FixOps {
+			u, ok := s.journal.Op(id)
+			if !ok || u.PairOp == "" || u.State != OpFailed {
+				continue
+			}
+			pair, ok := s.journal.Op(u.PairOp)
+			if !ok || pair.State != OpDone {
+				continue
+			}
+			settled := false
+			for _, c := range s.journal.ItemOps(pair.ItemID) {
+				settled = settled || (c.Compensates == pair.ID && c.State == OpDone)
+			}
+			if !settled {
+				return StatusPending
+			}
+		}
+		return StatusDone
+	}
 	if isChatFix(e) {
 		// A chat correction's status is its OWN ops (they carry the
 		// original entry's id, so e.Failed never moves for them).

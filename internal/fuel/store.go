@@ -88,7 +88,15 @@ type Entry struct {
 	FixText  string    `json:"fix_text,omitempty"`
 	FixOps   []string  `json:"fix_ops,omitempty"`
 	FixLines []FixLine `json:"fix_lines,omitempty"`
-	Widgets  []string  `json:"widgets,omitempty"`
+	// MoveTo is the target date of intent "move".
+	MoveTo string `json:"move_to,omitempty"`
+	// DayLabel is set when a log was for another day than the day it was
+	// sent ("Wed 30 Sep"); the reply then names the day.
+	DayLabel string `json:"day_label,omitempty"`
+	// Note replaces the status line with a code-generated refusal (a day in
+	// the future or too far back); nothing was written.
+	Note    string   `json:"note,omitempty"`
+	Widgets []string `json:"widgets,omitempty"`
 }
 
 // Op is one journaled row write.
@@ -100,14 +108,17 @@ type Op struct {
 	RowItemID string `json:"row_item_id"` // the item_id written on the row
 	Reason    string `json:"reason,omitempty"`
 	// Compensates is the op a compensation row cancels (one per op).
-	Compensates string         `json:"compensates,omitempty"`
-	Fraction    *float64       `json:"fraction,omitempty"`
-	Date        string         `json:"date"`
-	ClientID    string         `json:"client_id,omitempty"` // undo / fraction request that made it
-	ReqHash     string         `json:"req_hash,omitempty"`
-	Data        map[string]any `json:"data"`
-	Macros      Macros         `json:"macros"`
-	CreatedAt   time.Time      `json:"created_at"`
+	Compensates string `json:"compensates,omitempty"`
+	// PairOp (the undo half of a move) names the op of the NEW row: the
+	// undo is posted only after that op is done.
+	PairOp    string         `json:"pair_op,omitempty"`
+	Fraction  *float64       `json:"fraction,omitempty"`
+	Date      string         `json:"date"`
+	ClientID  string         `json:"client_id,omitempty"` // undo / fraction request that made it
+	ReqHash   string         `json:"req_hash,omitempty"`
+	Data      map[string]any `json:"data"`
+	Macros    Macros         `json:"macros"`
+	CreatedAt time.Time      `json:"created_at"`
 
 	State    string    `json:"state"`
 	ValueID  string    `json:"value_id,omitempty"`
@@ -168,6 +179,7 @@ type Journal struct {
 	fractions map[string]FractionChoice
 	doneByDay map[string]int // date -> done ops (the revision)
 	idents    map[string]Identity
+	pairUndo  map[string]string    // a move's new-row op id -> its undo op id
 	syncFn    func(*os.File) error // (*os.File).Sync; tests inject failures
 	size      int64                // file size after the last good append
 	broken    error                // set when durability became uncertain; no more appends
@@ -248,7 +260,7 @@ func OpenJournal(path string) (*Journal, error) {
 	j := &Journal{
 		entries: map[string]*Entry{}, items: map[string]*Item{}, ops: map[string]*Op{},
 		itemOps: map[string][]string{}, fractions: map[string]FractionChoice{}, doneByDay: map[string]int{},
-		idents: map[string]Identity{},
+		idents: map[string]Identity{}, pairUndo: map[string]string{},
 	}
 	err := loadLines(path, true, func(b []byte) error {
 		var r journalRec
@@ -297,6 +309,9 @@ func (j *Journal) apply(r journalRec) {
 			}
 			j.ops[op.ID] = &op
 			j.itemOps[op.ItemID] = append(j.itemOps[op.ItemID], op.ID)
+			if op.PairOp != "" {
+				j.pairUndo[op.PairOp] = op.ID
+			}
 			if op.ClientID != "" {
 				j.idents[op.ClientID] = Identity{Kind: op.Reason, Hash: op.ReqHash, At: op.CreatedAt, EntryID: op.EntryID, ItemID: op.ItemID, OpID: op.ID}
 			}
@@ -350,7 +365,9 @@ func (j *Journal) apply(r journalRec) {
 			// second record can be lost between the two. A failed
 			// correction (undo, fraction, fix, compensation) fails only
 			// itself: it must never cancel the rest of the meal.
-			if e := j.entries[op.EntryID]; e != nil && op.Kind == "original" {
+			// A move entry never fails as a whole either: each item moves
+			// (or stays) on its own.
+			if e := j.entries[op.EntryID]; e != nil && op.Kind == "original" && e.Intent != "move" {
 				e.Failed = true
 			}
 		}
@@ -522,11 +539,45 @@ func (j *Journal) FailedEntries() []Entry {
 	defer j.mu.Unlock()
 	var out []Entry
 	for _, e := range j.entries {
-		if e.Failed {
+		if e.Failed || (e.Intent == "move" && j.anyFailedOriginalLocked(e)) {
 			out = append(out, *e)
 		}
 	}
 	return out
+}
+
+func (j *Journal) anyFailedOriginalLocked(e *Entry) bool {
+	for _, id := range e.ItemIDs {
+		for _, opID := range j.itemOps[id] {
+			if op := j.ops[opID]; op != nil && op.Kind == "original" && op.State == OpFailed {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// PairUndo returns the undo op paired with a move's new-row op.
+func (j *Journal) PairUndo(newOpID string) (Op, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	id, ok := j.pairUndo[newOpID]
+	if !ok || j.ops[id] == nil {
+		return Op{}, false
+	}
+	return *j.ops[id], true
+}
+
+// OriginalFailed reports whether the item's own original row op failed.
+func (j *Journal) OriginalFailed(itemID string) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	for _, opID := range j.itemOps[itemID] {
+		if op := j.ops[opID]; op != nil && op.Kind == "original" && op.State == OpFailed {
+			return true
+		}
+	}
+	return false
 }
 
 func (j *Journal) Fraction(itemID string) (float64, bool) {
