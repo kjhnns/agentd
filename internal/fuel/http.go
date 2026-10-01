@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -159,6 +160,7 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("GET /fuel/snapshot", s.handleSnapshot)
 	mux.HandleFunc("GET /fuel/recent", s.handleRecent)
 	mux.HandleFunc("POST /fuel/relog", s.handleRelog)
+	mux.HandleFunc("GET /fuel/day", s.handleDay)
 	mux.HandleFunc("/fuel/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errf(http.StatusNotFound, "not_found", false, "no such route"))
 	})
@@ -619,6 +621,11 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errf(http.StatusGatewayTimeout, "timeout", true, "took too long; nothing was written, retry"))
 		return
 	}
+	if out.Intent == "undo" {
+		s.finishUndo(ctx, w, out, in.ClientID, hash, foodText, now, t0,
+			map[string]int{"upload": ms(upload), "asr": ms(asrD), "model": ms(modelD)})
+		return
+	}
 	if out.Intent == "correct" {
 		s.finishCorrect(ctx, w, out, in.ClientID, hash, foodText, date, now, t0,
 			map[string]int{"upload": ms(upload), "asr": ms(asrD), "model": ms(modelD)})
@@ -873,7 +880,7 @@ func (s *Service) buildLogResponse(e Entry) (LogResponse, string) {
 	if e.NoFood {
 		blocks = []Block{textBlock(noFoodText)}
 	}
-	if e.Intent == "correct" {
+	if isChatFix(e) {
 		blocks = correctBlocks(s, e, snap)
 		photos := e.PhotoIDs
 		if photos == nil {
@@ -1070,6 +1077,21 @@ func (s *Service) runOps(ctx context.Context, ops []Op) string {
 	return StatusDone
 }
 
+// deterministicOp gives an op a fixed id (rows of other writers: a retry,
+// or the same request from the food-log, writes the same op_id, which counts
+// once). The journal refuses a second op with the same id.
+func (s *Service) deterministicOp(op *Op, id string) {
+	// The wire op_id is FIXED (the food-log writes the same one, and any
+	// later attempt of the same removal must count once with them); the
+	// journal keeps its own unique op id.
+	op.Data["op_id"] = id
+}
+
+func shortHash(v string) string {
+	h := sha256.Sum256([]byte(v))
+	return hex.EncodeToString(h[:6])
+}
+
 func fixTgtString(t FixTarget) string {
 	f := func(p *float64) string {
 		if p == nil {
@@ -1113,6 +1135,7 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 	var body struct {
 		ClientID string   `json:"client_id"`
 		ItemID   string   `json:"item_id"`
+		RowKey   string   `json:"row_key"`
 		Fraction *float64 `json:"fraction"`
 		PortionG *float64 `json:"portion_g"`
 		VolumeML *float64 `json:"volume_ml"`
@@ -1128,8 +1151,20 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "bad JSON body"))
 		return
 	}
-	if !clientIDRe.MatchString(body.ClientID) || body.ItemID == "" {
-		writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "client_id and item_id are required"))
+	if body.RowKey != "" {
+		if body.ItemID != "" && body.ItemID != body.RowKey {
+			writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "give item_id or row_key, not both"))
+			return
+		}
+		body.ItemID = body.RowKey // a Fuel item_id, or "v:<value id>"
+	}
+	if !clientIDRe.MatchString(body.ClientID) || body.ItemID == "" || len(body.ItemID) > 100 {
+		writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "client_id and item_id (or row_key) are required"))
+		return
+	}
+	external := isExternalKey(body.ItemID)
+	if external && kind == "fraction" {
+		writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "fraction is for Fuel photo items; use fix with a share"))
 		return
 	}
 	var f float64
@@ -1182,7 +1217,25 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 	}
 	defer claim.release()
 
-	it, ok := s.journal.Item(body.ItemID)
+	var it Item
+	var ok bool
+	if external {
+		// A row written by another writer: found in the cached window and
+		// stood in for by a synthetic item keyed by its row key.
+		s.freshen(ctx, s.today())
+		date, found := s.findRow(body.ItemID)
+		if !found && s.loadWindow(ctx) {
+			date, found = s.findRow(body.ItemID)
+		}
+		if !found {
+			writeErr(w, errf(http.StatusNotFound, "not_found", false, "unknown row"))
+			return
+		}
+		rows, _, _ := s.cache.Rows(date)
+		it, ok = externalItem(body.ItemID, date, rows)
+	} else {
+		it, ok = s.journal.Item(body.ItemID)
+	}
 	if !ok {
 		writeErr(w, errf(http.StatusNotFound, "not_found", false, "unknown item"))
 		return
@@ -1199,7 +1252,7 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		ae = errf(http.StatusConflict, "pending", true, "the item is still being saved")
 	case v.failed:
 		ae = errf(http.StatusConflict, "failed", false, "the entry could not be saved")
-	case !v.origDone:
+	case !v.origDone && !external:
 		ae = errf(http.StatusConflict, "pending", true, "the item is not saved")
 	case v.state.Undone:
 		ae = errf(http.StatusConflict, "already_undone", false, "the item is already undone")
@@ -1236,11 +1289,25 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		return
 	}
 	dayRows, _, _ := s.cache.Rows(it.Date)
-	ic, origRow, _ := itemContrib(dayRows, it.ID)
+	ic, origRow, found := itemContrib(dayRows, it.ID)
+	if external && (!found || origRow.Data == nil) {
+		l.Unlock()
+		writeErr(w, errf(http.StatusNotFound, "not_found", false, "the row was deleted"))
+		return
+	}
+	if found && ic.undone {
+		// Undone in the authoritative rows, by any writer.
+		l.Unlock()
+		writeErr(w, errf(http.StatusConflict, "already_undone", false, "the item is already undone"))
+		return
+	}
 	switch kind {
 	case "undo":
 		// Cancels the known sum of every field; deleted outside = zeros.
 		o := s.newCorrectionOp(it, requiredKnown(ic.cancel()), "undo", nil)
+		if external {
+			s.deterministicOp(&o, "op_undo_"+strings.TrimPrefix(it.ID, "v:"))
+		}
 		op = &o
 	case "fix":
 		o, ae := s.absoluteCorrection(it, dayRows, fixTgt, "fix", nil)
@@ -1254,7 +1321,11 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 			// request identity is journaled so a retry replays this answer
 			// (and never writes later, after other changes).
 			ir := &IdentRec{ClientID: body.ClientID, Kind: kind, Hash: hash, ItemID: it.ID, EntryID: it.EntryID, At: now}
-			if err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Ident: ir, At: now}); err != nil {
+			noop := journalRec{T: "txn", Ident: ir, At: now}
+			if external {
+				noop.Items = []Item{it} // so a replay finds the stand-in
+			}
+			if err := s.journal.AppendCtx(ctx, noop); err != nil {
 				l.Unlock()
 				writeErr(w, errf(http.StatusInternalServerError, "internal", true, "could not persist the request"))
 				return
@@ -1286,8 +1357,23 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 			op = o
 		}
 	}
-	_ = ic
+	if external && kind == "fix" && op != nil {
+		// The id names the target AND the row state it was computed from
+		// (the value ids of the row and its corrections), so 300 -> 200 ->
+		// 100 -> 200 ml writes a new op_id for the last step.
+		var state []string
+		if g := itemGroup(dayRows, it.ID); g != nil {
+			for _, r := range g.rows {
+				state = append(state, r.ID)
+			}
+		}
+		sort.Strings(state)
+		s.deterministicOp(op, "op_fix_"+strings.TrimPrefix(it.ID, "v:")+"_"+shortHash(fixTgtString(fixTgt)+"|"+strings.Join(state, ",")))
+	}
 	rec := journalRec{T: "txn", Fraction: choice, At: now}
+	if external {
+		rec.Items = []Item{it} // the stand-in, so replays find it
+	}
 	if op != nil {
 		op.ClientID, op.ReqHash = body.ClientID, hash
 		op.Attempts, op.LastTry = 1, now
@@ -1526,7 +1612,7 @@ func (s *Service) writeEntry(w http.ResponseWriter, e Entry) {
 	if e.NoFood {
 		blocks = []Block{textBlock(noFoodText)}
 	}
-	if e.Intent == "correct" {
+	if isChatFix(e) {
 		blocks = correctBlocks(s, e, snap)
 	} else if b, ok := widgetBlock("macros_today", snap, addedOf(effs)); ok {
 		blocks = append(blocks, b)
@@ -1632,7 +1718,7 @@ func (s *Service) handleFeed(w http.ResponseWriter, r *http.Request) {
 	for _, it := range page {
 		fo := feedOut{ID: it.ID, At: it.At, Role: it.Role, Text: it.Text, PhotoIDs: it.PhotoIDs, EntryID: it.EntryID, Items: []ItemState{}, Blocks: it.Blocks}
 		if it.EntryID != nil && it.Role == "fuel" && len(fo.Blocks) > 0 && fo.Blocks[0].Type == "text" {
-			if e, ok := s.journal.Entry(*it.EntryID); ok && e.Intent == "correct" && it.Key == "r:"+e.ID {
+			if e, ok := s.journal.Entry(*it.EntryID); ok && isChatFix(e) && it.Key == "r:"+e.ID {
 				// A correction reply shows its ops' CURRENT state.
 				blocks := append([]Block(nil), fo.Blocks...)
 				blocks[0].Text = s.correctSummary(e)

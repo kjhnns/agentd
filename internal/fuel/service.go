@@ -377,6 +377,16 @@ func (s *Service) Stop() {
 	s.workers.Wait()
 }
 
+// WireID is the op_id written on the row: normally the op's own id; for a
+// row of another writer a deterministic id shared with that writer (the
+// journal id stays unique per attempt).
+func (op Op) WireID() string {
+	if id, _ := op.Data["op_id"].(string); id != "" {
+		return id
+	}
+	return op.ID
+}
+
 // LastTryOr is the last attempt time, else the creation time.
 func (op Op) LastTryOr() time.Time {
 	if !op.LastTry.IsZero() {
@@ -519,6 +529,12 @@ func correctionRowData(it Item, m Macros, opID, rowItemID, reason string) map[st
 		"corrects": it.ID,
 		"reason":   reason,
 		"eaten_at": it.EatenAt.Format(time.RFC3339),
+	}
+	if strings.HasPrefix(it.ID, "v:") {
+		// A row written by another writer (the agentd food-log): corrects
+		// names its VALUE id, the food-log convention; no Fuel entry.
+		d["corrects"] = strings.TrimPrefix(it.ID, "v:")
+		delete(d, "entry_id")
 	}
 	m.putInto(d)
 	return d
@@ -713,7 +729,7 @@ func (s *Service) reconcileOp(ctx context.Context, opID string, now time.Time, r
 	}
 	rows, _, _ := s.cache.Rows(op.Date)
 	for _, r := range dedupeRows(rows) {
-		if id, _ := r.Data["op_id"].(string); id == op.ID {
+		if id, _ := r.Data["op_id"].(string); id == op.WireID() {
 			s.markDone(op.ID, r.ID, op.Attempts, now)
 			log.Printf("fuel: op %s reconciled: found as value %s", op.ID, r.ID)
 			return
@@ -799,7 +815,7 @@ func (s *Service) compensate(ctx context.Context, readDays map[string]bool) {
 func (s *Service) rowPresent(op Op) bool {
 	rows, _, _ := s.cache.Rows(op.Date)
 	for _, r := range rows {
-		if id, _ := r.Data["op_id"].(string); id == op.ID {
+		if id, _ := r.Data["op_id"].(string); id == op.WireID() {
 			return true
 		}
 	}
@@ -959,7 +975,7 @@ func (s *Service) viewItem(it Item) itemView {
 // entryStatus: failed if the entry failed, pending while any op is not
 // terminal, else done.
 func (s *Service) entryStatus(e Entry) string {
-	if e.Intent == "correct" {
+	if isChatFix(e) {
 		// A chat correction's status is its OWN ops (they carry the
 		// original entry's id, so e.Failed never moves for them).
 		st := StatusDone

@@ -151,7 +151,7 @@ func (s *Service) lastItems() []LastItem {
 	var out []LastItem
 	for i := len(items) - 1; i >= 0; i-- { // newest last
 		it := items[i]
-		li := LastItem{ItemID: it.ID, Item: it.Name, Kind: it.KindOr(), PortionG: it.PortionG, NewestEntry: it.EntryID == newest.ID}
+		li := LastItem{ItemID: it.ID, Item: it.Name, Kind: it.KindOr(), PortionG: it.PortionG, NewestEntry: it.EntryID == newest.ID, At: s.localHHMM(it.EatenAt)}
 		if it.Orig.VolumeML.OK && it.Orig.VolumeML.V > 0 {
 			v := it.Orig.VolumeML.float()
 			li.VolumeML = &v
@@ -509,6 +509,8 @@ func (s *Service) correctSummary(e Entry) string {
 			if op, ok := s.journal.Op(l.OpID); ok {
 				it, _ := s.journal.Item(op.ItemID)
 				switch {
+				case op.State == OpFailed && op.Reason == "undo":
+					text = "Could not remove " + it.Name + "; it is still logged."
 				case op.State == OpFailed:
 					text = "Could not save the correction of " + it.Name + "; nothing changed for it."
 				case !terminal(op.State):
@@ -595,4 +597,13 @@ func (s *Service) finishCorrect(ctx context.Context, w http.ResponseWriter, out 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_, _ = w.Write(append(b, '\n'))
+}
+
+// localHHMM renders an instant as HH:MM in the targets tz.
+func (s *Service) localHHMM(t time.Time) string {
+	loc := time.UTC
+	if tg, err := s.loadTargets(); err == nil && tg != nil {
+		loc = tg.loc
+	}
+	return t.In(loc).Format("15:04")
 }

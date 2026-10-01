@@ -3,6 +3,7 @@ package fuel
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -432,8 +433,12 @@ func totalsFromRows(rows []Value) DayTotals {
 
 // itemGroup returns the contribution group of one item (nil when absent).
 func itemGroup(rows []Value, itemID string) *group {
+	key := "i:" + itemID
+	if strings.HasPrefix(itemID, "v:") {
+		key = itemID // an external row key is the group key itself
+	}
 	for _, g := range groupRows(rows) {
-		if g.key == "i:"+itemID {
+		if g.key == key {
 			return g
 		}
 	}
@@ -444,10 +449,8 @@ func itemGroup(rows []Value, itemID string) *group {
 // original row and every correction of it. orig is the original row (zero
 // Value when absent); ok is false when no row of the item is present.
 func itemContrib(rows []Value, itemID string) (*contrib, Value, bool) {
-	for _, g := range groupRows(rows) {
-		if g.key == "i:"+itemID {
-			return g.c, g.orig, g.c.rows > 0
-		}
+	if g := itemGroup(rows, itemID); g != nil {
+		return g.c, g.orig, g.c.rows > 0
 	}
 	return newContrib(), Value{}, false
 }
