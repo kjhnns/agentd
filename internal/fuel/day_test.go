@@ -351,3 +351,12 @@ func TestExternalFixSequenceBackToAnEarlierAmount(t *testing.T) {
 		t.Fatalf("fluids %v", intake(snap, "fluids_ml").Consumed)
 	}
 }
+
+func TestRowKeyOfARowWrittenSecondsAgo(t *testing.T) {
+	h := newHarness(t)
+	cof := agentdRow(h, "filter coffee", 300, 2, "2026-10-01T11:59:00+02:00", nil) // no clock advance: cache is fresh
+	b, _ := json.Marshal(map[string]any{"client_id": "g1000006-0001", "row_key": "v:" + cof})
+	if r := h.do("POST", "/fuel/undo", bytes.NewReader(b), "application/json"); r.Code != 200 {
+		t.Fatalf("%d %s", r.Code, r.Body)
+	}
+}

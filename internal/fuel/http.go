@@ -1224,6 +1224,9 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		// stood in for by a synthetic item keyed by its row key.
 		s.freshen(ctx, s.today())
 		date, found := s.findRow(body.ItemID)
+		if !found && s.cache.RefreshDay(ctx, s.today()) == nil {
+			date, found = s.findRow(body.ItemID) // written seconds ago
+		}
 		if !found && s.loadWindow(ctx) {
 			date, found = s.findRow(body.ItemID)
 		}
