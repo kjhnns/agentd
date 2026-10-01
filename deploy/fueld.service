@@ -15,7 +15,7 @@ ExecStart=%h/.local/bin/fueld -config %h/.config/fueld/config.toml
 WorkingDirectory=%h
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=90
+TimeoutStopSec=150
 UMask=0077
 NoNewPrivileges=yes
 

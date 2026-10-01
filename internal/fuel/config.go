@@ -27,12 +27,20 @@ type DaemonConfig struct {
 	Model         string
 	ModelKey      string // literal or "env:VAR"
 	ModelEffort   string
-	WhisperModel  string
-	TargetsFile   string
-	StaplesFile   string
-	StateDir      string
-	StravaDir     string
-	TestMode      bool
+	// ModelChat / ModelChatEffort: the model for non-log intents (spec 17
+	// G). Both empty = the fast model answers everything.
+	ModelChat       string
+	ModelChatEffort string
+	// LogBudget is the whole POST /fuel/log after the body is read;
+	// ModelTimeout is one model call (Go durations).
+	LogBudget    string
+	ModelTimeout string
+	WhisperModel string
+	TargetsFile  string
+	StaplesFile  string
+	StateDir     string
+	StravaDir    string
+	TestMode     bool
 
 	// Second-opinion recalibration of photo meals (spec section 16).
 	RecalibrateEnabled     bool
@@ -61,7 +69,10 @@ func DefaultDaemonConfig() DaemonConfig {
 		StateDir:      "~/.local/state/fueld",
 		StravaDir:     "~/warehouse/raw-sources/strava",
 
-		RecalibrateAgentdURL:   "http://127.0.0.1:8798",
+		RecalibrateAgentdURL: "http://127.0.0.1:8798",
+		LogBudget:            "90s",
+		ModelTimeout:         "60s",
+
 		RecalibrateTimeout:     "10m",
 		RecalibrateMinInterval: "30s",
 	}
@@ -133,8 +144,10 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 			"listen": &c.Listen, "token": &c.Token, "variables_url": &c.VariablesURL,
 			"variables_key": &c.VariablesKey, "food_log_var": &c.FoodLogVar, "body_var": &c.BodyVar,
 			"model_provider": &c.ModelProvider, "model": &c.Model, "model_key": &c.ModelKey,
-			"model_effort": &c.ModelEffort, "whisper_model": &c.WhisperModel,
-			"targets_file": &c.TargetsFile, "staples_file": &c.StaplesFile,
+			"model_effort": &c.ModelEffort, "model_chat": &c.ModelChat, "model_chat_effort": &c.ModelChatEffort,
+			"log_budget": &c.LogBudget, "model_timeout": &c.ModelTimeout,
+			"whisper_model": &c.WhisperModel,
+			"targets_file":  &c.TargetsFile, "staples_file": &c.StaplesFile,
 			"state_dir": &c.StateDir, "strava_dir": &c.StravaDir,
 			"recalibrate_agentd_url": &c.RecalibrateAgentdURL, "recalibrate_agentd_token": &c.RecalibrateAgentdToken,
 			"recalibrate_timeout": &c.RecalibrateTimeout, "recalibrate_min_interval": &c.RecalibrateMinInterval,
@@ -151,7 +164,8 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 	if c.Listen == "" {
 		return c, errors.New("listen is empty")
 	}
-	for k, v := range map[string]string{"recalibrate_timeout": c.RecalibrateTimeout, "recalibrate_min_interval": c.RecalibrateMinInterval} {
+	for k, v := range map[string]string{"recalibrate_timeout": c.RecalibrateTimeout, "recalibrate_min_interval": c.RecalibrateMinInterval,
+		"log_budget": c.LogBudget, "model_timeout": c.ModelTimeout} {
 		if d, err := time.ParseDuration(v); err != nil || d <= 0 {
 			return c, fmt.Errorf("%s %q is not a positive duration", k, v)
 		}

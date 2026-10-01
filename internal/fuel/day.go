@@ -56,6 +56,9 @@ func (s *Service) dayItems(date string) []DayItem {
 		if strings.TrimSpace(name) == "" {
 			continue
 		}
+		if n := baseName(g); n != "" {
+			name = n
+		}
 		eff := g.c.effective()
 		origM := macrosFromData(d)
 		origM.normalizeNetCarbs()

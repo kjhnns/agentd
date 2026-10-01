@@ -13,6 +13,10 @@ model_provider = "openai"
 model          = "gpt-5.1"
 model_key      = "env:OPENAI_API_KEY"          # pass openai/api-key (also used for Whisper)
 # model_effort = ""                            # optional reasoning_effort
+# model_chat  = ""                            # optional: a second model for non-log turns (correct, undo, move, question)
+# model_chat_effort = ""
+log_budget     = "90s"                         # a whole POST /fuel/log (quality over speed, spec 17)
+model_timeout  = "60s"                         # one model call
 whisper_model  = "whisper-1"
 targets_file   = "~/.agentd/fuel-targets.json" # missing = built-in defaults
 staples_file   = "~/.agentd/fuel-staples.json" # shared with ~/clawd/scripts/food-log

@@ -49,6 +49,8 @@ type Item struct {
 	Kind          string    `json:"kind,omitempty"` // food | drink | supplement
 	Orig          Macros    `json:"macros"`
 	EatenAt       time.Time `json:"eaten_at"`
+	// Check is set when the estimate stayed implausible after a re-ask.
+	Check string `json:"check,omitempty"`
 }
 
 // FixLine is one line of a chat correction reply: the success text of an
@@ -97,6 +99,9 @@ type Entry struct {
 	// the future or too far back); nothing was written.
 	Note    string   `json:"note,omitempty"`
 	Widgets []string `json:"widgets,omitempty"`
+	// Checks are code-generated lines of a log reply: a scale reading that
+	// replaced an estimate, items whose numbers look implausible.
+	Checks []string `json:"checks,omitempty"`
 }
 
 // Op is one journaled row write.

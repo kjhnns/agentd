@@ -140,7 +140,7 @@ func opinion(matches string, name string, portion, kcal, protein, satFat float64
 	}
 	nb, _ := json.Marshal(name)
 	rb, _ := json.Marshal(reason)
-	return fmt.Sprintf(`{"matches":%s,"item":%s,"portion_g":%g,"kcal":%g,"protein_g":%g,"carbs_g":60,"net_carbs_g":null,"fat_g":14,"sat_fat_g":%g,"fiber_g":4,"confidence":%q,"reason":%s}`,
+	return fmt.Sprintf(`{"matches":%s,"item":%s,"portion_g":%g,"kcal":%g,"protein_g":%g,"carbs_g":60,"net_carbs_g":null,"fat_g":14,"sat_fat_g":%g,"fiber_g":4,"confidence":%q,"evidence":"visual","reason":%s}`,
 		m, nb, portion, kcal, protein, satFat, conf, rb)
 }
 

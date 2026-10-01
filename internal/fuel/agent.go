@@ -112,3 +112,76 @@ func (a *AgentdClient) Ask(ctx context.Context, task string, photos [][]byte) (s
 	}
 	return answer, tag, nil
 }
+
+// AgentModel answers the model step of a chat turn through an agent daemon
+// (the generic agentd API) instead of a chat-completions endpoint: the
+// system text, the output schema and the labelled data go in as the task,
+// photos as media turns. The answer is validated like any model output.
+type AgentModel struct {
+	Agent *AgentdClient
+}
+
+func (a *AgentModel) Estimate(ctx context.Context, in ModelInput) (json.RawMessage, error) {
+	schema, _ := json.Marshal(outputSchema())
+	task := systemFor(in) + "\n\nAnswer with ONLY one JSON object that matches this JSON schema exactly (every key present, no other text):\n" + string(schema) + "\n\n"
+	for _, p := range userContent(in) {
+		if t, _ := p["text"].(string); t != "" {
+			task += t
+		}
+	}
+	photos := append(append([][]byte{}, in.Images...), in.RefImages...)
+	var answer string
+	var err error
+	if len(photos) == 0 {
+		answer, err = a.Agent.AskText(ctx, task)
+	} else {
+		task += "\nThe photo(s) are the image files saved in this session; view every one before you answer."
+		answer, _, err = a.Agent.Ask(ctx, task, photos)
+	}
+	if err != nil {
+		return nil, err
+	}
+	raw := strings.TrimSpace(answer)
+	if i, j := strings.Index(raw, "{"), strings.LastIndex(raw, "}"); i >= 0 && j > i {
+		raw = raw[i : j+1]
+	}
+	return json.RawMessage(raw), nil
+}
+
+// AskText runs a text-only task in a fresh session (POST /sessions, POST
+// /sessions/:id/input, DELETE).
+func (a *AgentdClient) AskText(ctx context.Context, task string) (string, error) {
+	code, b, err := a.do(ctx, http.MethodPost, "/sessions", "application/json", strings.NewReader(`{"title":"fuel chat turn"}`))
+	if err != nil {
+		return "", err
+	}
+	if code != http.StatusCreated && code != http.StatusOK {
+		return "", &statusError{"agent session", code}
+	}
+	var sess struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(b, &sess) != nil || sess.ID == "" {
+		return "", fmt.Errorf("agent: unreadable session answer")
+	}
+	defer func() {
+		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15e9)
+		defer cancel()
+		_, _, _ = a.do(dctx, http.MethodDelete, "/sessions/"+sess.ID, "", nil)
+	}()
+	body, _ := json.Marshal(map[string]string{"text": task})
+	code, b, err = a.do(ctx, http.MethodPost, "/sessions/"+sess.ID+"/input", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	if code != http.StatusOK {
+		return "", &statusError{"agent turn", code}
+	}
+	var turn struct {
+		Result string `json:"result"`
+	}
+	if json.Unmarshal(b, &turn) != nil {
+		return "", fmt.Errorf("agent: unreadable turn answer")
+	}
+	return turn.Result, nil
+}

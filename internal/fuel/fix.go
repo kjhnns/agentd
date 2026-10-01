@@ -43,23 +43,8 @@ func (s *Service) absoluteCorrection(it Item, rows []Value, tgt FixTarget, reaso
 		// Undone in the authoritative rows (also by the agentd food-log).
 		return nil, errf(http.StatusConflict, "already_undone", false, "the item is already undone")
 	}
-	base := macrosFromData(origRow.Data)
-	base.normalizeNetCarbs()
-	var origPortion, origVolume *float64
-	if p, ok := origRow.Data["portion_g"].(float64); ok && p > 0 {
-		origPortion = &p
-	}
-	if v, ok := origRow.Data["volume_ml"].(float64); ok && v > 0 {
-		origVolume = &v
-	}
-	// An applied second opinion replaces the original as the BASE of every
-	// later share (spec 16): its macros and its portion.
-	if bm, bp, ok := recalBase(g); ok {
-		base = withMacroBase(base, bm)
-		if bp != nil {
-			origPortion = bp
-		}
-	}
+	base, origPortion, origVolume := groupBase(g)
+	_ = origRow
 	var share float64
 	switch {
 	case tgt.Share != nil:
@@ -163,6 +148,7 @@ func (s *Service) lastItems() []LastItem {
 		it := items[i]
 		fuel[it.ID] = true
 		li := LastItem{ItemID: it.ID, Item: it.Name, Kind: it.KindOr(), PortionG: s.basePortion(it), NewestEntry: it.EntryID == newest.ID, At: s.localHHMM(it.EatenAt)}
+		s.describeState(&li, it)
 		if it.Orig.VolumeML.OK && it.Orig.VolumeML.V > 0 {
 			v := it.Orig.VolumeML.float()
 			li.VolumeML = &v
@@ -238,10 +224,14 @@ const (
 
 func correctionUnit(c ModelCorrection) string {
 	switch {
-	case c.PortionG != nil:
+	case c.PortionG != nil, c.PortionGDelta != nil:
 		return unitGrams
-	case c.VolumeML != nil:
+	case c.VolumeML != nil, c.VolumeMLDelta != nil:
 		return unitML
+	case c.Revised != nil, c.CountDelta != nil:
+		// A re-estimate or "a second one" names its item (by id or name);
+		// any active item of TODAY qualifies.
+		return unitToday
 	}
 	return unitShare
 }
@@ -294,7 +284,7 @@ func (s *Service) todaysActiveItems() []Item {
 		}
 		for i := len(e.ItemIDs) - 1; i >= 0; i-- {
 			if it, ok := s.journal.Item(e.ItemIDs[i]); ok && s.itemActive(it) {
-				out = append(out, it)
+				out = append(out, s.shown(it))
 			}
 		}
 	}
@@ -313,7 +303,8 @@ func (s *Service) resolveRef(ref, unit string) (Item, bool) {
 	if strings.EqualFold(ref, "last") {
 		return s.resolveLast(unit)
 	}
-	if it, ok := s.journal.Item(ref); ok && s.itemActive(it) {
+	if it, ok := s.journal.Item(ref); ok && s.itemActive(it) && (unit != unitToday || it.Date == s.today()) {
+		it = s.shown(it)
 		// An item_id is how the model points at an item it was shown; for a
 		// share-only ("only half") it must still be in the newest entry,
 		// otherwise "only half" could reach past a newer, empty entry.
@@ -336,8 +327,8 @@ func (s *Service) resolveRef(ref, unit string) (Item, bool) {
 		}
 		for i := len(e.ItemIDs) - 1; i >= 0; i-- {
 			it, ok := s.journal.Item(e.ItemIDs[i])
-			if ok && s.itemActive(it) {
-				cands = append(cands, it)
+			if ok && s.itemActive(it) && (unit != unitToday || it.Date == s.today()) {
+				cands = append(cands, s.shown(it))
 			}
 		}
 		if len(cands) >= 50 {
@@ -376,6 +367,10 @@ func (s *Service) refKnown(ref string) bool {
 
 // unitShareAnyName resolves names and ids without a unit check.
 const unitShareAnyName = "any"
+
+// unitToday resolves names and ids without a unit check, among the items
+// logged for today only.
+const unitToday = "today"
 
 func (s *Service) resolveLast(unit string) (Item, bool) {
 	if unit == unitShare {
@@ -417,12 +412,14 @@ type chatFix struct {
 	tgt  FixTarget
 	op   *Op
 	note string // why nothing was written for it
+	c    ModelCorrection
+	lead string // the reply line, when it is not the plain "Corrected X to N g."
 }
 
 // planChatCorrections resolves the model's corrections and computes the
 // rows under the item locks (taken in id order, released by the caller via
 // unlock). Items that are pending or undone are skipped with a note.
-func (s *Service) planChatCorrections(ctx context.Context, cs []ModelCorrection) ([]chatFix, func(), *apiError) {
+func (s *Service) planChatCorrections(ctx context.Context, cs []ModelCorrection, badRevised map[int]string, additive bool) ([]chatFix, func(), *apiError) {
 	// Resolve against FRESH rows: the newest log entry's day (and today),
 	// so an item undone elsewhere is not chosen.
 	if e, ok := s.newestLogEntry(); ok {
@@ -436,7 +433,12 @@ func (s *Service) planChatCorrections(ctx context.Context, cs []ModelCorrection)
 	var fixes []chatFix
 	seen := map[string]bool{}
 	var notes []string
-	for _, c := range cs {
+	for ci, c := range cs {
+		if why, bad := badRevised[ci]; bad {
+			// Implausible after the re-ask: the item stays as it is.
+			notes = append(notes, "I could not re-estimate "+cleanText(c.Revised.Item, 120)+" reliably ("+why+"). Nothing was changed for it; tell me the amount again.")
+			continue
+		}
 		unit := correctionUnit(c)
 		it, ok := s.resolveRef(c.Ref, unit)
 		if !ok {
@@ -451,7 +453,7 @@ func (s *Service) planChatCorrections(ctx context.Context, cs []ModelCorrection)
 			continue
 		}
 		seen[it.ID] = true
-		fixes = append(fixes, chatFix{it: it, tgt: FixTarget{Share: c.Share, PortionG: c.PortionG, VolumeML: c.VolumeML}})
+		fixes = append(fixes, chatFix{it: it, c: c})
 	}
 	sort.Slice(fixes, func(a, b int) bool { return fixes[a].it.ID < fixes[b].it.ID })
 	var locked []*itemMutex
@@ -495,12 +497,54 @@ func (s *Service) planChatCorrections(ctx context.Context, cs []ModelCorrection)
 			days[f.it.Date] = true
 		}
 		rows, _, _ := s.cache.Rows(f.it.Date)
+		g := itemGroup(rows, f.it.ID)
+		if g == nil || g.orig.Data == nil {
+			f.note = f.it.Name + ": the original row of this item was deleted."
+			continue
+		}
+		if g.c.undone {
+			f.note = f.it.Name + " was already removed."
+			continue
+		}
+		if f.c.Revised != nil {
+			// Checked against the rows the write is computed from.
+			if why := revisedIssue(f.it, g, *f.c.Revised); why != "" {
+				f.note = "I could not re-estimate " + cleanText(f.c.Revised.Item, 120) + " reliably (" + why + "). Nothing was changed for it; tell me the amount again."
+				continue
+			}
+			f.op, f.lead = s.reviseOp(f.it, g, *f.c.Revised)
+			if f.op == nil {
+				f.lead = f.it.Name + " is already counted like that."
+			} else if additive && f.op.Macros.Kcal.OK && f.op.Macros.Kcal.V < 0 {
+				f.op, f.lead, f.note = nil, "", additiveAsk
+			}
+			continue
+		}
+		tgt, lead, note := formTarget(f.it, g, f.c)
+		if note != "" {
+			f.note = note
+			continue
+		}
+		f.tgt, f.lead = tgt, lead
 		op, ae := s.absoluteCorrection(f.it, rows, f.tgt, "fix", nil)
 		if ae != nil {
 			f.note = f.it.Name + ": " + ae.msg + "."
 			continue
 		}
+		if additive && op != nil && (opReduces(op) || amountReduced(g, op)) {
+			// The final check, under the item lock and on fresh rows:
+			// additive words never write a reduction (spec 17 C).
+			f.lead, f.note = "", additiveAsk
+			continue
+		}
 		f.op = op
+	}
+	for _, fx := range fixes {
+		if fx.note == additiveAsk {
+			// The locked additive guard rejects the WHOLE turn: nothing is
+			// written and the reply is only the question (spec 17 C).
+			return []chatFix{{note: additiveAsk}}, unlock, nil
+		}
 	}
 	for _, n := range notes {
 		fixes = append(fixes, chatFix{note: n})
@@ -526,6 +570,9 @@ func fixLines(fixes []chatFix, shownDate string) []FixLine {
 			continue
 		}
 		d := describeFix(f.it, f.op)
+		if f.lead != "" {
+			d = f.lead
+		}
 		if f.it.Date != shownDate {
 			d = strings.TrimSuffix(d, ".") + " (logged on " + f.it.Date + ")."
 		}
@@ -570,11 +617,19 @@ func (s *Service) correctSummary(e Entry) string {
 // finishCorrect journals and writes a chat correction (intent "correct")
 // and answers in the POST /fuel/log shape: the code-generated summary with
 // the status line, macros_today with what changed, the corrected items.
-func (s *Service) finishCorrect(ctx context.Context, w http.ResponseWriter, out *ModelOutput, clientID, hash, userText, date string, now time.Time, t0 time.Time, lat map[string]int) {
-	fixes, unlock, ae := s.planChatCorrections(ctx, out.Corrections)
-	if ae != nil {
-		writeErr(w, ae)
-		return
+func (s *Service) finishCorrect(ctx context.Context, w http.ResponseWriter, out *ModelOutput, clientID, hash, userText, date string, now time.Time, t0 time.Time, lat map[string]int, ask string, badRevised map[int]string, additive bool) {
+	var fixes []chatFix
+	unlock := func() {}
+	if ask != "" {
+		// A question back to the user instead of a write (spec 17 C).
+		fixes = []chatFix{{note: ask}}
+	} else {
+		var ae *apiError
+		fixes, unlock, ae = s.planChatCorrections(ctx, out.Corrections, badRevised, additive)
+		if ae != nil {
+			writeErr(w, ae)
+			return
+		}
 	}
 	entry := Entry{ID: newID("en_"), ClientID: clientID, Date: date, EatenAt: now, CreatedAt: now,
 		Intent: "correct", PhotoIDs: []string{}, ReqHash: hash, UserText: userText}
@@ -650,4 +705,29 @@ func (s *Service) localHHMM(t time.Time) string {
 		loc = tg.loc
 	}
 	return t.In(loc).Format("15:04")
+}
+
+// opReduces reports whether a correction row makes its item smaller.
+func opReduces(op *Op) bool {
+	for _, k := range []string{"kcal", "volume_ml", "protein_g", "carbs_g", "fat_g"} {
+		if v := op.Macros.Get(k); v.OK && v.V != 0 {
+			return v.V < 0
+		}
+	}
+	return false
+}
+
+// amountReduced reports whether a correction row records a smaller portion
+// or volume than the item has now (rows read under the item lock): the
+// check that still works for an item without macros.
+func amountReduced(g *group, op *Op) bool {
+	base, _, _ := groupBase(g)
+	curP, curV := amountsAfter(g, g.c.effective(), base)
+	if p, ok := op.Data["portion_g_after"].(float64); ok && curP != nil && p < *curP-0.05 {
+		return true
+	}
+	if v, ok := op.Data["volume_ml_after"].(float64); ok && curV != nil && v < *curV-0.05 {
+		return true
+	}
+	return false
 }

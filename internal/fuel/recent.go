@@ -67,12 +67,9 @@ func amountsAfter(g *group, eff, origM Macros) (portion, volume *float64) {
 	if v, ok := d["volume_ml"].(float64); ok && v > 0 {
 		v0 = &v
 	}
-	if bm, bp, ok := recalBase(g); ok {
-		// The recalibrated values are the base of every later share.
-		origM = withMacroBase(origM, bm)
-		if bp != nil {
-			p0 = bp
-		}
+	if _, _, ok := recalBase(g); ok {
+		// The recalibrated or revised values are the base of every later share.
+		origM, p0, v0 = groupBase(g)
 	}
 	share := -1.0
 	var pAfter, vAfter *float64
@@ -244,6 +241,9 @@ func (s *Service) recentAll() []RecentItem {
 			name, _ := d["item"].(string)
 			if strings.TrimSpace(name) == "" {
 				continue
+			}
+			if n := baseName(g); n != "" {
+				name = n
 			}
 			eff := g.c.effective()
 			origM := macrosFromData(d)

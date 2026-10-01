@@ -40,12 +40,18 @@ type Options struct {
 	RecheckAfter   time.Duration // re-read an uncertain POST after (60 s)
 	FailAfter      time.Duration // an op not done after this is failed (24 h)
 	ReconcileEvery time.Duration // background reconcile tick (60 s)
-	Budget         time.Duration // whole request after the body is read (30 s)
-	ModelTimeout   time.Duration // 20 s
+	Budget         time.Duration // a request without a model call, after the body is read (30 s)
+	LogBudget      time.Duration // POST /fuel/log after the body is read (90 s; quality over speed, spec 17)
+	ModelTimeout   time.Duration // one model call (60 s)
 	ASRTimeout     time.Duration // 15 s
 	VarTimeout     time.Duration // each Variables call (5 s)
 	BusyWait       time.Duration // wait for a log slot (10 s)
 	ReadDeadline   time.Duration // upload read deadline (30 s)
+
+	// ChatModel, when set, answers the NON-LOG intents (correct, undo, move,
+	// question): a request the fast Model classifies as one of them is asked
+	// again with this model (spec 17 G). Logs stay on Model.
+	ChatModel Model
 
 	Recal RecalOptions // second-opinion recalibration (spec section 16)
 }
@@ -137,7 +143,8 @@ func (o *Options) defaults() {
 	d(&o.FailAfter, 24*time.Hour)
 	d(&o.ReconcileEvery, 60*time.Second)
 	d(&o.Budget, 30*time.Second)
-	d(&o.ModelTimeout, 20*time.Second)
+	d(&o.LogBudget, 3*o.Budget)
+	d(&o.ModelTimeout, 60*time.Second)
 	d(&o.ASRTimeout, 15*time.Second)
 	d(&o.VarTimeout, 5*time.Second)
 	d(&o.BusyWait, 10*time.Second)
@@ -538,6 +545,9 @@ func originalRowData(it Item, opID string, photoRef string) map[string]any {
 	if photoRef != "" {
 		d["photo_ref"] = photoRef
 	}
+	if it.Check != "" {
+		d["note"] = "check: " + it.Check
+	}
 	it.Orig.putInto(d)
 	return d
 }
@@ -739,7 +749,7 @@ func (s *Service) reconcileOnce(ctx context.Context) {
 	s.refreshFailedDays(ctx, now, readDays)
 	s.compensate(ctx, readDays)
 	s.coachCatchUp(ctx, now)
-	s.materializeFeed(ctx, 2*s.o.Budget)
+	s.materializeFeed(ctx, 2*s.o.LogBudget)
 }
 
 // coachCatchUp emits the coach event of every recent log entry that became
@@ -989,6 +999,8 @@ type ItemState struct {
 	// Recalibration is the second opinion on a photo item (spec 16); absent
 	// when the entry has none.
 	Recalibration *Recalibration `json:"recalibration,omitempty"`
+	// Check is why the estimate looks implausible (spec 17 E); absent = fine.
+	Check string `json:"check,omitempty"`
 }
 
 type itemView struct {
@@ -1003,7 +1015,7 @@ func (s *Service) viewItem(it Item) itemView {
 	e, _ := s.journal.Entry(it.EntryID)
 	v := itemView{failed: e.Failed}
 	st := ItemState{ItemID: it.ID, Item: it.Name, Kind: it.KindOr(), PortionG: it.PortionG, PortionBasis: it.Basis,
-		Macros: it.Orig, NeedsFraction: it.NeedsFraction, Actions: []string{}}
+		Macros: it.Orig, NeedsFraction: it.NeedsFraction, Actions: []string{}, Check: it.Check}
 	var eff Macros
 	init := false
 	for _, op := range ops {
@@ -1074,11 +1086,15 @@ func (s *Service) viewItem(it Item) itemView {
 	if g := itemGroup(rows, it.ID); g != nil && g.c.rows > 0 {
 		eff = g.c.effective()
 		// An applied second opinion is the item's new BASE (spec 16).
-		if bm, bp, ok := recalBase(g); ok {
-			st.Macros = withMacroBase(st.Macros, bm)
+		if _, _, ok := recalBase(g); ok {
+			bm, bp, _ := groupBase(g)
+			st.Macros = bm
 			if bp != nil {
 				st.PortionG = bp
 			}
+		}
+		if n := baseName(g); n != "" {
+			st.Item = n // a re-estimate renamed the item
 		}
 	} else {
 		eff = zeroMacros()

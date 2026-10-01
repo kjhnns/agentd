@@ -485,7 +485,7 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 	upload := time.Since(t0)
 	// The 30 s clock starts after the body is read; the work is detached from
 	// the client connection so a disconnect never strands a started write.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.o.Budget)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.o.LogBudget)
 	defer cancel()
 	now := s.o.Now()
 
@@ -586,7 +586,8 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 	tModel := time.Now()
 	fresh.Wait() // the model sees the refreshed day (questions answer from it)
 	preSnap, _ := s.snapshotFor(date)
-	mi := ModelInput{Text: foodText, Staples: s.staples, Snapshot: &preSnap, LastItems: s.lastItems(), Now: now.In(targets.loc)}
+	mi := ModelInput{Text: foodText, Staples: s.staples, Snapshot: &preSnap, LastItems: s.lastItems(), Now: now.In(targets.loc),
+		History: s.history(now, targets.loc), Yesterday: s.yesterdayItems(now, targets.loc), Recent: s.recentItems(targets.loc)}
 	for _, p := range imgs {
 		mi.Images = append(mi.Images, p.Model)
 	}
@@ -611,6 +612,67 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// One turn makes at most 4 model calls (spec 17): the first answer and
+	// up to three of: the chat model, the stored-photo pass, an additive
+	// re-ask, a plausibility re-ask. A refused extra call keeps the answer
+	// the turn already has.
+	used := s.o.Model
+	calls := 1
+	call := func(in ModelInput) (*ModelOutput, *apiError) {
+		if calls >= maxModelCalls {
+			return nil, errf(http.StatusBadGateway, "upstream_failed", true, "model call limit of the turn reached")
+		}
+		calls++
+		return s.callModelWith(ctx, used, in)
+	}
+	if e == nil && s.o.ChatModel != nil && !mi.PhotoOnly && out.RawIntent != "log" {
+		// Not a plain log: the chat model decides (spec 17 G). If it
+		// fails, the fast answer stands.
+		used = s.o.ChatModel
+		if o2, e2 := call(mi); e2 == nil {
+			out = o2
+		} else {
+			used = s.o.Model
+			log.Printf("fuel: chat model failed; the fast answer stands")
+		}
+	}
+	if e == nil && out.Intent == "correct" && len(mi.Images) == 0 {
+		// Second pass WITH the stored photos of the entry being corrected,
+		// so a restated amount is judged against what was photographed.
+		if ref := s.refPhotos(out); len(ref) > 0 {
+			mi.RefImages = ref
+			if o2, e2 := call(mi); e2 == nil && o2.Intent == "correct" {
+				out = o2
+			}
+		}
+	}
+	additive := isAdditive(foodText)
+	if e == nil && out.Intent == "correct" {
+		out = s.plausibleRevised(call, mi, out)
+	}
+	ask := ""
+	if e == nil && out.Intent == "correct" && additive && s.anyReduces(out) {
+		// Additive words may never reduce (spec 17 C): one re-ask, then a
+		// question to the user instead of a write. The write path checks
+		// again under the item lock.
+		log.Printf("fuel: an additive message came back as a reduction; asking once more")
+		retry := mi
+		retry.Hint = additiveHint
+		if o2, e2 := call(retry); e2 == nil && !(o2.Intent == "correct" && s.anyReduces(o2)) && o2.Intent != "undo" && o2.Intent != "move" {
+			out = o2
+		} else {
+			ask = additiveAsk
+		}
+	}
+	var badRevised map[int]string
+	if e == nil && out.Intent == "correct" {
+		badRevised = s.revisedProblems(out) // of the FINAL answer; never written
+	}
+	var checks map[int]string
+	var scaleNotes []string
+	if e == nil && out.Intent == "log" && len(out.Items) > 0 {
+		out, checks, scaleNotes = s.plausible(call, mi, out)
+	}
 	modelD := time.Since(tModel)
 	if e != nil {
 		writeErr(w, e)
@@ -629,7 +691,7 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 	}
 	if out.Intent == "correct" {
 		s.finishCorrect(ctx, w, out, in.ClientID, hash, foodText, date, now, t0,
-			map[string]int{"upload": ms(upload), "asr": ms(asrD), "model": ms(modelD)})
+			map[string]int{"upload": ms(upload), "asr": ms(asrD), "model": ms(modelD)}, ask, badRevised, additive)
 		return
 	}
 	if out.Intent == "move" {
@@ -660,6 +722,15 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 		entry.DayLabel = dayLabel(date)
 	}
 	items := s.buildItems(out, entry)
+	if note == "" {
+		entry.Checks = append(entry.Checks, scaleNotes...)
+		for i := range items {
+			if why := checks[i]; why != "" {
+				items[i].Check = why
+				entry.Checks = append(entry.Checks, "Check this: "+items[i].Name+": "+why+".")
+			}
+		}
+	}
 	for _, it := range items {
 		entry.ItemIDs = append(entry.ItemIDs, it.ID)
 	}
@@ -936,6 +1007,9 @@ func (s *Service) buildLogResponse(e Entry) (LogResponse, string) {
 		return LogResponse{Status: s.entryStatus(e), EntryID: e.ID, Intent: e.Intent, Transcript: e.Transcript, PhotoIDs: photos,
 			Items: states, Blocks: blocks, Snapshot: snap}, s.entryStatus(e)
 	}
+	if len(e.Checks) > 0 {
+		blocks = append(blocks, textBlock(strings.Join(e.Checks, " ")))
+	}
 	if e.ModelText != "" {
 		blocks = append(blocks, textBlock(e.ModelText))
 	}
@@ -1016,9 +1090,13 @@ func (s *Service) transcribe(ctx context.Context, audio []byte, ext string) (str
 }
 
 func (s *Service) callModel(ctx context.Context, mi ModelInput) (*ModelOutput, *apiError) {
+	return s.callModelWith(ctx, s.o.Model, mi)
+}
+
+func (s *Service) callModelWith(ctx context.Context, m Model, mi ModelInput) (*ModelOutput, *apiError) {
 	for attempt := 0; attempt < 2; attempt++ {
 		mctx, cancel := context.WithTimeout(ctx, s.o.ModelTimeout)
-		raw, err := s.o.Model.Estimate(mctx, mi)
+		raw, err := m.Estimate(mctx, mi)
 		cancel()
 		if err != nil {
 			if ctx.Err() != nil {

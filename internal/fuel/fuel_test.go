@@ -283,6 +283,9 @@ func newHarness(t *testing.T, mut ...func(*Options)) *harness {
 	for _, m := range mut {
 		m(&o)
 	}
+	if o.LogBudget == 0 {
+		o.LogBudget = o.Budget // the tests' budget is the log budget too
+	}
 	h := &harness{t: t, vars: fv, model: fm, clk: clk, dir: dir, opts: o}
 	h.start()
 	return h
@@ -2568,7 +2571,7 @@ func TestReplayRespectsTheBudget(t *testing.T) {
 	h.restart()
 	h.logText("12345678-0101", "250 g skyr and 30 g walnuts")
 	h.vars.failReads.Store(false)
-	h.svc.o.Budget = 300 * time.Millisecond
+	h.svc.o.Budget, h.svc.o.LogBudget = 300*time.Millisecond, 300*time.Millisecond
 	h.clk.Add(61 * time.Second)
 	h.vars.mu.Lock() // reads hang
 	start := time.Now()

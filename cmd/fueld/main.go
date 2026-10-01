@@ -69,7 +69,7 @@ func main() {
 		Addr:              cfg.Listen,
 		Handler:           Handler(svc.Handler()),
 		ReadHeaderTimeout: 15 * time.Second,
-		WriteTimeout:      90 * time.Second,
+		WriteTimeout:      5 * time.Minute, // a log turn may take the whole log_budget
 		IdleTimeout:       120 * time.Second,
 	}
 	errc := make(chan error, 1)
@@ -90,9 +90,9 @@ func main() {
 	}
 	log.Printf("fueld: shutting down")
 	// In-flight requests finish: upload deadline 30 s + slot wait 10 s +
-	// budget 30 s. Detached Variables writes are then drained by Close, so
+	// log budget 90 s. Detached Variables writes are then drained by Close, so
 	// their outcome is journaled before the stores close.
-	sctx, scancel := context.WithTimeout(context.Background(), 75*time.Second)
+	sctx, scancel := context.WithTimeout(context.Background(), 135*time.Second)
 	defer scancel()
 	if err := srv.Shutdown(sctx); err != nil {
 		log.Printf("fueld: shutdown: %v (closing remaining connections)", err)
@@ -125,19 +125,32 @@ func build(cfg fuel.DaemonConfig) (*fuel.Service, error) {
 		// No client timeout: each job runs under its own deadline.
 		recal.Agent = &fuel.AgentdClient{Base: cfg.RecalibrateAgentdURL, Token: tok, Client: &http.Client{}}
 	}
+	logBudget, _ := time.ParseDuration(cfg.LogBudget)
+	modelTimeout, _ := time.ParseDuration(cfg.ModelTimeout)
+	var chat fuel.Model
+	if cfg.ModelChat != "" || cfg.ModelChatEffort != "" {
+		cm := cfg.ModelChat
+		if cm == "" {
+			cm = cfg.Model
+		}
+		chat = &fuel.OpenAI{Key: modelKey, Model: cm, Effort: cfg.ModelChatEffort, Client: &http.Client{Timeout: modelTimeout + 5*time.Second}}
+	}
 	return fuel.New(fuel.Options{
-		Recal:       recal,
-		Token:       fuel.ResolveSecret(cfg.Token),
-		Vars:        &fuel.VariablesHTTP{Base: cfg.VariablesURL, Key: varsKey, Client: &http.Client{Timeout: 30 * time.Second}},
-		FoodVar:     cfg.FoodLogVar,
-		BodyVar:     cfg.BodyVar,
-		Model:       &fuel.OpenAI{Key: modelKey, Model: cfg.Model, Effort: cfg.ModelEffort, Client: &http.Client{Timeout: 30 * time.Second}},
-		ASR:         media.NewWhisper(modelKey, cfg.WhisperModel, ""),
-		TargetsFile: cfg.TargetsFile,
-		StaplesFile: cfg.StaplesFile,
-		StateDir:    cfg.StateDir,
-		StravaDir:   cfg.StravaDir,
-		TestMode:    cfg.TestMode,
+		Recal:        recal,
+		ChatModel:    chat,
+		Token:        fuel.ResolveSecret(cfg.Token),
+		Vars:         &fuel.VariablesHTTP{Base: cfg.VariablesURL, Key: varsKey, Client: &http.Client{Timeout: 30 * time.Second}},
+		FoodVar:      cfg.FoodLogVar,
+		BodyVar:      cfg.BodyVar,
+		Model:        &fuel.OpenAI{Key: modelKey, Model: cfg.Model, Effort: cfg.ModelEffort, Client: &http.Client{Timeout: modelTimeout + 5*time.Second}},
+		LogBudget:    logBudget,
+		ModelTimeout: modelTimeout,
+		ASR:          media.NewWhisper(modelKey, cfg.WhisperModel, ""),
+		TargetsFile:  cfg.TargetsFile,
+		StaplesFile:  cfg.StaplesFile,
+		StateDir:     cfg.StateDir,
+		StravaDir:    cfg.StravaDir,
+		TestMode:     cfg.TestMode,
 	})
 }
 
