@@ -67,6 +67,13 @@ func amountsAfter(g *group, eff, origM Macros) (portion, volume *float64) {
 	if v, ok := d["volume_ml"].(float64); ok && v > 0 {
 		v0 = &v
 	}
+	if bm, bp, ok := recalBase(g); ok {
+		// The recalibrated values are the base of every later share.
+		origM = withMacroBase(origM, bm)
+		if bp != nil {
+			p0 = bp
+		}
+	}
 	share := -1.0
 	var pAfter, vAfter *float64
 	corrections := 0

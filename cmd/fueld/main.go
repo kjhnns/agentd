@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -110,7 +111,22 @@ func build(cfg fuel.DaemonConfig) (*fuel.Service, error) {
 	case varsKey == "":
 		return nil, errors.New("variables_key resolves to empty")
 	}
+	recal := fuel.RecalOptions{Enabled: cfg.RecalibrateEnabled, KillFile: cfg.RecalibrateKillFile}
+	recal.Timeout, _ = time.ParseDuration(cfg.RecalibrateTimeout)
+	recal.MinInterval, _ = time.ParseDuration(cfg.RecalibrateMinInterval)
+	if recal.KillFile == "" {
+		recal.KillFile = filepath.Join(cfg.StateDir, "recalibrate.off")
+	}
+	if cfg.RecalibrateEnabled {
+		tok := fuel.ResolveSecret(cfg.RecalibrateAgentdToken)
+		if tok == "" {
+			return nil, errors.New("recalibrate_agentd_token resolves to empty")
+		}
+		// No client timeout: each job runs under its own deadline.
+		recal.Agent = &fuel.AgentdClient{Base: cfg.RecalibrateAgentdURL, Token: tok, Client: &http.Client{}}
+	}
 	return fuel.New(fuel.Options{
+		Recal:       recal,
 		Token:       fuel.ResolveSecret(cfg.Token),
 		Vars:        &fuel.VariablesHTTP{Base: cfg.VariablesURL, Key: varsKey, Client: &http.Client{Timeout: 30 * time.Second}},
 		FoodVar:     cfg.FoodLogVar,

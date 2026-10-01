@@ -52,6 +52,14 @@ func (s *Service) absoluteCorrection(it Item, rows []Value, tgt FixTarget, reaso
 	if v, ok := origRow.Data["volume_ml"].(float64); ok && v > 0 {
 		origVolume = &v
 	}
+	// An applied second opinion replaces the original as the BASE of every
+	// later share (spec 16): its macros and its portion.
+	if bm, bp, ok := recalBase(g); ok {
+		base = withMacroBase(base, bm)
+		if bp != nil {
+			origPortion = bp
+		}
+	}
 	var share float64
 	switch {
 	case tgt.Share != nil:
@@ -154,15 +162,15 @@ func (s *Service) lastItems() []LastItem {
 	for i := len(items) - 1; i >= 0; i-- { // oldest first
 		it := items[i]
 		fuel[it.ID] = true
-		li := LastItem{ItemID: it.ID, Item: it.Name, Kind: it.KindOr(), PortionG: it.PortionG, NewestEntry: it.EntryID == newest.ID, At: s.localHHMM(it.EatenAt)}
+		li := LastItem{ItemID: it.ID, Item: it.Name, Kind: it.KindOr(), PortionG: s.basePortion(it), NewestEntry: it.EntryID == newest.ID, At: s.localHHMM(it.EatenAt)}
 		if it.Orig.VolumeML.OK && it.Orig.VolumeML.V > 0 {
 			v := it.Orig.VolumeML.float()
 			li.VolumeML = &v
 		}
-		if fitsUnit(it, unitGrams) {
+		if s.fitsUnit(it, unitGrams) {
 			li.Units = append(li.Units, "g")
 		}
-		if fitsUnit(it, unitML) {
+		if s.fitsUnit(it, unitML) {
 			li.Units = append(li.Units, "ml")
 		}
 		all = append(all, timed{li, it.EatenAt})
@@ -241,16 +249,29 @@ func correctionUnit(c ModelCorrection) string {
 // fitsUnit: a grams correction needs an item with a portion in grams that
 // is not a drink; a ml correction needs an item with a volume; a share fits
 // anything.
-func fitsUnit(it Item, unit string) bool {
+func (s *Service) fitsUnit(it Item, unit string) bool {
 	switch unit {
 	case unitShareAnyName:
 		return true
 	case unitGrams:
-		return it.PortionG != nil && *it.PortionG > 0 && it.KindOr() != "drink"
+		p := s.basePortion(it)
+		return p != nil && *p > 0 && it.KindOr() != "drink"
 	case unitML:
 		return it.Orig.VolumeML.OK && it.Orig.VolumeML.V > 0
 	}
 	return true
+}
+
+// basePortion is the item's base portion in grams: the recalibrated one
+// while a second opinion is applied (spec 16), else the logged one.
+func (s *Service) basePortion(it Item) *float64 {
+	rows, _, _ := s.cache.Rows(it.Date)
+	if g := itemGroup(rows, it.ID); g != nil {
+		if _, bp, ok := recalBase(g); ok && bp != nil {
+			return bp
+		}
+	}
+	return it.PortionG
 }
 
 const lastSearchEntries = 8
@@ -301,7 +322,7 @@ func (s *Service) resolveRef(ref, unit string) (Item, bool) {
 				return s.resolveLast(unit)
 			}
 		}
-		if fitsUnit(it, unit) {
+		if s.fitsUnit(it, unit) {
 			return it, true
 		}
 		return s.resolveLast(unit)
@@ -340,7 +361,7 @@ func (s *Service) resolveRef(ref, unit string) (Item, bool) {
 	if !ok {
 		return Item{}, false
 	}
-	if !fitsUnit(it, unit) {
+	if !s.fitsUnit(it, unit) {
 		return s.resolveLast(unit)
 	}
 	return it, true
@@ -372,7 +393,7 @@ func (s *Service) resolveLast(unit string) (Item, bool) {
 		return Item{}, false
 	}
 	for _, it := range s.todaysActiveItems() {
-		if fitsUnit(it, unit) {
+		if s.fitsUnit(it, unit) {
 			return it, true
 		}
 	}

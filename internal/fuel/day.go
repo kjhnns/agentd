@@ -24,6 +24,8 @@ type DayItem struct {
 	PhotoIDs   []string  `json:"photo_ids"` // every stored photo of the entry
 	Actions    []string  `json:"actions"`
 	RecentKey  string    `json:"recent_key"`
+	// Recalibration is the second opinion on a Fuel photo item (spec 16).
+	Recalibration *Recalibration `json:"recalibration,omitempty"`
 
 	// For resolution (not on the wire).
 	origPortion *float64
@@ -83,6 +85,11 @@ func (s *Service) dayItems(date string) []DayItem {
 		}
 		if v, ok := d["volume_ml"].(float64); ok && v > 0 {
 			it.origVolume = &v
+		}
+		if src == "fuel" {
+			if ji, ok := s.journal.Item(it.RowKey); ok {
+				it.Recalibration = s.itemRecal(ji)
+			}
 		}
 		it.PhotoIDs = []string{}
 		if ref, _ := d["photo_ref"].(string); ref != "" {

@@ -19,3 +19,13 @@ staples_file   = "~/.agentd/fuel-staples.json" # shared with ~/clawd/scripts/foo
 state_dir      = "~/.local/state/fueld"
 strava_dir     = "~/warehouse/raw-sources/strava"
 test_mode      = false                         # true refuses food_log_var "Food log"
+
+# Second-opinion recalibration of photo meals (spec section 16). fueld is a
+# plain client of an agentd API (a fresh session per job, photos uploaded as
+# media turns). Default off.
+recalibrate_enabled      = false
+recalibrate_agentd_url   = "http://127.0.0.1:8798"   # the sandboxed agentd-safe instance
+recalibrate_agentd_token = "env:FUEL_AGENTD_TOKEN"   # pass agentd-safe/web-token
+recalibrate_timeout      = "10m"                     # one job
+recalibrate_min_interval = "30s"                     # between job starts
+# recalibrate_kill_file  = "~/.local/state/fueld/recalibrate.off"  # touch it to stop new jobs

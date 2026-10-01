@@ -46,6 +46,8 @@ type Options struct {
 	VarTimeout     time.Duration // each Variables call (5 s)
 	BusyWait       time.Duration // wait for a log slot (10 s)
 	ReadDeadline   time.Duration // upload read deadline (30 s)
+
+	Recal RecalOptions // second-opinion recalibration (spec section 16)
 }
 
 // Service is the fast path. Construct with New, then Start, then Handler.
@@ -89,6 +91,10 @@ type Service struct {
 	reqMu    sync.Mutex
 	inflReq  map[string]*inflightReq // client id -> in-progress request
 	logTimes []time.Time             // accepted logs, for the hourly / daily caps
+
+	recal     *recalStore
+	recalMu   sync.Mutex // one recalibration job at a time
+	recalLast time.Time  // start of the last job (min interval)
 
 	slots chan struct{} // at most 2 logs processed at once
 	fails authFailures
@@ -136,6 +142,9 @@ func (o *Options) defaults() {
 	d(&o.VarTimeout, 5*time.Second)
 	d(&o.BusyWait, 10*time.Second)
 	d(&o.ReadDeadline, 30*time.Second)
+	d(&o.Recal.Timeout, 10*time.Minute)
+	d(&o.Recal.MinInterval, 30*time.Second)
+	d(&o.Recal.Tick, 2*time.Second)
 	if o.Now == nil {
 		o.Now = func() time.Time { return time.Now().UTC() }
 	}
@@ -175,6 +184,11 @@ func New(o Options) (*Service, error) {
 		slots:   make(chan struct{}, 2),
 		kick:    make(chan struct{}, 1),
 	}
+	rs, err := openRecalStore(filepath.Join(o.StateDir, "recal.jsonl"))
+	if err != nil {
+		return nil, fmt.Errorf("fuel: recal: %w", err)
+	}
+	s.recal = rs
 	s.coachSeen = map[string]bool{}
 	_ = loadLines(filepath.Join(o.StateDir, "coach-events.jsonl"), false, func(b []byte) error {
 		var ev struct {
@@ -362,6 +376,14 @@ func (s *Service) Start(ctx context.Context) {
 		s.reconcileOnce(lctx)
 		s.loop(lctx)
 	}()
+	if s.recalOn() {
+		s.recalResume()
+		s.workers.Add(1)
+		go func() {
+			defer s.workers.Done()
+			s.recalLoop(lctx)
+		}()
+	}
 }
 
 // Stop cancels startup and the background loop and waits for both; a later
@@ -964,6 +986,9 @@ type ItemState struct {
 	Undone        bool     `json:"undone"`
 	Effective     Macros   `json:"effective"`
 	Actions       []string `json:"actions"`
+	// Recalibration is the second opinion on a photo item (spec 16); absent
+	// when the entry has none.
+	Recalibration *Recalibration `json:"recalibration,omitempty"`
 }
 
 type itemView struct {
@@ -1046,12 +1071,20 @@ func (s *Service) viewItem(it Item) itemView {
 	// failed read still shows what is known to be written). Pending and
 	// uncertain ops show in actions, never here.
 	rows, _, _ := s.cache.Rows(it.Date)
-	if c, _, found := itemContrib(rows, it.ID); found {
-		eff = c.effective()
+	if g := itemGroup(rows, it.ID); g != nil && g.c.rows > 0 {
+		eff = g.c.effective()
+		// An applied second opinion is the item's new BASE (spec 16).
+		if bm, bp, ok := recalBase(g); ok {
+			st.Macros = withMacroBase(st.Macros, bm)
+			if bp != nil {
+				st.PortionG = bp
+			}
+		}
 	} else {
 		eff = zeroMacros()
 	}
 	st.Effective = eff
+	st.Recalibration = s.itemRecal(it)
 	if !v.pending && !v.failed && v.origDone && !st.Undone {
 		st.Actions = append(st.Actions, "undo")
 		if it.NeedsFraction && st.Fraction == nil {

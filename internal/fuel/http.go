@@ -154,6 +154,7 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("POST /fuel/undo", func(w http.ResponseWriter, r *http.Request) { s.handleMutation(w, r, "undo") })
 	mux.HandleFunc("POST /fuel/fraction", func(w http.ResponseWriter, r *http.Request) { s.handleMutation(w, r, "fraction") })
 	mux.HandleFunc("POST /fuel/fix", func(w http.ResponseWriter, r *http.Request) { s.handleMutation(w, r, "fix") })
+	mux.HandleFunc("POST /fuel/recalibration/revert", func(w http.ResponseWriter, r *http.Request) { s.handleMutation(w, r, revertKind) })
 	mux.HandleFunc("GET /fuel/entry/{id}", s.handleEntry)
 	mux.HandleFunc("GET /fuel/feed", s.handleFeed)
 	mux.HandleFunc("GET /fuel/photo/{id}", s.handlePhoto)
@@ -726,6 +727,7 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 	if err := s.idem.Put(idemRec{ClientID: in.ClientID, Hash: hash, Kind: "log", At: now, EntryID: entry.ID, ItemIDs: entry.ItemIDs}); err != nil {
 		log.Printf("fuel: idem reservation for %s failed (the journal identity still holds)", entry.ID)
 	}
+	s.recalEnqueue(entry) // a photo log gets a second opinion (spec 16)
 	if len(ops) > 0 {
 		s.runOps(ctx, ops)
 	}
@@ -1208,6 +1210,10 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		return
 	}
 	external := isExternalKey(body.ItemID)
+	if external && kind == revertKind {
+		writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "only Fuel photo items carry a second opinion"))
+		return
+	}
 	if external && kind == "fraction" {
 		writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "fraction is for Fuel photo items; use fix with a share"))
 		return
@@ -1350,6 +1356,14 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		return
 	}
 	switch kind {
+	case revertKind:
+		o, ae := s.recalRevertOp(it, dayRows)
+		if ae != nil {
+			l.Unlock()
+			writeErr(w, ae)
+			return
+		}
+		op = o
 	case "undo":
 		// Cancels the known sum of every field; deleted outside = zeros.
 		o := s.newCorrectionOp(it, requiredKnown(ic.cancel()), "undo", nil)
@@ -1505,6 +1519,8 @@ func (s *Service) mutationResponseLocked(it Item, kind string, f float64, op *Op
 	}
 	var lead string
 	switch kind {
+	case revertKind:
+		lead = "Reverted the second opinion on " + it.Name + "."
 	case "undo":
 		lead = "Removed " + it.Name + "."
 	case "fix":
@@ -1639,6 +1655,8 @@ type entryResponse struct {
 	Items    []ItemState `json:"items"`
 	Blocks   []Block     `json:"blocks"`
 	Snapshot Snapshot    `json:"snapshot"`
+	// Recalibration is the entry's second opinion (spec 16), when it has one.
+	Recalibration *Recalibration `json:"recalibration,omitempty"`
 }
 
 func (s *Service) writeEntry(w http.ResponseWriter, e Entry) {
@@ -1664,6 +1682,7 @@ func (s *Service) writeEntry(w http.ResponseWriter, e Entry) {
 		blocks = append(blocks, b)
 	}
 	status := s.entryStatus(e)
+	recal := s.entryRecal(e)
 	s.stateMu.RUnlock()
 	code := http.StatusOK
 	if status == StatusPending {
@@ -1673,7 +1692,7 @@ func (s *Service) writeEntry(w http.ResponseWriter, e Entry) {
 	if photos == nil {
 		photos = []string{}
 	}
-	writeJSON(w, code, entryResponse{Status: status, EntryID: e.ID, PhotoIDs: photos, Items: states, Blocks: blocks, Snapshot: snap})
+	writeJSON(w, code, entryResponse{Status: status, EntryID: e.ID, PhotoIDs: photos, Items: states, Blocks: blocks, Snapshot: snap, Recalibration: recal})
 }
 
 func (s *Service) handleEntry(w http.ResponseWriter, r *http.Request) {
