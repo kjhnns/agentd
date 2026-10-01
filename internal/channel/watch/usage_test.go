@@ -86,3 +86,61 @@ func TestUsageMissingMeasurement(t *testing.T) {
 		t.Fatal("null utilization cannot become zero usage")
 	}
 }
+
+func TestUsageAllProviders(t *testing.T) {
+	claudeFail := false
+	claude := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if claudeFail {
+			w.WriteHeader(401)
+			return
+		}
+		w.Write([]byte(`{"seven_day":{"utilization":40,"resets_at":null}}`))
+	}))
+	defer claude.Close()
+	codexBody := `{"rate_limit":{"primary_window":{"used_percent":36,"limit_window_seconds":604800,"reset_at":1791055808},"secondary_window":null}}`
+	codex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer codex-secret" || r.Header.Get("ChatGPT-Account-Id") != "acct" {
+			t.Error("missing codex auth")
+		}
+		w.Write([]byte(codexBody))
+	}))
+	defer codex.Close()
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "c.json"), []byte(`{"claudeAiOauth":{"accessToken":"provider-secret"}}`), 0600)
+	os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"tokens":{"access_token":"codex-secret","account_id":"acct"}}`), 0600)
+	a := New("watch-secret", nil)
+	a.usage.endpoint, a.usage.credentials = claude.URL, filepath.Join(dir, "c.json")
+	a.codexUsage.endpoint, a.codexUsage.credentials = codex.URL, filepath.Join(dir, "auth.json")
+	get := func() (int, string) {
+		req := httptest.NewRequest("GET", "/watch/usage?provider=all", nil)
+		req.Header.Set("Authorization", "Bearer watch-secret")
+		w := httptest.NewRecorder()
+		a.Handler().ServeHTTP(w, req)
+		return w.Code, w.Body.String()
+	}
+	code, body := get()
+	if code != 200 || !strings.Contains(body, `"claude":{`) || !strings.Contains(body, `"utilization":36`) ||
+		!strings.Contains(body, `"resets_at":"2026-10-03T`) || strings.Contains(body, "secret") {
+		t.Fatalf("unexpected response: %d %s", code, body)
+	}
+	// One provider failing cold must not hide the other.
+	claudeFail = true
+	a.usage.cached, a.usage.attempted = nil, time.Time{}
+	code, body = get()
+	if code != 200 || !strings.Contains(body, `"claude":null`) || !strings.Contains(body, `"utilization":36`) {
+		t.Fatalf("partial response: %d %s", code, body)
+	}
+	// The week is found by window length: a five-hour primary is the session.
+	codexBody = `{"rate_limit":{"primary_window":{"used_percent":5,"limit_window_seconds":18000,"reset_at":0},"secondary_window":{"used_percent":70,"limit_window_seconds":604800,"reset_at":1791055808}}}`
+	a.codexUsage.cached, a.codexUsage.attempted = nil, time.Time{}
+	s, err := a.codexUsage.read(context.Background())
+	if err != nil || *s.Weekly.Utilization != 70 || *s.Session.Utilization != 5 || s.Session.ResetsAt != nil {
+		t.Fatalf("window classification: %v %+v", err, s)
+	}
+	// No weekly window is unavailable, never zero usage.
+	codexBody = `{"rate_limit":{"primary_window":null}}`
+	a.codexUsage.cached, a.codexUsage.attempted = nil, time.Time{}
+	if _, err := a.codexUsage.read(context.Background()); err == nil {
+		t.Fatal("missing weekly window must be an error")
+	}
+}

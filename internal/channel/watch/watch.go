@@ -44,18 +44,19 @@ const DefaultUserID = "watch"
 
 // Adapter is the wrist ChannelAdapter + notify.Sink + its HTTP surface.
 type Adapter struct {
-	title   string
-	token   string
-	userID  string
-	store   *Store
-	media   *media.Service
-	inbound chan channel.InboundMsg
-	mirror  func(text string, silent bool)
-	mirrorQ chan mirrorJob
-	fails   authFailures
-	maxWait time.Duration
-	now     func() time.Time
-	usage   *usageReader
+	title      string
+	token      string
+	userID     string
+	store      *Store
+	media      *media.Service
+	inbound    chan channel.InboundMsg
+	mirror     func(text string, silent bool)
+	mirrorQ    chan mirrorJob
+	fails      authFailures
+	maxWait    time.Duration
+	now        func() time.Time
+	usage      *usageReader
+	codexUsage *usageReader
 }
 
 // New builds a watch adapter gated by its own bearer token (NOT the API
@@ -63,14 +64,15 @@ type Adapter struct {
 // so a leaked token must not unlock the code-executing API).
 func New(token string, store *Store) *Adapter {
 	return &Adapter{
-		title:   "agentd",
-		usage:   newUsageReader(),
-		token:   token,
-		userID:  DefaultUserID,
-		store:   store,
-		inbound: make(chan channel.InboundMsg, 64),
-		maxWait: 30 * time.Second,
-		now:     func() time.Time { return time.Now().UTC() },
+		title:      "agentd",
+		usage:      newUsageReader(),
+		codexUsage: newCodexUsageReader(),
+		token:      token,
+		userID:     DefaultUserID,
+		store:      store,
+		inbound:    make(chan channel.InboundMsg, 64),
+		maxWait:    30 * time.Second,
+		now:        func() time.Time { return time.Now().UTC() },
 	}
 }
 
