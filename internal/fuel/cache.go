@@ -17,6 +17,7 @@ type dayCache struct {
 	// 18.6): the strength sets are computed from them at each snapshot, so a
 	// changed set_variables list needs no new read.
 	nums    []numVal
+	fp      string // fingerprint of the food rows of the last server read
 	fetched time.Time
 	ok      bool // at least one successful read
 }
@@ -40,6 +41,11 @@ type Cache struct {
 	bodyTO   time.Duration // the one-shot history read (startup, 20 min loop)
 	refreshM sync.Map      // date -> *sync.Mutex (one refresh per day at a time)
 	publish  sync.Locker   // the service render lock (stateMu), taken to publish
+	// onChange is called (outside the cache lock) when a refresh brings
+	// other food rows for a date that was loaded before, or other Body
+	// composition rows ("body").
+	onChange func(date string)
+	bodyFP   string
 }
 
 func newCache(v Variables, ids VarIDs, j *Journal, now func() time.Time) *Cache {
@@ -115,8 +121,12 @@ func (c *Cache) RefreshDay(ctx context.Context, date string) error {
 		c.publish.Lock()
 		defer c.publish.Unlock()
 	}
+	dc.fp = rowsFingerprint(dc.rows)
+	changed := false
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	if old := c.days[date]; old != nil && old.ok && old.fp != dc.fp {
+		changed = true
+	}
 	if c.journal != nil {
 		for _, op := range c.journal.DoneRowsFor(date, c.now().Add(-60*time.Second)) {
 			if !seen[op.ValueID] {
@@ -126,7 +136,21 @@ func (c *Cache) RefreshDay(ctx context.Context, date string) error {
 	}
 	c.days[date] = dc
 	c.gen[date]++
+	c.mu.Unlock()
+	if changed && c.onChange != nil {
+		c.onChange(date)
+	}
 	return nil
+}
+
+// rowsFingerprint identifies the content of a server read (ids and data).
+func rowsFingerprint(rows []Value) string {
+	parts := make([]string, 0, len(rows))
+	for _, r := range rows {
+		parts = append(parts, r.ID+"\x00"+r.Raw)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "\x01")
 }
 
 // commit runs fn under the cache lock (journal a done op + merge its row).
@@ -350,9 +374,21 @@ func (c *Cache) RefreshBody(ctx context.Context) error {
 	}
 	sort.SliceStable(body, func(a, b int) bool { return body[a].RecordDate < body[b].RecordDate })
 	c.recOwn = keep
-	c.body, c.bodyAt, c.rec = body, c.now(), rec
+	fp := rowsFingerprint(body)
+	changed := !c.bodyAt.IsZero() && fp != c.bodyFP
+	c.body, c.bodyAt, c.rec, c.bodyFP = body, c.now(), rec, fp
 	c.mu.Unlock()
+	if changed && c.onChange != nil {
+		c.onChange("body")
+	}
 	return nil
+}
+
+// RecordsReadAt is the time of the last full read of the record variables.
+func (c *Cache) RecordsReadAt() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.bodyAt
 }
 
 // mergeRecord adds an own record row after its 201, by value id.

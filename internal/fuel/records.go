@@ -321,8 +321,15 @@ func opStatus(state string) string {
 
 // buildRecordsView reduces rows and ops. rows holds the cached rows of the
 // record variables by var ("bp", "symptom", "body").
-func buildRecordsView(rows map[string][]Value, ops []recOp, loc *time.Location) *recordsView {
+func buildRecordsView(rows map[string][]Value, ops []recOp, loc *time.Location, readAt time.Time) *recordsView {
 	v := &recordsView{entries: map[string]*recEntry{}}
+	// Rows are the truth. A DONE operation whose row is not in the cached
+	// rows counts only while its write is newer than the last full read (the
+	// read may not hold it yet). After a read that came later, a missing row
+	// was deleted outside: the record, or the void, is gone with it.
+	gone := func(op recOp) bool {
+		return op.State == OpDone && !readAt.IsZero() && op.LastTry.Before(readAt.Add(-60*time.Second))
+	}
 	types := map[string]map[string]bool{"bp": {recBP: true}, "symptom": {recSymptom: true}, "body": {recWaist: true}}
 	rowOp := map[string]string{} // op id -> value id of its row
 	voidRow := map[string]bool{} // record id -> a void row exists
@@ -349,15 +356,17 @@ func buildRecordsView(rows map[string][]Value, ops []recOp, loc *time.Location) 
 		if _, found := rowOp[op.OpID]; found {
 			continue // the row is the truth, whatever the op state says
 		}
+		if gone(op) {
+			continue
+		}
 		rec, ok := recordFromPayload(op, loc)
 		if !ok {
 			continue
 		}
 		st := opStatus(op.State)
 		if op.State == OpDone {
-			// Done and not (or no longer) in the cached rows: the row was
-			// deleted outside, or the cache is older than the write. Shown
-			// from the op only while young (eventual consistency).
+			// Done and not yet in the cached rows (the write is newer than
+			// the last full read): shown from the op.
 			vid := op.ValueID
 			rec.ValueID = &vid
 		} else {
@@ -381,6 +390,9 @@ func buildRecordsView(rows map[string][]Value, ops []recOp, loc *time.Location) 
 		if _, found := rowOp[op.OpID]; found {
 			e.void = StatusDone
 			continue
+		}
+		if gone(op) {
+			continue // the void row was deleted outside: the record is visible again
 		}
 		e.void = opStatus(op.State)
 	}
@@ -485,23 +497,7 @@ func (s *Service) recordsViewNow() *recordsView {
 		loc = t.loc
 	}
 	rows := s.cache.RecordRows()
-	v := buildRecordsView(rows, s.records.all(), loc)
-	// A done op that is not in the cached rows is shown only while the write
-	// is younger than the next full read can be (else: deleted outside).
-	now := s.o.Now()
-	for _, op := range s.records.all() {
-		if op.Kind == "record" && op.State == OpDone {
-			if e := v.entries[op.RecordID]; e != nil && e.rec.ValueID != nil && *e.rec.ValueID == op.ValueID {
-				found := false
-				for _, r := range rows[op.Var] {
-					found = found || r.ID == op.ValueID
-				}
-				if !found && now.Sub(op.LastTry) > 25*time.Minute {
-					delete(v.entries, op.RecordID)
-				}
-			}
-		}
-	}
+	v := buildRecordsView(rows, s.records.all(), loc, s.cache.RecordsReadAt())
 	s.mu.Lock()
 	v.bpOK, v.symOK = s.ids.BP != "", s.ids.Symptom != ""
 	s.mu.Unlock()

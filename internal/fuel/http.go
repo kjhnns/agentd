@@ -1581,7 +1581,7 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		case body.Revised != nil:
 			// A re-estimate with the caller's values (17 B, 18.6). What does
 			// not add up is refused, never written (the final rule of 17 E).
-			if why := revisedIssue(it, g, *body.Revised); why != "" {
+			if why := revisedIssueWith(it, g, *body.Revised, implausibleAny); why != "" {
 				ae = errf(http.StatusBadRequest, "bad_input", false, "the revised values are implausible: %s", why)
 			} else {
 				o, _ = s.reviseOp(it, g, *body.Revised)

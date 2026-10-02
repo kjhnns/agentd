@@ -386,10 +386,15 @@ func (cs *calibStore) appendLine(v any) error {
 	return f.Sync()
 }
 
-// putRun replaces the result of its date and appends the run.
+// putRun appends the run (durable first), then replaces the result of its
+// date. Nothing is published in memory when the line could not be written:
+// a candidate that is not durable must never be accepted or shown.
 func (cs *calibStore) putRun(r calibRun) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
+	if err := cs.appendLine(r); err != nil {
+		return err
+	}
 	cs.results[r.Result.ForDate] = r
 	if c := r.Result.Candidate; c != nil {
 		cs.cands[c.ResultID] = *c
@@ -411,10 +416,20 @@ func (cs *calibStore) putRun(r calibRun) error {
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, filepath.Join(cs.dir, "calibration.json")); err != nil {
-		return err
+	// calibration.json is the per-date view; calibration.jsonl (written
+	// above) is the durable record that the load check and a restart read.
+	return os.Rename(tmp, filepath.Join(cs.dir, "calibration.json"))
+}
+
+// hasCandidate reports whether the candidate is stored (durably appended).
+func (cs *calibStore) hasCandidate(c *CalibCandidate) bool {
+	if c == nil {
+		return false
 	}
-	return cs.appendLine(r)
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	got, ok := cs.cands[c.ResultID]
+	return ok && got == *c
 }
 
 func (cs *calibStore) result(date string) (calibRun, bool) {
@@ -611,6 +626,9 @@ func (s *Service) runCalibrationLocked(ctx context.Context) (CalibResult, bool) 
 	}
 	if err := s.calib.putRun(run); err != nil {
 		log.Printf("fuel: calibration: could not store the result: %v", err)
+		s.calibStoreErr = err
+	} else {
+		s.calibStoreErr = nil
 	}
 	log.Printf("fuel: calibration for %s: state=%s days=%d", D, run.Result.State, run.Result.Days)
 	return run.Result, refreshed
@@ -689,6 +707,12 @@ func (s *Service) handleCalibrationAccept(w http.ResponseWriter, r *http.Request
 		return
 	}
 	res, _ := s.runCalibrationLocked(ctx)
+	if res.State == "candidate" && (s.calibStoreErr != nil || !s.calib.hasCandidate(res.Candidate)) {
+		// The run is not durable: an acceptance of it could not be loaded
+		// after a restart. Nothing is accepted and no line is written.
+		writeErr(w, errf(http.StatusInternalServerError, "internal", true, "could not store the calibration result; nothing was accepted"))
+		return
+	}
 	a := calibAccept{AcceptOp: body.OpID, At: s.o.Now()}
 	if res.SettingsVersion != nil {
 		a.SettingsVersion = *res.SettingsVersion

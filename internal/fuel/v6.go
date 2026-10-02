@@ -140,6 +140,13 @@ func implausible(it ModelItem) string {
 	if it.FoodClass == "" {
 		return ""
 	}
+	return implausibleAny(it)
+}
+
+// implausibleAny runs the checks that need no food class on EVERY item (the
+// deterministic routes of section 20: a caller may leave the class out), and
+// the density bounds when a class is given.
+func implausibleAny(it ModelItem) string {
 	v := func(p *float64) float64 {
 		if p == nil {
 			return 0
@@ -180,12 +187,17 @@ func implausible(it ModelItem) string {
 // problemsOf lists the implausible items. An item with a KNOWN staple key is
 // exempt: the server replaces its macros by the label values.
 func (s *Service) problemsOf(out *ModelOutput) map[int]string {
+	return s.problemsWith(out, implausible)
+}
+
+// problemsWith is problemsOf with the given check.
+func (s *Service) problemsWith(out *ModelOutput, check func(ModelItem) string) map[int]string {
 	p := map[int]string{}
 	for i, it := range out.Items {
 		if it.StapleKey != nil && s.stapleKnown(*it.StapleKey) {
 			continue
 		}
-		if why := implausible(it); why != "" {
+		if why := check(it); why != "" {
 			p[i] = why
 		}
 	}
@@ -227,6 +239,11 @@ func (s *Service) plausible(call modelCall, mi ModelInput, out *ModelOutput) (*M
 // keeps its kind, its alcohol and (when revised.portion_g is null) its
 // current portion, so all three count ("" = plausible).
 func revisedIssue(it Item, g *group, r ModelRevised) string {
+	return revisedIssueWith(it, g, r, implausible)
+}
+
+// revisedIssueWith is revisedIssue with the given check.
+func revisedIssueWith(it Item, g *group, r ModelRevised, check func(ModelItem) string) string {
 	as := r.asItem()
 	as.Kind = it.KindOr()
 	if g != nil && g.orig.Data != nil {
@@ -237,7 +254,7 @@ func revisedIssue(it Item, g *group, r ModelRevised) string {
 			as.PortionG, _ = amountsAfter(g, eff, base)
 		}
 	}
-	return implausible(as)
+	return check(as)
 }
 
 // revisedProblems lists the implausible re-estimates of a correction answer

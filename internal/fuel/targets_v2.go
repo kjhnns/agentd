@@ -231,9 +231,21 @@ func validDate(s string) bool {
 
 // strictInto decodes raw into v with unknown keys refused, after checking
 // that every key of required is present.
-func strictInto(what string, raw json.RawMessage, required []string, v any) error {
-	if _, err := obj(what, raw, required); err != nil {
+func strictInto(what string, raw json.RawMessage, required []string, v any, nullable ...string) error {
+	m, err := obj(what, raw, required)
+	if err != nil {
 		return err
+	}
+	// A required member is a value: null would decode to zero and silently
+	// switch a rule off. Only the members named in nullable may be null.
+	for _, k := range required {
+		ok := false
+		for _, n := range nullable {
+			ok = ok || n == k
+		}
+		if isNull(m[k]) && !ok {
+			return fmt.Errorf("targets: %s.%s must not be null", what, k)
+		}
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
@@ -371,8 +383,12 @@ func parseV2(raw map[string]json.RawMessage) (*V2, error) {
 	}
 	if !isNull(em["maintenance"]) {
 		var m Maintenance
-		if err := strictInto("energy.maintenance", em["maintenance"], []string{"kcal", "mass_kg", "avg_run_km_per_day", "window", "adopted_on", "result_id"}, &m); err != nil {
+		if err := strictInto("energy.maintenance", em["maintenance"], []string{"kcal", "mass_kg", "avg_run_km_per_day", "window", "adopted_on", "result_id"}, &m, "result_id"); err != nil {
 			return nil, err
+		}
+		var win []json.RawMessage
+		if json.Unmarshal(mustRaw(em["maintenance"], "window"), &win) != nil || len(win) != 2 {
+			return nil, errors.New("targets: energy.maintenance.window needs exactly two dates")
 		}
 		if err := checkMaintenanceNumbers(m.Kcal, m.MassKg, m.AvgRunKm); err != nil {
 			return nil, err

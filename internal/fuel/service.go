@@ -109,12 +109,15 @@ type Service struct {
 
 	// v7: record operations (their own store), the calibration, the kept
 	// variable list (strength set variables resolve against it).
-	records        *recordStore
-	recMu          sync.Mutex // one record or void operation at a time
-	calib          *calibStore
-	calibMu        sync.Mutex // one calibration run or accept at a time
-	calibLast      time.Time
-	calibDirty     atomic.Bool
+	records    *recordStore
+	recMu      sync.Mutex // one record or void operation at a time
+	calib      *calibStore
+	calibMu    sync.Mutex // one calibration run or accept at a time
+	calibLast  time.Time
+	calibDirty atomic.Bool
+	// calibStoreErr is the error of the last attempt to store a run (guarded
+	// by calibMu): a run that is not durable is never accepted.
+	calibStoreErr  error
 	varMu          sync.Mutex
 	varList        []VarInfo
 	strengthLogged string // the missing-variables line that was logged last
@@ -406,6 +409,14 @@ func (s *Service) Resolve(ctx context.Context) error {
 	s.cache = newCache(s.o.Vars, ids, s.journal, s.o.Now)
 	s.cache.readTO = s.o.VarTimeout
 	s.cache.publish = &s.stateMu
+	// A refresh that brings other rows for a past day, or other Body
+	// composition rows, makes the calibration run again (18.5 step 1): an
+	// edit by another writer and a new weigh-in are inputs too.
+	s.cache.onChange = func(date string) {
+		if date == "body" || date < s.o.Now().UTC().Format("2006-01-02") {
+			s.calibDirty.Store(true)
+		}
+	}
 	s.mu.Unlock()
 	return nil
 }

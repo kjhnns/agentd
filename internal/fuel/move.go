@@ -269,6 +269,7 @@ func (s *Service) finishMove(ctx context.Context, w http.ResponseWriter, out *Mo
 	var stand, items []Item
 	var ops []Op
 	read := map[string]bool{}
+	skipped := 0 // items that cannot be moved (checked under their locks)
 	for _, d := range found {
 		srcDate := d.EatenAt.In(targets.loc).Format("2006-01-02")
 		var old Item
@@ -277,6 +278,7 @@ func (s *Service) finishMove(ctx context.Context, w http.ResponseWriter, out *Mo
 			it, ok := s.journal.Item(d.RowKey)
 			if !ok {
 				lines = append(lines, FixLine{Text: "I cannot move " + d.Item + " from here."})
+				skipped++
 				continue
 			}
 			old, srcDate = it, it.Date
@@ -296,6 +298,7 @@ func (s *Service) finishMove(ctx context.Context, w http.ResponseWriter, out *Mo
 			var ok bool
 			if old, ok = externalItem(d.RowKey, srcDate, rows); !ok {
 				lines = append(lines, FixLine{Text: d.Item + " is no longer in the log."})
+				skipped++
 				continue
 			}
 		}
@@ -304,12 +307,15 @@ func (s *Service) finishMove(ctx context.Context, w http.ResponseWriter, out *Mo
 		switch {
 		case srcDate == date:
 			lines = append(lines, FixLine{ItemID: old.ID, Text: d.Item + " is already on " + dayLabel(date) + "."})
+			skipped++
 			continue
 		case v.pending:
 			lines = append(lines, FixLine{ItemID: old.ID, Text: d.Item + " is still being saved; try again in a moment."})
+			skipped++
 			continue
 		case g == nil || g.orig.Data == nil || g.c.undone || v.state.Undone:
 			lines = append(lines, FixLine{ItemID: old.ID, Text: d.Item + " was already removed."})
+			skipped++
 			continue
 		}
 		// The new row: the item's CURRENT amounts on the target day, at the
@@ -348,6 +354,20 @@ func (s *Service) finishMove(ctx context.Context, w http.ResponseWriter, out *Mo
 		items = append(items, ni)
 		ops = append(ops, nop, uop)
 		lines = append(lines, FixLine{OpID: uop.ID, ItemID: old.ID, Text: d.Item})
+	}
+	if preset != nil && skipped > 0 {
+		// POST /fuel/move names its items: all of them move, or none (an item
+		// that another request removed meanwhile must not leave a half move).
+		release()
+		var notes []FixLine
+		for _, l := range lines {
+			if l.OpID == "" {
+				notes = append(notes, FixLine{Text: l.Text})
+			}
+		}
+		notes = append(notes, FixLine{Text: "Nothing was moved."})
+		answer(today, notes, nil, nil, nil, func() {})
+		return
 	}
 	answer(date, lines, stand, items, ops, release)
 }

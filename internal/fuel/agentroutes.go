@@ -150,7 +150,7 @@ func (s *Service) handleItems(w http.ResponseWriter, r *http.Request) {
 
 	// Plausibility: no re-ask here (there is no model); what looks wrong
 	// gets the visible check flag (spec 17 E).
-	checks := s.problemsOf(out)
+	checks := s.problemsWith(out, implausibleAny) // also without a food class
 	userText := strings.TrimSpace(body.Note)
 	if userText == "" {
 		var names []string
