@@ -291,6 +291,13 @@ func (s *Service) chatMessage(e Entry, capability, mark string, paths []string, 
 	for i := len(yItems) - 1; i >= 0; i-- {
 		b.WriteString("\n" + chatItemLine(yItems[i], loc))
 	}
+	if len(s.staples) > 0 {
+		var st []string
+		for _, x := range s.staples {
+			st = append(st, fmt.Sprintf("%s (also: %s; default %s g)", x.Key, strings.Join(x.Aliases, ", "), fmtNum(x.DefaultG)))
+		}
+		b.WriteString("\nSTAPLES (label values of fueld win: set staple_key and portion_g, your macro values are replaced): " + strings.Join(st, "; "))
+	}
 	b.WriteString("\nRECENT LIST (his usual foods and portions; key is for fuel-op relog):")
 	if len(recent) == 0 {
 		b.WriteString("\n  none")
