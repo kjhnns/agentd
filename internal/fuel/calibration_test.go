@@ -239,18 +239,18 @@ func calFixture(h *harness, n int, kcal float64) {
 	h.strava("fresh", "Walk", 600, 0, "2026-10-01T07:00:00", h.clk.Now())
 }
 
-// waitCalib waits for the calibration run that a start makes for today.
+// waitCalib waits until the calibration tick of the start is over, then
+// runs the calibration once, so that today's result is of the current data
+// (the tick of an earlier start may have stored a result of older data).
 func (h *harness) waitCalib() {
 	h.t.Helper()
-	for i := 0; i < 400; i++ {
-		if _, ok := h.svc.calib.result(h.svc.today()); ok {
-			h.svc.calibMu.Lock() // and for the run to release its lock
-			h.svc.calibMu.Unlock()
-			return
-		}
+	for i := 0; i < 2000 && !h.svc.calibBooted.Load(); i++ {
 		time.Sleep(5 * time.Millisecond)
 	}
-	h.t.Fatal("no calibration result after the start")
+	if !h.svc.calibBooted.Load() {
+		h.t.Fatal("the calibration tick of the start did not finish")
+	}
+	h.svc.RunCalibration(context.Background())
 }
 
 func TestT7CalibrationRefreshAndStore(t *testing.T) {

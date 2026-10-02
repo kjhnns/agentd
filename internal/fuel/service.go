@@ -109,12 +109,13 @@ type Service struct {
 
 	// v7: record operations (their own store), the calibration, the kept
 	// variable list (strength set variables resolve against it).
-	records    *recordStore
-	recMu      sync.Mutex // one record or void operation at a time
-	calib      *calibStore
-	calibMu    sync.Mutex // one calibration run or accept at a time
-	calibLast  time.Time
-	calibDirty atomic.Bool
+	records     *recordStore
+	recMu       sync.Mutex // one record or void operation at a time
+	calib       *calibStore
+	calibMu     sync.Mutex // one calibration run or accept at a time
+	calibLast   time.Time
+	calibDirty  atomic.Bool
+	calibBooted atomic.Bool // the calibration tick of the start is over
 	// calibStoreErr is the error of the last attempt to store a run (guarded
 	// by calibMu): a run that is not durable is never accepted.
 	calibStoreErr  error
@@ -476,6 +477,7 @@ func (s *Service) Start(ctx context.Context) {
 		defer s.workers.Done()
 		s.reconcileOnce(lctx)
 		s.calibTick(lctx, true)
+		s.calibBooted.Store(true)
 		s.loop(lctx)
 	}()
 	if s.recalOn() {
