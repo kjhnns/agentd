@@ -365,9 +365,30 @@ func openCalibStore(dir string) (*calibStore, error) {
 		if c := r.Result.Candidate; c != nil {
 			cs.cands[c.ResultID] = *c
 		}
+		// The log is the durable record: the LAST run of a date is its
+		// result (calibration.json is a derived view and may be one run
+		// behind after a crash between the two writes).
+		if r.Result.ForDate != "" {
+			cs.results[r.Result.ForDate] = r
+		}
 		return nil
 	})
+	cs.prune()
 	return cs, err
+}
+
+// prune keeps the results of the last 60 dates (the caller holds the lock,
+// or the store is not shared yet).
+func (cs *calibStore) prune() {
+	var dates []string
+	for d := range cs.results {
+		dates = append(dates, d)
+	}
+	sort.Strings(dates)
+	for len(dates) > 60 {
+		delete(cs.results, dates[0])
+		dates = dates[1:]
+	}
 }
 
 func (cs *calibStore) appendLine(v any) error {
@@ -399,15 +420,7 @@ func (cs *calibStore) putRun(r calibRun) error {
 	if c := r.Result.Candidate; c != nil {
 		cs.cands[c.ResultID] = *c
 	}
-	var dates []string
-	for d := range cs.results {
-		dates = append(dates, d)
-	}
-	sort.Strings(dates)
-	for len(dates) > 60 {
-		delete(cs.results, dates[0])
-		dates = dates[1:]
-	}
+	cs.prune()
 	b, err := json.Marshal(map[string]any{"results": cs.results})
 	if err != nil {
 		return err

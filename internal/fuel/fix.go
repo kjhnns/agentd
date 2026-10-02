@@ -77,6 +77,12 @@ func (s *Service) absoluteCorrection(it Item, rows []Value, tgt FixTarget, reaso
 			any = true
 		}
 	}
+	// The lever deltas count too: a supplement with zero macros and 10 g
+	// psyllium halves to 5 g.
+	levDelta := leverScaleDeltas(reduceLevers(g), share)
+	for _, d := range levDelta {
+		any = any || (d.OK && d.V != 0)
+	}
 	if !any {
 		// The rounded amounts may be unchanged while the portion or volume
 		// is not (a zero-macro supplement by grams): then the row still
@@ -96,7 +102,7 @@ func (s *Service) absoluteCorrection(it Item, rows []Value, tgt FixTarget, reaso
 	op := s.newCorrectionOp(it, requiredKnown(delta), reason, fraction)
 	// The delta of each lever the item is tagged for, by the same arithmetic
 	// as the macros; no key for an untagged lever (spec 18.6).
-	leverScaleDeltas(reduceLevers(g), share).putInto(op.Data)
+	levDelta.putInto(op.Data)
 	op.Data["share_after"] = math.Round(share*1000) / 1000
 	if origPortion != nil {
 		op.Data["portion_g_after"] = round1(*origPortion * share)

@@ -179,3 +179,107 @@ func TestSchemaTwoRequiredNumbersAreNotNull(t *testing.T) {
 		}
 	}
 }
+
+// ---- round 2 ----
+
+// The run log is the durable record: after a crash between the log line and
+// calibration.json, a restart shows the LAST run of the date.
+func TestCalibrationLogWinsOverTheDerivedFile(t *testing.T) {
+	h := newV7(t, calibDoc())
+	calFixture(h, 14, 2800)
+	h.restart()
+	h.waitCalib()
+	old, _ := os.ReadFile(filepath.Join(h.opts.StateDir, "calibration.json"))
+	if !strings.Contains(string(old), `"state":"candidate"`) {
+		t.Fatalf("the fixture must give a candidate: %s", old)
+	}
+	// An input changes: the next run is collecting (one day drops out).
+	rows := h.vars.rows("var-food")
+	h.vars.edit(rows[0]["_id"].(string), map[string]any{"kcal": 100.0}, false)
+	if res, _ := h.svc.RunCalibration(context.Background()); res.State == "candidate" {
+		t.Fatalf("the changed input must not give a candidate: %+v", res)
+	}
+	// The crash: the log has the new run, calibration.json still has the old one.
+	h.svc.Close()
+	if err := os.WriteFile(filepath.Join(h.opts.StateDir, "calibration.json"), old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cs, err := openCalibStore(h.opts.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := cs.result("2026-10-01"); !ok || r.Result.State == "candidate" {
+		t.Errorf("after a restart the last run of the log must win: %+v", r.Result)
+	}
+	h.start()
+}
+
+// A change of yesterday just after local midnight marks the calibration
+// dirty (the date is the date in targets.tz, not the UTC date).
+func TestCalibrationDirtyUsesTheLocalDate(t *testing.T) {
+	h := newV7(t, calibDoc())
+	h.food("2026-10-01", "day", 2800, 150, 10, 30.0, nil)
+	h.atZurich(t, "2026-10-02 00:30") // 2026-10-01T22:30Z: the UTC date is still 2026-10-01
+	h.waitCalib()
+	h.svc.calibDirty.Store(false)
+	rows := h.vars.rows("var-food")
+	h.vars.edit(rows[0]["_id"].(string), map[string]any{"kcal": 1900.0}, false)
+	_ = h.svc.cache.RefreshDay(context.Background(), "2026-10-01")
+	if !h.svc.calibDirty.Load() {
+		t.Error("a change of the local yesterday did not mark the calibration dirty")
+	}
+	// An own write for the local yesterday too.
+	h.svc.calibDirty.Store(false)
+	rec := h.post("/fuel/items", map[string]any{"client_id": cid(), "day": "yesterday", "items": []any{
+		map[string]any{"item": "late snack", "kcal": 100, "protein_g": 5, "carbs_g": 5, "fat_g": 5, "sat_fat_g": 1}}})
+	if rec.Code != 200 || !h.svc.calibDirty.Load() {
+		t.Errorf("an own write for the local yesterday: %d dirty %v", rec.Code, h.svc.calibDirty.Load())
+	}
+}
+
+// A failed entry leaves nothing behind, also an item with zero macros and a
+// lever amount; and a share fix changes a lever when the macros are zero.
+func TestZeroMacroItemWithLevers(t *testing.T) {
+	psyllium := map[string]any{"item": "psyllium husk", "kind": "supplement", "kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "sat_fat_g": 0,
+		"levers": map[string]any{"psyllium_g": 10, "beta_glucan_g": 0, "nuts_g": 0, "pulses_g": 0, "plant_protein_g": 0, "brew_method": nil}}
+	h := newV7(t, v2(), func(o *Options) { o.RecheckAfter = time.Second })
+	// A share fix halves the psyllium although every macro is zero.
+	r := decode[LogResponse](t, h.post("/fuel/items", map[string]any{"client_id": cid(), "items": []any{psyllium}}))
+	h.clk.Add(time.Second)
+	fx := h.fix(cid(), r.Items[0].ItemID, map[string]any{"share": 0.5})
+	if fx.Code != 200 || num(decode[MutationResponse](t, fx).Item.Levers.Psyllium) != "5" || lastRow(h)["psyllium_g"] != -5.0 {
+		t.Fatalf("share fix of a zero-macro item: %d %s", fx.Code, fx.Body)
+	}
+	// A failed entry: the supplement is saved, the other item is rejected.
+	h.vars.onPost = func(n int, d map[string]any) (bool, int) {
+		if d["item"] == "toast" {
+			return false, 400
+		}
+		return true, 201
+	}
+	toast := map[string]any{"item": "toast", "kcal": 90, "protein_g": 3, "carbs_g": 17, "fat_g": 1, "sat_fat_g": 0.2}
+	h.clk.Add(time.Minute)
+	if rec := h.post("/fuel/items", map[string]any{"client_id": cid(), "items": []any{psyllium, toast}}); rec.Code != 502 {
+		t.Fatalf("a rejected item: %d %s", rec.Code, rec.Body)
+	}
+	h.vars.onPost = nil
+	h.clk.Add(2 * time.Minute)
+	h.svc.reconcileOnce(context.Background())
+	h.clk.Add(2 * time.Minute)
+	s := h.snap(t, "")
+	if l := lever(s, "psyllium_g"); l.Consumed != 5 {
+		t.Errorf("the failed entry left psyllium behind: %g (want 5, the first item only)", l.Consumed)
+	}
+	comp := 0
+	for _, row := range h.vars.rows("var-food") {
+		if row["reason"] == "compensation" && row["psyllium_g"] == -10.0 {
+			comp++
+		}
+	}
+	if comp != 1 {
+		t.Errorf("compensation rows with the lever cancelled: %d", comp)
+	}
+	if n := len(h.day("").Items); n != 1 {
+		t.Errorf("active items of the day: %d, want 1", n)
+	}
+}

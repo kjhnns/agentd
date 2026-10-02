@@ -413,7 +413,9 @@ func (s *Service) Resolve(ctx context.Context) error {
 	// composition rows, makes the calibration run again (18.5 step 1): an
 	// edit by another writer and a new weigh-in are inputs too.
 	s.cache.onChange = func(date string) {
-		if date == "body" || date < s.o.Now().UTC().Format("2006-01-02") {
+		// The date in targets.tz (not UTC: just after local midnight the day
+		// before is already a past day).
+		if date == "body" || date < s.today() {
 			s.calibDirty.Store(true)
 		}
 	}
@@ -730,6 +732,7 @@ func (s *Service) postOp(ctx context.Context, op Op, preJournaled bool) string {
 // step under the cache lock, so a snapshot never sees the new revision with
 // the old rows (or the reverse).
 func (s *Service) markDone(opID, valueID string, attempts int, now time.Time) {
+	today := s.today() // the local date in targets.tz, taken before the locks
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	s.cache.commit(func() {
@@ -741,7 +744,7 @@ func (s *Service) markDone(opID, valueID string, attempts int, now time.Time) {
 		// together. A restart without the record re-finds it by op_id.
 		if done, ok := s.journal.Op(opID); ok && done.State == OpDone {
 			s.cache.mergeLocked(done)
-			if done.Date < now.UTC().Format("2006-01-02") {
+			if done.Date < today {
 				s.calibDirty.Store(true) // a write for a past day: the calibration runs again
 			}
 		}
@@ -1024,9 +1027,14 @@ func (s *Service) compensate(ctx context.Context, readDays map[string]bool) {
 			var resLev leverVals
 			residual := func() (Macros, bool) {
 				rows, _, _ := s.cache.RowsRaw(e.Date)
-				c, _, found := itemContrib(rows, itemID)
+				c, orig, found := itemContrib(rows, itemID)
 				resLev = leverCancel(reduceLevers(itemGroup(rows, itemID)))
-				return c.cancel(), found && c.residual()
+				// Something is left to cancel: a non-zero sum, or an original
+				// row that is still active (an item with zero macros, for
+				// example a supplement with a lever amount, would else stay
+				// in the day of a failed entry).
+				active := found && orig.Data != nil && !c.undone
+				return c.cancel(), found && (c.residual() || active)
 			}
 			res, need := residual()
 			if !outstanding && need && !readDays[e.Date] && s.cache.Age(e.Date) >= 60*time.Second {
