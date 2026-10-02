@@ -270,16 +270,16 @@ def s_eggs():
     clean()
     r, code, s = say("Full 200g", ["eggs_meal_1.jpg", "eggs_meal_2.jpg", "eggs_meal_3.jpg"])
     items, _ = day()
-    add("21 breakfast, 3 photos", "Full 200g (3 photos: cottage cheese pack, label, scrambled eggs)", len([it for it in of(items, "egg") if "butter" not in it["item"].lower()]) == 1 and len(of(items, "cottage")) == 1, s, names(items), r)
+    add("21 breakfast, 3 photos", "Full 200g (3 photos: cottage cheese pack, label, scrambled eggs)", len([it for it in of(items, "egg") if not it["item"].lower().startswith("butter")]) == 1 and len(of(items, "cottage")) == 1, s, names(items), r)
     r, code, s = say("4x eggs and a little bit of butter and salt", ["eggs.jpg"])
     items, _ = day()
-    eggs = [it for it in of(items, "egg") if "butter" not in it["item"].lower()]
+    eggs = [it for it in of(items, "egg") if not it["item"].lower().startswith("butter")]
     g = sum((it.get("portion_g") or 0) for it in eggs)
     add("22 duplicate eggs (must revise)", "4x eggs and a little bit of butter and salt (photo of the same eggs, seconds later)",
         len(eggs) == 1 and between(g, 180, 260) and len(of(items, "butter")) == 1, s, names(items), r)
     r, code, s = say("I had another two eggs")
     items, _ = day()
-    eggs2 = [it for it in of(items, "egg") if "butter" not in it["item"].lower()]
+    eggs2 = [it for it in of(items, "egg") if not it["item"].lower().startswith("butter")]
     k_before, k_after = sum(map(kcal, eggs)), sum(map(kcal, eggs2))
     add("23 another two eggs (must add)", "I had another two eggs", k_after > k_before + 80 and len(eggs2) in (1, 2), s, names(eggs2), r)
 
