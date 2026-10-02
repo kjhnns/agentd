@@ -416,7 +416,9 @@ func TestW7Energy(t *testing.T) {
 }
 
 func TestW8Alcohol(t *testing.T) {
-	wine := func(g float64) map[string]any { return map[string]any{"kind": "drink", "alcohol_g": g, "volume_ml": 150.0} }
+	wine := func(g float64) map[string]any {
+		return map[string]any{"kind": "drink", "alcohol_g": g, "volume_ml": 150.0}
+	}
 	fix := func(h *harness) {
 		h.food("2026-09-28", "wine", 100, 0, 0, 0.0, wine(12))
 		h.food("2026-09-30", "beer", 150, 1, 0, 0.0, wine(10))

@@ -61,7 +61,7 @@ type fakeVars struct {
 	vals      []fakeValue
 	n         int
 	posts     int
-	reads     atomic.Int64 // GET /values?date= requests
+	reads     atomic.Int64   // GET /values?date= requests
 	postsTo   map[string]int // POSTs by variable id
 	vars      []VarInfo
 	onPost    func(n int, data map[string]any) (store bool, status int) // nil = store, 201
