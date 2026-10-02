@@ -68,6 +68,12 @@ type DaemonConfig struct {
 	ChatAgentModel     string
 	ChatAgentTimeout   string // Go duration ("130s")
 	AgentOpToken       string // literal or "env:VAR": the agent token of the turn-bound routes
+
+	// The web app (spec 23). Default off: no static route, no session route,
+	// cookies ignored.
+	WebEnabled            bool
+	PublicOrigin          string // "https://fuel.gojoe.run"
+	WebInsecureTestCookie bool   // test instances on plain http only; refused with https or without test_mode
 }
 
 // DefaultConfigPath is where fueld looks without -config.
@@ -153,16 +159,13 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 		}
 		key := strings.TrimSpace(line[:eq])
 		raw := stripTOMLComment(strings.TrimSpace(line[eq+1:]))
-		if key == "test_mode" || key == "recalibrate_enabled" {
+		if b := map[string]*bool{"test_mode": &c.TestMode, "recalibrate_enabled": &c.RecalibrateEnabled,
+			"web_enabled": &c.WebEnabled, "web_insecure_test_cookie": &c.WebInsecureTestCookie}[key]; b != nil {
 			v, err := strconv.ParseBool(raw)
 			if err != nil {
 				return c, fmt.Errorf("line %d: %s expects true or false", n, key)
 			}
-			if key == "test_mode" {
-				c.TestMode = v
-			} else {
-				c.RecalibrateEnabled = v
-			}
+			*b = v
 			continue
 		}
 		if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
@@ -187,6 +190,7 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 			"chat_backend":         &c.ChatBackend, "chat_agent_url": &c.ChatAgentURL, "chat_agent_token": &c.ChatAgentToken,
 			"chat_agent_workspace": &c.ChatAgentWorkspace, "chat_agent_model": &c.ChatAgentModel,
 			"chat_agent_timeout": &c.ChatAgentTimeout, "agent_op_token": &c.AgentOpToken,
+			"public_origin": &c.PublicOrigin,
 		}[key]
 		if dst == nil {
 			return c, fmt.Errorf("line %d: unknown key %q", n, key)
@@ -249,6 +253,9 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return c, fmt.Errorf("chat_agent_url %q is not an http(s) URL", c.ChatAgentURL)
 		}
+	}
+	if err := (WebOptions{Enabled: c.WebEnabled, PublicOrigin: c.PublicOrigin, InsecureTestCookie: c.WebInsecureTestCookie}).validate(c.TestMode); err != nil {
+		return c, errors.New(strings.TrimPrefix(err.Error(), "fuel: "))
 	}
 	if c.ModelProvider != "openai" {
 		return c, fmt.Errorf("model_provider %q is not supported (openai)", c.ModelProvider)

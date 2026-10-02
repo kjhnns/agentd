@@ -33,3 +33,9 @@ recalibrate_agentd_token = "env:FUEL_AGENTD_TOKEN"   # pass agentd-safe/web-toke
 recalibrate_timeout      = "10m"                     # one job
 recalibrate_min_interval = "30s"                     # between job starts
 # recalibrate_kill_file  = "~/.local/state/fueld/recalibrate.off"  # touch it to stop new jobs
+
+# The web app (spec section 23). Default off: no static route, no session
+# route, cookies ignored. public_origin is the ONE origin the page runs on.
+# web_enabled   = true
+# public_origin = "https://fuel.gojoe.run"
+# web_insecure_test_cookie = true   # test instances on plain http only; refused with https or without test_mode

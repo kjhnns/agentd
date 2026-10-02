@@ -63,6 +63,8 @@ type Options struct {
 	Question QuestionOptions // questions through an agent session (spec section 21)
 
 	Chat ChatOptions // the agent chat broker (spec section 22)
+
+	Web WebOptions // the web app: browser sessions and the static page (spec section 23)
 }
 
 // Service is the fast path. Construct with New, then Start, then Handler.
@@ -108,6 +110,7 @@ type Service struct {
 	logTimes []time.Time             // accepted logs, for the hourly / daily caps
 
 	recal     *recalStore
+	web       *webState  // nil = the web app is off
 	recalMu   sync.Mutex // one recalibration job at a time
 	recalLast time.Time  // start of the last job (min interval)
 
@@ -164,6 +167,9 @@ func (o Options) Validate() error {
 	}
 	if o.TestMode && strings.EqualFold(strings.TrimSpace(o.SymptomVar), prodSymptomVar) {
 		return errors.New(`fuel: test_mode refuses symptom_var "Symptom log" (the production variable)`)
+	}
+	if err := o.Web.validate(o.TestMode); err != nil {
+		return err
 	}
 	return nil
 }
@@ -262,6 +268,11 @@ func New(o Options) (*Service, error) {
 	}
 	if s.calib, err = openCalibStore(o.StateDir); err != nil {
 		return nil, fmt.Errorf("fuel: calibration: %w", err)
+	}
+	if o.Web.Enabled {
+		if s.web, err = openWeb(o.Web, o.StateDir, o.Token, o.Now); err != nil {
+			return nil, fmt.Errorf("fuel: web: %w", err)
+		}
 	}
 	s.coachSeen = map[string]bool{}
 	_ = loadLines(filepath.Join(o.StateDir, "coach-events.jsonl"), false, func(b []byte) error {

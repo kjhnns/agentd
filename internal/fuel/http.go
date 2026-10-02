@@ -118,6 +118,18 @@ func (s *Service) gate(next http.Handler) http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		role := s.tokenRole(r)
+		// The web app (spec 23): a session cookie stands for the app token.
+		// A request with an Authorization header is judged by the bearer alone.
+		if role == "" && s.web != nil && r.Header.Get("Authorization") == "" {
+			ok, e := s.web.cookieAuth(w, r)
+			if e != nil {
+				writeErr(w, e)
+				return
+			}
+			if ok {
+				role = "app"
+			}
+		}
 		if role == "" {
 			if engaged, ra := s.fails.note(s.o.Now()); engaged {
 				log.Printf("fuel: auth brake engaged, last from %s", clientIP(r))
@@ -190,7 +202,19 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("/fuel/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errf(http.StatusNotFound, "not_found", false, "no such route"))
 	})
-	return s.gate(mux)
+	gated := s.gate(mux)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The static files and the session routes answer before a session
+		// exists; with web_enabled off they are 404 and cookies are ignored.
+		if isWebPath(r.URL.Path) {
+			s.serveWeb(w, r)
+			return
+		}
+		if s.web != nil {
+			s.web.headers(w)
+		}
+		gated.ServeHTTP(w, r)
+	})
 }
 
 // ---- idempotency + concurrency ----

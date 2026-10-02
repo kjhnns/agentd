@@ -74,7 +74,7 @@ func main() {
 	}
 	errc := make(chan error, 1)
 	go func() {
-		log.Printf("fueld: listening on http://%s (test_mode=%v, food_log_var=%q)", cfg.Listen, cfg.TestMode, cfg.FoodLogVar)
+		log.Printf("fueld: listening on http://%s (test_mode=%v, food_log_var=%q, web_enabled=%v)", cfg.Listen, cfg.TestMode, cfg.FoodLogVar, cfg.WebEnabled)
 		errc <- srv.ListenAndServe()
 	}()
 	sig := make(chan os.Signal, 1)
@@ -183,6 +183,7 @@ func build(cfg fuel.DaemonConfig) (*fuel.Service, error) {
 		StateDir:     cfg.StateDir,
 		StravaDir:    cfg.StravaDir,
 		TestMode:     cfg.TestMode,
+		Web:          fuel.WebOptions{Enabled: cfg.WebEnabled, PublicOrigin: cfg.PublicOrigin, InsecureTestCookie: cfg.WebInsecureTestCookie},
 	})
 }
 
