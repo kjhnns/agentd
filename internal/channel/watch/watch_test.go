@@ -226,6 +226,37 @@ func TestVoiceUploadCarriesTranscriptAndMedia(t *testing.T) {
 	}
 }
 
+// The phone's "+" menu uploads a JPEG with the typed text as the caption: the
+// receipt shows the caption plus a [photo] marker, and the turn gets the saved
+// image as a media artifact with the caption as its text.
+func TestPhotoUploadCarriesCaptionAndImage(t *testing.T) {
+	a, _ := newAdapter(t)
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("text", "what is this?")
+	part, _ := mw.CreatePart(map[string][]string{
+		"Content-Disposition": {`form-data; name="file"; filename="photo.jpg"`},
+		"Content-Type":        {"image/jpeg"},
+	})
+	_, _ = part.Write([]byte("\xff\xd8\xff\xe0JPEGDATA"))
+	_ = mw.Close()
+	rec := do(t, a.Handler(), http.MethodPost, "/watch/messages", "wt", &buf, mw.FormDataContentType())
+	if rec.Code != 202 {
+		t.Fatalf("photo post: %d %s", rec.Code, rec.Body.String())
+	}
+	var posted struct {
+		Message Message `json:"message"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &posted)
+	if posted.Message.Kind != KindText || posted.Message.Text != "what is this?\n[photo]" {
+		t.Fatalf("receipt = %+v", posted.Message)
+	}
+	in := <-a.Inbound()
+	if len(in.Media) != 1 || in.Media[0].Kind != media.KindImage || in.Media[0].Path == "" || in.Text != "what is this?" {
+		t.Fatalf("inbound = %+v", in)
+	}
+}
+
 func TestEmptyAndBadPosts(t *testing.T) {
 	a, _ := newAdapter(t)
 	h := a.Handler()
