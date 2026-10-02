@@ -1800,7 +1800,9 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 	err = s.journal.AppendCtx(ctx, rec)
 	s.stateMu.Unlock()
 	if err != nil && turn != nil {
-		turn.unadmit(body.ClientID)
+		l.Unlock()
+		turnPersistErr(w, turn, body.ClientID, err)
+		return
 	}
 	if err != nil {
 		l.Unlock()

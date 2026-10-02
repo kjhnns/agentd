@@ -1214,12 +1214,54 @@ func TestChatTurnWriteWithUncertainJournalIsNotRefused(t *testing.T) {
 	fa.script = func(msg string) (int, string) {
 		c := capOf(msg)
 		h.svc.journal.syncFn = func(*os.File) error { return errors.New("injected fsync failure") }
-		rec := h.op("POST", "/fuel/items", c, map[string]any{"client_id": opID(), "items": []any{food("skyr", 150, 95, 16, 0.2)}})
+		body := map[string]any{"client_id": opID(), "items": []any{food("skyr", 150, 95, 16, 0.2)}}
+		rec := h.op("POST", "/fuel/items", c, body)
 		code, ec, text = rec.Code, errCode(t, rec), rec.Body.String()
+		// The repeat of fuel-op (the same client_id) is uncertain too, never a
+		// success built from missing operations.
+		if again := h.op("POST", "/fuel/items", c, body); again.Code != 500 || errCode(t, again) != "uncertain" {
+			t.Errorf("repeat after an uncertain write: %d %s", again.Code, again.Body)
+		}
 		return 200, end(msg, "I do not know if it was saved.")
 	}
 	h.logText(cid(), "150 g skyr")
 	if code != 500 || ec != "uncertain" || strings.Contains(text, "nothing was written") {
 		t.Fatalf("uncertain journal: %d %q %s", code, ec, text)
+	}
+}
+
+// The same rule for a turn-bound fix and undo: uncertain on the first answer
+// and on the repeat, not 503 then 409 pending.
+func TestChatTurnFixAndUndoWithUncertainJournal(t *testing.T) {
+	for _, kind := range []string{"fix", "undo"} {
+		h, fa := newChat(t)
+		fa.script = func(msg string) (int, string) {
+			rec := h.op("POST", "/fuel/items", capOf(msg), map[string]any{"client_id": opID(), "items": []any{food("skyr", 150, 95, 16, 0.2)}})
+			if rec.Code != 200 {
+				t.Errorf("items: %d %s", rec.Code, rec.Body)
+			}
+			return 200, end(msg, "Logged the skyr.")
+		}
+		r := decode[LogResponse](t, h.logText(cid(), "150 g skyr"))
+		if len(r.Items) != 1 {
+			t.Fatalf("%s: items %d", kind, len(r.Items))
+		}
+		id := r.Items[0].ItemID
+		h.clk.Add(time.Minute)
+		fa.script = func(msg string) (int, string) {
+			h.svc.journal.syncFn = func(*os.File) error { return errors.New("injected fsync failure") }
+			body := map[string]any{"client_id": opID(), "item_id": id}
+			if kind == "fix" {
+				body["portion_g"] = 100
+			}
+			for i := 0; i < 2; i++ {
+				rec := h.op("POST", "/fuel/"+kind, capOf(msg), body)
+				if rec.Code != 500 || errCode(t, rec) != "uncertain" || strings.Contains(rec.Body.String(), "nothing was written") {
+					t.Errorf("%s call %d: %d %s", kind, i+1, rec.Code, rec.Body)
+				}
+			}
+			return 200, end(msg, "I do not know if it was saved.")
+		}
+		h.logText(cid(), "that was 100 g")
 	}
 }

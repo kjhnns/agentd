@@ -408,9 +408,7 @@ func (s *Service) turnItems(ctx context.Context, w http.ResponseWriter, t *chatT
 	err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: its, Ops: ops})
 	s.stateMu.Unlock()
 	if err != nil {
-		if turnPersistErr(w, err) {
-			t.unadmit(body.ClientID)
-		}
+		turnPersistErr(w, t, body.ClientID, err)
 		return
 	}
 	for _, it := range out.Items {

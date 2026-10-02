@@ -578,9 +578,7 @@ func (s *Service) turnRelog(ctx context.Context, w http.ResponseWriter, t *chatT
 	err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: []Item{it}, Ops: []Op{op}})
 	s.stateMu.Unlock()
 	if err != nil {
-		if turnPersistErr(w, err) {
-			t.unadmit(clientID)
-		}
+		turnPersistErr(w, t, clientID, err)
 		return
 	}
 	t.names[n] = true

@@ -595,9 +595,7 @@ func (s *Service) turnMove(ctx context.Context, w http.ResponseWriter, t *chatTu
 	s.stateMu.Unlock()
 	release()
 	if err != nil {
-		if turnPersistErr(w, err) {
-			t.unadmit(clientID)
-		}
+		turnPersistErr(w, t, clientID, err)
 		return
 	}
 	// The pairs are (new row, undo of the old row): the old item took its

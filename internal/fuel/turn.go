@@ -44,12 +44,13 @@ type chatTurn struct {
 // turnCall is one admitted call of a turn (idempotency by client_id inside
 // the turn): the hash of its request and what its answer is rendered from.
 type turnCall struct {
-	hash    string
-	date    string
-	opIDs   []string
-	itemIDs []string
-	lines   []string
-	set     bool // the answer was rendered once
+	uncertain bool // the journal could not confirm the write: a repeat answers "uncertain"
+	hash      string
+	date      string
+	opIDs     []string
+	itemIDs   []string
+	lines     []string
+	set       bool // the answer was rendered once
 }
 
 type turnCtxKey struct{}
@@ -183,6 +184,10 @@ func (s *Service) turnReplay(ctx context.Context, w http.ResponseWriter, t *chat
 	}
 	if c.hash != hash {
 		writeErr(w, errf(http.StatusConflict, "idempotency_conflict", false, "client_id was used for a different request in this turn"))
+		return true
+	}
+	if c.uncertain {
+		writeErr(w, errTurnUncertain)
 		return true
 	}
 	s.turnAnswer(ctx, w, t, c.date, c.opIDs, c.itemIDs, c.lines)
@@ -482,21 +487,27 @@ func (s *Service) handlePreview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"date": date, "written": false, "items": pis, "sum": totals, "budgets": budgets})
 }
 
-// turnPersistErr answers a failed journal append of a turn-bound write. When
-// the journal's durability is uncertain the transaction may be applied and
-// reconciliation may post it after a restart: the admission is kept and the
-// answer is "uncertain", never "nothing was written". It reports whether the
-// write is known not to exist (the caller then releases the admission).
-func turnPersistErr(w http.ResponseWriter, err error) (notWritten bool) {
+var errTurnUncertain = errf(http.StatusInternalServerError, "uncertain", false, "storage problem on the server; the write may or may not be saved. Do not repeat it. Write nothing more in this turn.")
+
+// turnPersistErr answers a failed journal append of a turn-bound write and
+// settles the admission of clientID. When the journal's durability is
+// uncertain the transaction may be applied and reconciliation may post it
+// after a restart: the admission stays, marked uncertain, so the first answer
+// and every repeat of the client_id say "uncertain", never "nothing was
+// written" and never a success built from missing operations. Any other
+// failure wrote nothing: the admission is taken back and the call may come again.
+func turnPersistErr(w http.ResponseWriter, t *chatTurn, clientID string, err error) {
 	switch {
 	case errors.Is(err, ErrJournalBroken):
-		writeErr(w, errf(http.StatusInternalServerError, "uncertain", false, "storage problem on the server; the write may or may not be saved. Do not repeat it. Write nothing more in this turn."))
-		return false
+		if c, ok := t.calls[clientID]; ok {
+			c.uncertain = true
+		}
+		writeErr(w, errTurnUncertain)
 	case errors.Is(err, ErrDeadline):
+		t.unadmit(clientID)
 		writeErr(w, errf(http.StatusGatewayTimeout, "timeout", true, "took too long; nothing was written, retry"))
-		return true
 	default:
+		t.unadmit(clientID)
 		writeErr(w, errf(http.StatusInternalServerError, "internal", true, "could not persist the request; nothing was written"))
-		return true
 	}
 }
