@@ -370,15 +370,25 @@ func parseChatAnswer(raw, mark string) (string, bool) {
 		if strings.TrimSpace(strings.TrimPrefix(t, "FUEL-END")) != mark {
 			return "", false
 		}
-		return cleanAnswer(strings.Join(lines[:i], "\n")), true
+		a = cleanAnswer(strings.Join(lines[:i], "\n"))
+		if foreignAnswer(a) {
+			return "", false
+		}
+		return a, true
 	}
 	a = cleanAnswer(a)
-	if a == "" || strings.HasPrefix(strings.ToUpper(a), "CHECKPOINT") || strings.Contains(a, "FUEL-READY") {
+	if a == "" || foreignAnswer(a) {
 		return "", false
 	}
 	// No end line: the model forgot it. The mark is a check against a
 	// foreign result, not a format rule.
 	return a, true
+}
+
+// foreignAnswer reports a text that is not the answer of a turn: the result
+// of a checkpoint or of a photo upload.
+func foreignAnswer(a string) bool {
+	return strings.HasPrefix(strings.ToUpper(a), "CHECKPOINT") || strings.Contains(a, "FUEL-READY")
 }
 
 // ---- the run ----
@@ -766,8 +776,14 @@ func (s *Service) chatAdded(e Entry, states []ItemState, date string) []Macros {
 			ms = append(ms, states[i].Effective)
 		}
 	}
+	own := map[string]bool{}
+	for _, id := range e.ItemIDs {
+		own[id] = true
+	}
 	for _, id := range e.FixOps {
-		if op, ok := s.journal.Op(id); ok && op.State != OpFailed && op.Date == date {
+		// A change of an item that this turn logged is in that item's
+		// current contribution already: it counts once.
+		if op, ok := s.journal.Op(id); ok && op.State != OpFailed && op.Date == date && !own[op.ItemID] {
 			ms = append(ms, op.Macros)
 		}
 	}

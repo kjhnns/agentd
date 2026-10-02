@@ -191,6 +191,9 @@ func (s *Service) recalEnqueue(e Entry) {
 	if !s.recalOn() || e.Intent != "log" || e.NoFood || len(e.PhotoIDs) == 0 || len(e.ItemIDs) == 0 {
 		return
 	}
+	if e.Chat != "" {
+		return // no second opinion for an entry of the agent chat (spec 22.9)
+	}
 	if _, ok := s.recal.get(e.ID); ok {
 		return
 	}

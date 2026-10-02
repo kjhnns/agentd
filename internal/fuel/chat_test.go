@@ -2,6 +2,7 @@ package fuel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1016,6 +1017,7 @@ func TestParseChatAnswer(t *testing.T) {
 		{"FUEL-END AB12", "AB12", "", true},
 		{"Logged the eggs.\nFUEL-END ZZ99", "AB12", "", false},
 		{"CHECKPOINT SAVED", "AB12", "", false},
+		{"CHECKPOINT SAVED\nFUEL-END AB12", "AB12", "", false},
 		{"FUEL-READY", "AB12", "", false},
 		{"", "AB12", "", false},
 	} {
@@ -1105,7 +1107,7 @@ func TestChatConfig(t *testing.T) {
 		t.Fatalf("defaults: %+v %v", c, err)
 	}
 	for _, bad := range []string{
-		"chat_backend = \"agent\"\n", // no tokens
+		"chat_backend = \"agent\"\n",                           // no tokens
 		"chat_backend = \"agent\"\nchat_agent_token = \"x\"\n", // no agent_op_token
 		"chat_backend = \"robot\"\n",
 		"chat_agent_timeout = \"301s\"\n",
@@ -1119,4 +1121,62 @@ func TestChatConfig(t *testing.T) {
 	if _, err := ParseDaemonConfig([]byte(base + "chat_backend = \"agent\"\nchat_agent_token = \"env:A\"\nagent_op_token = \"env:B\"\nchat_agent_workspace = \"fuel-e2e\"\n")); err != nil {
 		t.Errorf("a valid agent config: %v", err)
 	}
+}
+
+// A pending chat entry at a start is ended by the chat rule (failed, the
+// rows kept), never by the question rule (fallback); no second opinion job
+// is made for an agent chat entry, also not by the restart recovery.
+func TestChatSweepNotQuestionSweepAndNoRecal(t *testing.T) {
+	h, fa := newChat(t, func(o *Options) {
+		o.Chat.SyncWait = 20 * time.Millisecond
+		o.Recal = RecalOptions{Enabled: true, Agent: fakeRecalAgent{}}
+	})
+	fa.script = logsItems(h, "Logged the plate.", food("glass noodle salad", 350, 420, 18, 2))
+	body, ct := multipartBody(t, map[string]string{"client_id": cid()}, []filePart{{"image", "a.jpg", "image/jpeg", testJPEG(300, 200)}})
+	r := decode[LogResponse](t, h.do("POST", "/fuel/log", body, ct))
+	waitFor(t, "the entry", func() bool { return h.get("/fuel/entry/"+r.EntryID).Code == 200 })
+	// A pending entry as a crash leaves it: journaled, no running turn.
+	e := Entry{ID: newID("en_"), ClientID: cid(), Date: "2026-10-01", EatenAt: h.clk.Now(), CreatedAt: h.clk.Now(), Intent: "question",
+		PhotoIDs: []string{}, UserText: "lost in a crash", Chat: chatAgent, Agent: agentPending, ReqHash: "x"}
+	if err := h.svc.journal.Append(journalRec{T: "txn", Entry: &e}); err != nil {
+		t.Fatal(err)
+	}
+	h.restart()
+	got, _ := h.svc.journal.Entry(e.ID)
+	if got.Agent != agentFailed || got.AgentText != chatNoAnswer {
+		t.Errorf("the pending chat entry after a start: agent=%q text=%q", got.Agent, got.AgentText)
+	}
+	if !strings.Contains(h.get("/fuel/feed").Body.String(), "lost in a crash") {
+		t.Error("the message of the crashed turn is not in the feed")
+	}
+	if jobs := h.svc.recal.all(); len(jobs) != 0 {
+		t.Errorf("recalibration jobs for agent chat entries: %+v", jobs)
+	}
+}
+
+// A fix of an item that the same turn logged counts once in the widget.
+func TestChatAddedCountsOnce(t *testing.T) {
+	h, fa := newChat(t)
+	fa.script = func(msg string) (int, string) {
+		c := capOf(msg)
+		rec := h.op("POST", "/fuel/items", c, map[string]any{"client_id": opID(), "items": []any{food("rice", 200, 260, 5, 0.2)}})
+		id := decode[turnWriteResponse](t, rec).Items[0].ItemID
+		if fx := h.op("POST", "/fuel/fix", c, map[string]any{"client_id": opID(), "item_id": id, "share": 0.5}); fx.Code != 200 {
+			t.Errorf("fix: %d %s", fx.Code, fx.Body)
+		}
+		return 200, end(msg, "Logged half of the rice.")
+	}
+	r := decode[LogResponse](t, h.logText(cid(), "rice, but only half"))
+	wb, _ := widgetOf(r.Blocks)
+	added, _ := json.Marshal(wb.Data)
+	if !strings.Contains(string(added), `"kcal":130`) {
+		t.Errorf("added: %s", added)
+	}
+}
+
+// fakeRecalAgent fails the test's expectation when a job runs: none is made.
+type fakeRecalAgent struct{}
+
+func (fakeRecalAgent) Ask(context.Context, string, [][]byte) (string, string, error) {
+	return "", "fake", fmt.Errorf("no job is expected")
 }

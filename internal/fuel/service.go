@@ -982,13 +982,33 @@ func (s *Service) refreshFailedDays(ctx context.Context, now time.Time, readDays
 		if now.Sub(e.CreatedAt) > 35*24*time.Hour {
 			every = 6 * time.Hour
 		}
-		if readDays[e.Date] || s.cache.Age(e.Date) < every {
-			continue
-		}
-		if err := s.cache.RefreshDay(ctx, e.Date); err == nil {
-			readDays[e.Date] = true
+		for _, date := range s.failedDates(e) {
+			if readDays[date] || s.cache.Age(date) < every {
+				continue
+			}
+			if err := s.cache.RefreshDay(ctx, date); err == nil {
+				readDays[date] = true
+			}
 		}
 	}
+}
+
+// failedDates are the days a failed entry's rows are on: its own date, and
+// for an entry of the agent chat the date of every item (a turn can write on
+// more than one day, spec 22.5).
+func (s *Service) failedDates(e Entry) []string {
+	out := []string{e.Date}
+	if e.Chat == "" {
+		return out
+	}
+	seen := map[string]bool{e.Date: true}
+	for _, id := range append(append([]string{}, e.ItemIDs...), e.MovedIDs...) {
+		if it, ok := s.journal.Item(id); ok && !seen[it.Date] {
+			seen[it.Date] = true
+			out = append(out, it.Date)
+		}
+	}
+	return out
 }
 
 func (s *Service) reconcileOp(ctx context.Context, opID string, now time.Time, readDays map[string]bool) {
@@ -1052,9 +1072,6 @@ func (s *Service) reconcileOp(ctx context.Context, opID string, now time.Time, r
 func (s *Service) compensate(ctx context.Context, readDays map[string]bool) {
 	now := s.o.Now()
 	for _, e := range s.journal.FailedEntries() {
-		if !s.cache.Loaded(e.Date) {
-			continue // no view of the day yet: refreshFailedDays reads it
-		}
 		ids := e.ItemIDs
 		if e.Chat != "" {
 			ids = append(append([]string{}, e.ItemIDs...), e.MovedIDs...)
@@ -1062,6 +1079,17 @@ func (s *Service) compensate(ctx context.Context, readDays map[string]bool) {
 		for _, itemID := range ids {
 			if (e.Intent == "move" || e.Chat != "") && !s.journal.OriginalFailed(itemID) {
 				continue // only the items whose new row failed (a late row)
+			}
+			// The day of the ITEM: an agent chat entry can hold items of
+			// more than one day.
+			date := e.Date
+			if e.Chat != "" {
+				if it, ok := s.journal.Item(itemID); ok {
+					date = it.Date
+				}
+			}
+			if !s.cache.Loaded(date) {
+				continue // no view of the day yet: refreshFailedDays reads it
 			}
 			l := s.itemLock(itemID)
 			if !l.LockCtx(ctx) {
@@ -1073,7 +1101,7 @@ func (s *Service) compensate(ctx context.Context, readDays map[string]bool) {
 			}
 			var resLev leverVals
 			residual := func() (Macros, bool) {
-				rows, _, _ := s.cache.RowsRaw(e.Date)
+				rows, _, _ := s.cache.RowsRaw(date)
 				c, orig, found := itemContrib(rows, itemID)
 				resLev = leverCancel(reduceLevers(itemGroup(rows, itemID)))
 				// Something is left to cancel: a non-zero sum, or an original
@@ -1084,13 +1112,13 @@ func (s *Service) compensate(ctx context.Context, readDays map[string]bool) {
 				return c.cancel(), found && (c.residual() || active)
 			}
 			res, need := residual()
-			if !outstanding && need && !readDays[e.Date] && s.cache.Age(e.Date) >= 60*time.Second {
+			if !outstanding && need && !readDays[date] && s.cache.Age(date) >= 60*time.Second {
 				// About to write: re-read so the amount is authoritative.
-				if err := s.cache.RefreshDay(ctx, e.Date); err != nil {
+				if err := s.cache.RefreshDay(ctx, date); err != nil {
 					l.Unlock()
 					continue
 				}
-				readDays[e.Date] = true
+				readDays[date] = true
 				res, need = residual()
 			}
 			if outstanding || !need {

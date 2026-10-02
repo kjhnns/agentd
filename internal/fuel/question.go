@@ -431,8 +431,8 @@ func (s *Service) questionSweep(startup bool) {
 	now := s.o.Now()
 	swept := false
 	for _, e := range s.journal.Entries() {
-		if e.Agent != agentPending {
-			continue
+		if e.Agent != agentPending || e.Chat != "" {
+			continue // an entry of the agent chat is ended by chatSweep (spec 22.7)
 		}
 		if !startup {
 			s.q.mu.Lock()
