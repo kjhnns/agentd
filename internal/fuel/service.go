@@ -1055,8 +1055,12 @@ func (s *Service) compensate(ctx context.Context, readDays map[string]bool) {
 		if !s.cache.Loaded(e.Date) {
 			continue // no view of the day yet: refreshFailedDays reads it
 		}
-		for _, itemID := range e.ItemIDs {
-			if e.Intent == "move" && !s.journal.OriginalFailed(itemID) {
+		ids := e.ItemIDs
+		if e.Chat != "" {
+			ids = append(append([]string{}, e.ItemIDs...), e.MovedIDs...)
+		}
+		for _, itemID := range ids {
+			if (e.Intent == "move" || e.Chat != "") && !s.journal.OriginalFailed(itemID) {
 				continue // only the items whose new row failed (a late row)
 			}
 			l := s.itemLock(itemID)

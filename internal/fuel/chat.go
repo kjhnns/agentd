@@ -519,9 +519,13 @@ func (s *Service) chatStart(e Entry, photos [][]byte, lat map[string]int, t0 tim
 		s.chat.mu.Unlock()
 		tA := time.Now()
 		if got {
-			ctx, cancel := context.WithTimeout(base, s.o.Chat.Timeout)
-			res = s.chatRun(ctx, e, photos)
-			cancel()
+			// The entry must still be pending (a recovery pass may have
+			// ended it while it waited): a final entry never gets a turn.
+			if cur, ok := s.journal.Entry(e.ID); ok && cur.Agent == agentPending {
+				ctx, cancel := context.WithTimeout(base, s.o.Chat.Timeout)
+				res = s.chatRun(ctx, e, photos)
+				cancel()
+			}
 			<-s.chat.sem
 		}
 		l["model"] += ms(time.Since(tA))

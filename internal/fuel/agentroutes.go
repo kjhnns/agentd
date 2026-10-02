@@ -109,11 +109,14 @@ func (s *Service) handleItems(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	now := s.o.Now()
 	hh := sha256.Sum256(append([]byte("items\x00"+strings.TrimSpace(body.LocalTime)+"\x00"+body.Note+"\x00"), synth...))
+	if body.New {
+		hh = sha256.Sum256(append(hh[:], "new"...))
+	}
 	hash := hex.EncodeToString(hh[:])
 	turn := turnOf(r)
 	if turn != nil {
 		// A turn-bound write (spec 22.5): idempotent inside the turn.
-		if turn.replay(w, body.ClientID) {
+		if s.turnReplay(ctx, w, turn, body.ClientID, hash) {
 			return
 		}
 	} else {
@@ -149,7 +152,11 @@ func (s *Service) handleItems(w http.ResponseWriter, r *http.Request) {
 	date := eatenAt.In(targets.loc).Format("2006-01-02")
 	requestDate := date
 	if out.Day != nil || out.Time != nil {
-		d, at, refuse := resolveDay(out.Day, out.Time, now, targets.loc, date, eatenAt)
+		ref := now
+		if turn != nil {
+			ref = turn.at // "yesterday" is the day before the user's message, not before the clock
+		}
+		d, at, refuse := resolveDay(out.Day, out.Time, ref, targets.loc, date, eatenAt)
 		if refuse != "" {
 			writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "%s", refuse))
 			return
@@ -157,7 +164,7 @@ func (s *Service) handleItems(w http.ResponseWriter, r *http.Request) {
 		date, eatenAt = d, at
 	}
 	if turn != nil {
-		s.turnItems(ctx, w, turn, body, out, date, eatenAt, now)
+		s.turnItems(ctx, w, turn, body, hash, out, date, eatenAt, now)
 		return
 	}
 	if e := s.rateCheck(now); e != nil {
@@ -270,7 +277,7 @@ func (s *Service) handleMove(w http.ResponseWriter, r *http.Request) {
 	hash := hashOf("move", body.Day, ids)
 	turn := turnOf(r)
 	if turn != nil {
-		if turn.replay(w, body.ClientID) {
+		if s.turnReplay(ctx, w, turn, body.ClientID, hash) {
 			return
 		}
 		for _, id := range ids {
@@ -343,7 +350,7 @@ type movePreset struct {
 
 // turnItems is POST /fuel/items inside a turn (spec 22.5): the items become
 // items of the turn's entry, in one journal line with their rows.
-func (s *Service) turnItems(ctx context.Context, w http.ResponseWriter, t *chatTurn, body itemsBody, out *ModelOutput, date string, eatenAt, now time.Time) {
+func (s *Service) turnItems(ctx context.Context, w http.ResponseWriter, t *chatTurn, body itemsBody, hash string, out *ModelOutput, date string, eatenAt, now time.Time) {
 	entry, ae := s.turnEntry(t)
 	if ae != nil {
 		writeErr(w, ae)
@@ -396,7 +403,7 @@ func (s *Service) turnItems(ctx context.Context, w http.ResponseWriter, t *chatT
 		// The reply shows the day of the food (the v4.4 rule).
 		entry.Date, entry.DayLabel = date, dayLabel(date)
 	}
-	t.admit(body.ClientID)
+	t.admit(body.ClientID, hash)
 	s.stateMu.Lock()
 	err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: its, Ops: ops})
 	s.stateMu.Unlock()

@@ -1248,6 +1248,9 @@ func (s *Service) callModelWith(ctx context.Context, m Model, mi ModelInput) (*M
 
 // buildItems turns model items into stored items: staple overrides, net
 // carbs normalized, rounded once.
+// mokaRE names coffee from a moka pot in an item name.
+var mokaRE = regexp.MustCompile(`(?i)\b(moka|bialetti|stovetop)\b`)
+
 func (s *Service) buildItems(out *ModelOutput, e Entry) []Item {
 	var items []Item
 	for _, mi := range out.Items {
@@ -1303,6 +1306,11 @@ func (s *Service) buildItems(out *ModelOutput, e Entry) []Item {
 			if d := t.V2.Levers.CoffeeDefaultBrew; brew == "unknown" && d != nil {
 				brew = *d
 			}
+		}
+		if it.Kind == "drink" && mokaRE.MatchString(it.Name) {
+			// A moka pot (Bialetti) has no paper filter: unfiltered for the
+			// brew-method lever, whatever the estimate said (spec 18.6, 22.12).
+			brew = "unfiltered"
 		}
 		it.levers, it.brew = checkLevers(it.ID, lev, brew, it.Kind, it.PortionG, m, est)
 		it.Orig = m
@@ -1523,7 +1531,7 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 			writeErr(w, errf(http.StatusForbidden, "agent_scope", false, "a turn takes fix and undo only"))
 			return
 		}
-		if turn.replay(w, body.ClientID) {
+		if s.turnReplay(ctx, w, turn, body.ClientID, hash) {
 			return
 		}
 	} else {
@@ -1781,7 +1789,7 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		entry.FixLines = append(entry.FixLines, FixLine{OpID: op.ID, ItemID: it.ID, Text: turnLine})
 		entry.FixText = joinLines(entry.FixLines)
 		rec.Entry = &entry
-		turn.admit(body.ClientID)
+		turn.admit(body.ClientID, hash)
 	}
 	// Published under the exclusive render lock: a render never sees the
 	// item's new pending op or fraction choice without the rest.

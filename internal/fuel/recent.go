@@ -356,6 +356,8 @@ func (s *Service) handleRelog(w http.ResponseWriter, r *http.Request) {
 		Key       string   `json:"key"`
 		Scale     *float64 `json:"scale"`
 		LocalTime string   `json:"local_time"`
+		// New (a turn-bound request, spec 22.5): more food, not the same again.
+		New bool `json:"new"`
 	}
 	err := decodeStrict(r.Body, &body)
 	_ = rc.SetReadDeadline(time.Time{})
@@ -390,7 +392,10 @@ func (s *Service) handleRelog(w http.ResponseWriter, r *http.Request) {
 	turn := turnOf(r)
 	if turn != nil {
 		// A turn-bound relog (spec 22.5): idempotent inside the turn.
-		if turn.replay(w, body.ClientID) {
+		if body.New {
+			hash += "|new"
+		}
+		if s.turnReplay(ctx, w, turn, body.ClientID, hash) {
 			return
 		}
 	} else {
@@ -452,7 +457,7 @@ func (s *Service) handleRelog(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if turn != nil {
-		s.turnRelog(ctx, w, turn, body.ClientID, *src, scale, date, eatenAt, now)
+		s.turnRelog(ctx, w, turn, body.ClientID, hash, body.New, *src, scale, date, eatenAt, now)
 		return
 	}
 	if e := s.rateCheck(now); e != nil {
@@ -526,7 +531,7 @@ func (s *Service) handleRelog(w http.ResponseWriter, r *http.Request) {
 
 // turnRelog is POST /fuel/relog inside a turn (spec 22.5): the recent item
 // becomes a new item of the turn's entry.
-func (s *Service) turnRelog(ctx context.Context, w http.ResponseWriter, t *chatTurn, clientID string, src RecentItem, scale float64, date string, eatenAt, now time.Time) {
+func (s *Service) turnRelog(ctx context.Context, w http.ResponseWriter, t *chatTurn, clientID, hash string, isNew bool, src RecentItem, scale float64, date string, eatenAt, now time.Time) {
 	entry, ae := s.turnEntry(t)
 	if ae != nil {
 		writeErr(w, ae)
@@ -542,6 +547,12 @@ func (s *Service) turnRelog(ctx context.Context, w http.ResponseWriter, t *chatT
 		return
 	}
 	s.freshen(ctx, date)
+	if d, dup := s.likelyDuplicate(t, date, src.Item); dup && !isNew {
+		writeErr(w, errf(http.StatusConflict, "likely_duplicate", false,
+			"%q looks like %s (id %s), logged a few minutes ago. If the user's words say it is MORE food, repeat this call with --new. Nothing was written",
+			src.Item, s.describeDayItem(d), d.RowKey))
+		return
+	}
 	m := src.Macros.Scale(scale)
 	it := Item{ID: newID("it_"), EntryID: entry.ID, Date: date, Name: src.Item, Basis: "repeat", Orig: m, EatenAt: eatenAt, Kind: src.Kind,
 		levers: src.levers.scale(scale), brew: src.brew}
@@ -562,7 +573,7 @@ func (s *Service) turnRelog(ctx context.Context, w http.ResponseWriter, t *chatT
 	opID := newID("op_")
 	op := Op{ID: opID, Kind: "original", EntryID: entry.ID, ItemID: it.ID, RowItemID: it.ID, Date: date,
 		Data: originalRowData(it, opID, ""), Macros: m, CreatedAt: now, State: OpPending, Attempts: 1, LastTry: s.o.Now()}
-	t.admit(clientID)
+	t.admit(clientID, hash)
 	s.stateMu.Lock()
 	err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: []Item{it}, Ops: []Op{op}})
 	s.stateMu.Unlock()

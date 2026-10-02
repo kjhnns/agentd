@@ -1,7 +1,6 @@
 package fuel
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -41,11 +40,15 @@ type chatTurn struct {
 	writes   int
 }
 
-// turnCall is the answer of one admitted call of a turn (idempotency by
-// client_id inside the turn).
+// turnCall is one admitted call of a turn (idempotency by client_id inside
+// the turn): the hash of its request and what its answer is rendered from.
 type turnCall struct {
-	status int
-	body   []byte
+	hash    string
+	date    string
+	opIDs   []string
+	itemIDs []string
+	lines   []string
+	set     bool // the answer was rendered once
 }
 
 type turnCtxKey struct{}
@@ -137,28 +140,6 @@ func agentScope(r *http.Request) *apiError {
 	return errf(http.StatusForbidden, "agent_scope", false, "the agent token is not valid for this route")
 }
 
-// turnRecorder keeps the answer of a turn-bound call for its replay.
-type turnRecorder struct {
-	http.ResponseWriter
-	status int
-	buf    bytes.Buffer
-}
-
-func (t *turnRecorder) WriteHeader(code int) {
-	t.status = code
-	t.ResponseWriter.WriteHeader(code)
-}
-
-func (t *turnRecorder) Write(b []byte) (int, error) {
-	if t.status == 0 {
-		t.status = http.StatusOK
-	}
-	t.buf.Write(b)
-	return t.ResponseWriter.Write(b)
-}
-
-func (t *turnRecorder) Unwrap() http.ResponseWriter { return t.ResponseWriter }
-
 // turnBound wraps a write route: without the header the route is unchanged.
 // With it, the turn is looked up and LOCKED for the whole request.
 func (s *Service) turnBound(h http.HandlerFunc) http.HandlerFunc {
@@ -185,39 +166,32 @@ func (s *Service) turnBound(h http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, errTurnClosed)
 			return
 		}
-		rec := &turnRecorder{ResponseWriter: w}
 		t.cur = ""
-		h(rec, r.WithContext(context.WithValue(r.Context(), turnCtxKey{}, t)))
-		if t.cur != "" {
-			// The call was admitted (journaled): its answer replays.
-			if c := t.calls[t.cur]; c != nil {
-				c.status, c.body = rec.status, append([]byte(nil), rec.buf.Bytes()...)
-			}
-			t.cur = ""
-		}
+		h(w, r.WithContext(context.WithValue(r.Context(), turnCtxKey{}, t)))
+		t.cur = ""
 	}
 }
 
-// replay answers a repeated client_id of the turn. true = answered.
-func (t *chatTurn) replay(w http.ResponseWriter, clientID string) bool {
+// replay answers a repeated client_id of the turn: the CURRENT state of the
+// first call's writes (sections 6 and 20), never a second write. Another
+// request with that client_id is 409. true = answered.
+func (s *Service) turnReplay(ctx context.Context, w http.ResponseWriter, t *chatTurn, clientID, hash string) bool {
 	c, ok := t.calls[clientID]
 	if !ok {
 		return false
 	}
-	if len(c.body) == 0 {
-		writeErr(w, errf(http.StatusConflict, "turn_call_done", false, "this call was already admitted in this turn; read the day (fuel-op day) and do not write it again"))
+	if c.hash != hash {
+		writeErr(w, errf(http.StatusConflict, "idempotency_conflict", false, "client_id was used for a different request in this turn"))
 		return true
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(c.status)
-	_, _ = w.Write(c.body)
+	s.turnAnswer(ctx, w, t, c.date, c.opIDs, c.itemIDs, c.lines)
 	return true
 }
 
 // admit marks the call of clientID as admitted. Call it right before the
 // journal line of the write.
-func (t *chatTurn) admit(clientID string) {
-	t.calls[clientID] = &turnCall{}
+func (t *chatTurn) admit(clientID, hash string) {
+	t.calls[clientID] = &turnCall{hash: hash}
 	t.cur = clientID
 	t.writes++
 }
@@ -281,6 +255,11 @@ func (s *Service) turnEntry(t *chatTurn) (Entry, *apiError) {
 // turnAnswer renders the answer of a turn-bound write: the result of ITS ops,
 // the items it touched, the snapshot of the date.
 func (s *Service) turnAnswer(ctx context.Context, w http.ResponseWriter, t *chatTurn, date string, opIDs, itemIDs []string, lines []string) {
+	if c := t.calls[t.cur]; c != nil && !c.set {
+		// The first answer of an admitted call: kept for its replay.
+		c.date, c.opIDs, c.itemIDs, c.lines, c.set = date, opIDs, itemIDs, lines, true
+	}
+	t.cur = ""
 	s.renderReady(ctx, date)
 	s.stateMu.RLock()
 	snap, err := s.snapshotFor(date)

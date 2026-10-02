@@ -394,8 +394,9 @@ func (j *Journal) apply(r journalRec) {
 			// correction (undo, fraction, fix, compensation) fails only
 			// itself: it must never cancel the rest of the meal.
 			// A move entry never fails as a whole either: each item moves
-			// (or stays) on its own.
-			if e := j.entries[op.EntryID]; e != nil && op.Kind == "original" && e.Intent != "move" {
+			// (or stays) on its own. The same holds for an entry of the
+			// agent chat (spec 22.6): each write of the turn stands alone.
+			if e := j.entries[op.EntryID]; e != nil && op.Kind == "original" && e.Intent != "move" && e.Chat == "" {
 				e.Failed = true
 			}
 		}
@@ -567,7 +568,7 @@ func (j *Journal) FailedEntries() []Entry {
 	defer j.mu.Unlock()
 	var out []Entry
 	for _, e := range j.entries {
-		if e.Failed || (e.Intent == "move" && j.anyFailedOriginalLocked(e)) {
+		if e.Failed || ((e.Intent == "move" || e.Chat != "") && j.anyFailedOriginalLocked(e)) {
 			out = append(out, *e)
 		}
 	}
@@ -575,7 +576,7 @@ func (j *Journal) FailedEntries() []Entry {
 }
 
 func (j *Journal) anyFailedOriginalLocked(e *Entry) bool {
-	for _, id := range e.ItemIDs {
+	for _, id := range append(append([]string{}, e.ItemIDs...), e.MovedIDs...) {
 		for _, opID := range j.itemOps[id] {
 			if op := j.ops[opID]; op != nil && op.Kind == "original" && op.State == OpFailed {
 				return true

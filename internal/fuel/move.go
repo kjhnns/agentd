@@ -199,7 +199,7 @@ func (s *Service) finishMove(ctx context.Context, w http.ResponseWriter, out *Mo
 	today := s.today()
 	answer := func(date string, lines []FixLine, stand []Item, items []Item, ops []Op, release func()) {
 		if preset != nil && preset.turn != nil {
-			s.turnMove(ctx, w, preset.turn, clientID, date, lines, stand, items, ops, release)
+			s.turnMove(ctx, w, preset.turn, clientID, hash, date, lines, stand, items, ops, release)
 			return
 		}
 		entry := Entry{ID: newID("en_"), ClientID: clientID, Date: date, EatenAt: now, CreatedAt: now,
@@ -217,7 +217,12 @@ func (s *Service) finishMove(ctx context.Context, w http.ResponseWriter, out *Mo
 		}
 		s.finishMoveEntry(ctx, w, entry, append(stand, items...), ops, clientID, hash, now, t0, lat, release)
 	}
-	date, _, refuse := resolveDay(out.Day, nil, now, targets.loc, today, now)
+	ref, refDay := now, today
+	if preset != nil && preset.turn != nil {
+		// A turn-bound move: "yesterday" is the day before the user's message.
+		ref, refDay = preset.turn.at, preset.turn.date
+	}
+	date, _, refuse := resolveDay(out.Day, nil, ref, targets.loc, refDay, ref)
 	if refuse != "" {
 		answer(today, []FixLine{{Text: strings.Replace(strings.Replace(refuse, "log for", "move to", 1), "Nothing was logged.", "Nothing was moved.", 1)}}, nil, nil, nil, func() {})
 		return
@@ -540,7 +545,7 @@ func joinAnd(xs []string) string {
 // turnMove is POST /fuel/move inside a turn (spec 22.5): the new rows and the
 // undo ops belong to the entry of the turn. A request that moves nothing
 // writes nothing.
-func (s *Service) turnMove(ctx context.Context, w http.ResponseWriter, t *chatTurn, clientID, date string, lines []FixLine, stand, items []Item, ops []Op, release func()) {
+func (s *Service) turnMove(ctx context.Context, w http.ResponseWriter, t *chatTurn, clientID, hash, date string, lines []FixLine, stand, items []Item, ops []Op, release func()) {
 	entry, ae := s.turnEntry(t)
 	if ae != nil {
 		release()
@@ -584,7 +589,7 @@ func (s *Service) turnMove(ctx context.Context, w http.ResponseWriter, t *chatTu
 	if entry.Intent == "question" {
 		entry.Intent = "move"
 	}
-	t.admit(clientID)
+	t.admit(clientID, hash)
 	s.stateMu.Lock()
 	err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: append(stand, items...), Ops: ops})
 	s.stateMu.Unlock()
