@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1201,4 +1202,24 @@ type fakeRecalAgent struct{}
 
 func (fakeRecalAgent) Ask(context.Context, string, [][]byte) (string, string, error) {
 	return "", "fake", fmt.Errorf("no job is expected")
+}
+
+// A turn write whose journal fsync fails is uncertain, never "nothing was
+// written": the transaction may be applied and posted after a restart. The
+// answer is "uncertain" and the same client_id is not free for another body.
+func TestChatTurnWriteWithUncertainJournalIsNotRefused(t *testing.T) {
+	h, fa := newChat(t)
+	var code int
+	var ec, text string
+	fa.script = func(msg string) (int, string) {
+		c := capOf(msg)
+		h.svc.journal.syncFn = func(*os.File) error { return errors.New("injected fsync failure") }
+		rec := h.op("POST", "/fuel/items", c, map[string]any{"client_id": opID(), "items": []any{food("skyr", 150, 95, 16, 0.2)}})
+		code, ec, text = rec.Code, errCode(t, rec), rec.Body.String()
+		return 200, end(msg, "I do not know if it was saved.")
+	}
+	h.logText(cid(), "150 g skyr")
+	if code != 500 || ec != "uncertain" || strings.Contains(text, "nothing was written") {
+		t.Fatalf("uncertain journal: %d %q %s", code, ec, text)
+	}
 }

@@ -525,6 +525,10 @@ func (c *client) write(path, turn string, body map[string]any) int {
 	}
 	if code != http.StatusOK {
 		ec, msg := errText(b)
+		if ec == "uncertain" {
+			fmt.Fprintln(c.out, "unknown: fueld could not confirm the save. Write nothing more in this turn and say that you do not know if it was saved.")
+			return 1
+		}
 		fmt.Fprintf(c.out, "refused (%d %s): %s\n", code, ec, msg)
 		return 1
 	}

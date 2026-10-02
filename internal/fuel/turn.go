@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -479,4 +480,23 @@ func (s *Service) handlePreview(w http.ResponseWriter, r *http.Request) {
 		totals[k] = sum(k)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"date": date, "written": false, "items": pis, "sum": totals, "budgets": budgets})
+}
+
+// turnPersistErr answers a failed journal append of a turn-bound write. When
+// the journal's durability is uncertain the transaction may be applied and
+// reconciliation may post it after a restart: the admission is kept and the
+// answer is "uncertain", never "nothing was written". It reports whether the
+// write is known not to exist (the caller then releases the admission).
+func turnPersistErr(w http.ResponseWriter, err error) (notWritten bool) {
+	switch {
+	case errors.Is(err, ErrJournalBroken):
+		writeErr(w, errf(http.StatusInternalServerError, "uncertain", false, "storage problem on the server; the write may or may not be saved. Do not repeat it. Write nothing more in this turn."))
+		return false
+	case errors.Is(err, ErrDeadline):
+		writeErr(w, errf(http.StatusGatewayTimeout, "timeout", true, "took too long; nothing was written, retry"))
+		return true
+	default:
+		writeErr(w, errf(http.StatusInternalServerError, "internal", true, "could not persist the request; nothing was written"))
+		return true
+	}
 }
