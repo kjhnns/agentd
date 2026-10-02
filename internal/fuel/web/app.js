@@ -116,10 +116,29 @@ function stop() {
   state.snapshot = null;
 }
 
+// Sign out: first every delete that waits for Undo gets its final answer,
+// then the session is ended. The login page shows only after the server
+// confirmed it; else the app stays and says so.
+let leaving = false;
 async function logout() {
-  flushDeletes(ctx);
-  await signOut(false);
-  renderLogin('');
+  if (leaving) return;
+  leaving = true;
+  const btn = document.getElementById('logout');
+  if (btn) { btn.disabled = true; btn.textContent = 'Signing out'; }
+  let ok = false;
+  try {
+    await flushDeletes(ctx);
+    ok = !state.session || await signOut(false);
+  } catch (e) {
+    ok = false;
+  }
+  leaving = false;
+  if (ok) {
+    renderLogin('');
+    return;
+  }
+  if (btn) { btn.disabled = false; btn.textContent = 'Sign out'; }
+  ctx.flash('Sign out failed. The session is still open. Try again.');
 }
 
 onUnauthorized(() => {

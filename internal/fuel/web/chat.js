@@ -7,7 +7,7 @@
 // message the user typed.
 
 import { el, clear, sleep, clientId, localTime, num, clock } from './util.js';
-import { call, get } from './api.js';
+import { call, get, sendLog } from './api.js';
 
 const MAX_PHOTOS = 4;
 const LONG_EDGE = 2048;
@@ -146,41 +146,48 @@ export function createChat(ctx) {
     run();
   }
 
+  // One message, one request body, for its whole life. sendLog repeats the
+  // identical request until the server gives a final answer; the page never
+  // makes a second client_id for it and never puts an unconfirmed text back
+  // into the composer (a second send could log it twice).
   async function run() {
     const p = pending;
+    if (!p || p.running) return;
+    p.running = true;
     p.phase = 'sending';
     p.message = '';
     render();
-    for (let attempt = 0; ; attempt++) {
-      try {
-        const r = await call('POST', '/fuel/log', p.req);
-        if (r.status === 202 && r.data && r.data.entry_id) {
-          p.phase = 'waiting';
-          render();
-          await pollEntry(r.data.entry_id);
-        }
-        return done(p);
-      } catch (e) {
-        if (e.status === 401) { // signed out: the text goes back, the login page shows
-          restore(p);
-          return;
-        }
-        if (e.status === 0 && attempt < 2) { // no answer: the identical request once more
-          await sleep(2000);
-          continue;
-        }
-        if (e.status === 400 || e.status === 413 || e.status === 415) {
-          // Refused before any write: the text goes back to the composer.
-          restore(p);
-          note.textContent = e.message;
-          return;
-        }
-        p.phase = 'failed';
-        p.message = e.status === 0 ? 'Could not confirm whether this was saved.' : e.message;
-        render();
-        return;
-      }
+    const r = await sendLog(p.req, (attempt, e) => {
+      if (attempt < 2 && e.status === 0) return; // two quick tries first
+      p.phase = 'failed';
+      p.message = e.status === 0 ? 'Could not confirm whether this was saved. It is sent again with the same id, so it is not logged twice.'
+        : e.message + ' It is sent again with the same id.';
+      render();
+    }, () => new Promise((ok) => { p.kick = ok; }));
+    p.running = false;
+    if (pending !== p) return; // signed out in between
+    if (!r.ok) {
+      // A final refusal (400, 401, 413, 415, ...): nothing was written, the text goes back.
+      restore(p);
+      if (r.error.status !== 401) note.textContent = r.error.message + (p.urls.length ? ' Attach the photos again.' : '');
+      return;
     }
+    if (r.status === 202 && r.data && r.data.entry_id) {
+      p.phase = 'waiting';
+      render();
+      await pollEntry(r.data.entry_id);
+    }
+    await done(p);
+  }
+
+  function retryNow() {
+    const p = pending;
+    if (!p || !p.kick) return;
+    const k = p.kick;
+    p.kick = null;
+    p.phase = 'sending';
+    render();
+    k();
   }
 
   async function pollEntry(id) {
@@ -211,22 +218,6 @@ export function createChat(ctx) {
     if (!ta.value) {
       ta.value = p.text;
       grow();
-    }
-    render();
-  }
-
-  // Discard asks the server first: when the message is in the feed it did
-  // arrive, and the text does NOT go back (a second send would log it twice).
-  async function discard() {
-    const p = pending;
-    if (!p) return;
-    await refresh();
-    if (arrived(p)) {
-      release(p);
-      note.textContent = 'The message did arrive. The answer appears here.';
-    } else {
-      restore(p);
-      if (p.urls.length) note.textContent = 'Attach the photos again.';
     }
     render();
   }
@@ -331,8 +322,7 @@ export function createChat(ctx) {
         feedBox.append(el('div', { class: 'msg fuel failed', id: 'send-failed' },
           el('div', { class: 'reply' }, el('p', null, pending.message),
             el('div', { class: 'acts' },
-              el('button', { class: 'btn', type: 'button', on: { click: () => run() } }, 'Try again'),
-              el('button', { class: 'btn ghost', type: 'button', on: { click: () => discard() } }, 'Discard')))));
+              el('button', { class: 'btn', type: 'button', id: 'retry-send', on: { click: () => retryNow() } }, 'Try again now')))));
       } else if (!answered) {
         feedBox.append(el('div', { class: 'msg fuel thinking', id: 'thinking' },
           el('div', { class: 'reply' }, el('p', null, el('span', { class: 'dots' }, 'Thinking'), ' ',
@@ -346,7 +336,11 @@ export function createChat(ctx) {
     photos.forEach((p) => URL.revokeObjectURL(p.url));
     photos = [];
     items = [];
-    if (pending) release(pending);
+    if (pending) {
+      const k = pending.kick;
+      release(pending);
+      if (k) k(); // the loop ends on the 401 of the closed session
+    }
     seq++;
     renderTray();
     render();

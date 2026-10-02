@@ -542,6 +542,16 @@ func (s *Service) webSessionGet(w http.ResponseWriter, r *http.Request) {
 	id := ws.cookieID(r)
 	sess, ok, renewed := ws.lookup(id)
 	if !ok || r.Header.Get("Authorization") != "" {
+		// A cookie that names no session counts on the brake of the data
+		// routes; a request without a cookie (the page's first load) does not.
+		if id != "" {
+			if engaged, ra := s.fails.note(s.o.Now()); engaged {
+				e := errf(http.StatusTooManyRequests, "rate_limited", true, "too many failed attempts")
+				e.retryAfter = ra
+				writeErr(w, e)
+				return
+			}
+		}
 		writeErr(w, errf(http.StatusUnauthorized, "unauthorized", false, "no session"))
 		return
 	}

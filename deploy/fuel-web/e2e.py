@@ -237,8 +237,29 @@ def run(page, ctx, text, grams, errors, foreign, writes):
     page.emulate_media(color_scheme="light")
     page.set_viewport_size({"width": 1440, "height": 900})
 
-    # sign out
+    # Repeat makes one row with one request (no model call)
     page.click("a[data-nav=day]")
+    page.wait_for_selector("#day-table")
+    page.locator("button[data-repeat]").first.click()
+    until(lambda: page.locator("#day-table tbody tr").count() == rows_before + 1, 30)
+    check("Repeat adds one row with one POST /fuel/relog", page.locator("#day-table tbody tr").count() == rows_before + 1 and len([w for w in writes if w[1] == "/fuel/relog"]) == 1, writes)
+    known = set(page.eval_on_selector_all("#day-table tbody tr", "els => els.map(e => e.dataset.row)"))
+    # Sign out inside the Undo window: the delete gets its answer first, then the session ends
+    newest = page.locator("#day-table tbody tr").first
+    key2 = newest.get_attribute("data-row")
+    newest.locator("button[data-del]").click()
+    page.click("#logout")
+    page.wait_for_selector("form.login")
+    seq = [w for w in writes if w[1] in ("/fuel/undo", "/fuel/session") and w[0] in ("POST", "DELETE")]
+    check("sign-out inside the Undo window sends the delete first", seq[-2:] == [("POST", "/fuel/undo"), ("DELETE", "/fuel/session")], seq)
+    page.fill("#token", TOKEN)
+    page.click("form.login button[type=submit]")
+    page.wait_for_selector("#day-table, #day-empty")
+    check("that row is gone after the next sign-in", key2 in known and page.locator("tr[data-row='%s']" % key2).count() == 0 and page.locator("#day-table tbody tr").count() == rows_before,
+          (key2, page.locator("#day-table tbody tr").count(), rows_before))
+    del errors[:]  # the session probe of the login page is an expected 401 line
+
+    # sign out
     page.click("#logout")
     page.wait_for_selector("form.login")
     r = page.request.get(BASE + "/fuel/day")

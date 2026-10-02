@@ -16,27 +16,40 @@ let editing = null;         // the row key whose amount field is open
 export function dayBusy() { return editing !== null; }
 
 // A delete that still waits for Undo is sent at once when the user leaves
-// the view. Closing or reloading the page sends nothing (the row is back).
+// the view or signs out. The returned promise ends when every such delete
+// has its final answer, so a sign-out can wait for it. Closing or reloading
+// the page sends nothing (the row is back).
 export function flushDeletes(ctx) {
-  for (const key of Array.from(deleting.keys())) commitDelete(ctx, key);
+  return Promise.all(Array.from(deleting.keys()).map((key) => commitDelete(ctx, key)));
 }
 
-async function commitDelete(ctx, key) {
+function stillSaving(ctx, name) {
+  return (attempt) => { if (attempt === 3) ctx.flash('Still saving ' + name + '. The same request is sent again until the server answers.'); };
+}
+
+function commitDelete(ctx, key) {
   const p = deleting.get(key);
-  if (!p || p.sent) return;
+  if (!p) return Promise.resolve();
+  if (!p.done) p.done = sendDelete(ctx, key, p); // one request per delete, however often it is flushed
+  return p.done;
+}
+
+async function sendDelete(ctx, key, p) {
   p.sent = true;
   clearTimeout(p.timer);
   ctx.render();
   try {
-    await write('/fuel/undo', { client_id: p.clientId, row_key: key });
+    // write() returns only with a final answer; the row stays locked until then.
+    await write('/fuel/undo', { client_id: p.clientId, row_key: key }, stillSaving(ctx, p.name));
   } catch (e) {
-    if (e.code !== 'already_undone' && e.status !== 401) ctx.flash('Could not remove ' + p.name + ': ' + e.message);
+    if (e.status === 401) ctx.flash(p.name + ' was not removed: the session ended first.');
+    else if (e.code !== 'already_undone') ctx.flash('Could not remove ' + p.name + ': ' + e.message);
   }
   deleting.delete(key);
   await ctx.refresh();
 }
 
-function startDelete(ctx, item) {
+export function startDelete(ctx, item) {
   if (deleting.has(item.row_key) || busy.has(item.row_key)) return;
   const p = { clientId: clientId(), name: item.item, sent: false };
   p.timer = setTimeout(() => commitDelete(ctx, item.row_key), UNDO_MS);
@@ -52,12 +65,15 @@ function undoDelete(ctx, key) {
   ctx.render();
 }
 
+// act runs one row action. The row is locked until write() has a FINAL
+// answer, so the same action cannot be started a second time while the
+// first one is open.
 async function act(ctx, item, path, body, okText) {
   if (busy.has(item.row_key)) return;
   busy.add(item.row_key);
   ctx.render();
   try {
-    await write(path, body);
+    await write(path, body, stillSaving(ctx, item.item));
     if (okText) ctx.flash(okText);
   } catch (e) {
     if (e.status !== 401) ctx.flash(e.message);

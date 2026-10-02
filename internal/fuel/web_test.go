@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -481,4 +482,30 @@ func TestWebLoginConcurrencyLimit(t *testing.T) {
 		t.Fatalf("after a slot is free: %d", rec.Code)
 	}
 	var _ = http.StatusOK
+}
+
+// The logic tests of the page code (double writes, sign-out). Skipped when
+// node is not installed.
+func TestWebJS(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	out, err := exec.Command(node, "--test", "webtest/writes.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("node --test: %v\n%s", err, out)
+	}
+	if !bytes.Contains(out, []byte("# fail 0")) {
+		t.Fatalf("node --test:\n%s", out)
+	}
+}
+
+// The static allow list holds the app only, never a test file.
+func TestWebEmbedHasNoTests(t *testing.T) {
+	h := webHarness(t)
+	for name := range h.svc.web.files {
+		if strings.Contains(name, "test") {
+			t.Fatalf("embedded: %s", name)
+		}
+	}
 }
