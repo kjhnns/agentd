@@ -275,6 +275,9 @@ func computeCalibration(t *Targets, D string, days []calibDay, stravaFresh bool,
 			}
 		}
 	}
+	if fit {
+		run.MCal, run.Uncertainty = mcal, unc // unrounded; not on the wire
+	}
 	if !g.G5 {
 		if fit && len(xs) >= 3 {
 			res.BlockedBy = append(res.BlockedBy, fmt.Sprintf("The weight trend is too noisy: plus or minus %s kcal; at most %s are allowed.", fmtNum(roundTo(unc, 10)), fmtNum(c.MaxUncertaintyKcal)))
@@ -311,7 +314,6 @@ func computeCalibration(t *Targets, D string, days []calibDay, stravaFresh bool,
 	}
 	cand.ResultID = hex.EncodeToString(h.Sum(nil))[:16]
 	res.State, res.Candidate = "candidate", &cand
-	run.MCal, run.Uncertainty = mcal, unc
 	return run
 }
 
@@ -602,6 +604,11 @@ func (s *Service) runCalibrationLocked(ctx context.Context) (CalibResult, bool) 
 	_, stravaAt := s.strava.Load()
 	run := computeCalibration(t, D, days, !stravaStale(s.o.Now(), stravaAt), refreshed, asOf)
 	run.At = s.o.Now()
+	if ctx.Err() != nil {
+		// The service is stopping (or the request budget ran out): the reads
+		// were cut, so this is no result. Nothing is stored.
+		return run.Result, false
+	}
 	if err := s.calib.putRun(run); err != nil {
 		log.Printf("fuel: calibration: could not store the result: %v", err)
 	}
