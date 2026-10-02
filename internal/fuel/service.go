@@ -1500,6 +1500,9 @@ func (s *Service) recoverMutation(ctx context.Context, clientID, hash, kind, ent
 	if id, ok := s.journal.Ident(clientID); !ok || id.ItemID != itemID {
 		return // the client_id was reused later; that request owns it
 	}
+	if kind == "revise" {
+		kind = "fix" // a re-estimate through POST /fuel/fix: the request kind is "fix"
+	}
 	key := mutationKey(clientID, s.journal)
 	needFeed := !s.feed.HasKey(key)
 	needFinal := s.needsFinal(clientID, at, now)

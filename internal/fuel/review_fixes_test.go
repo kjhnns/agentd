@@ -283,3 +283,46 @@ func TestZeroMacroItemWithLevers(t *testing.T) {
 		t.Errorf("active items of the day: %d, want 1", n)
 	}
 }
+
+// A re-estimate through POST /fuel/fix whose final response was lost (a 202 or
+// a crash) is finished by the background recovery. The identical retry must
+// then replay, not get 409: the request kind is "fix", the op's reason "revise".
+func TestRecoveredReviseReplaysAsFix(t *testing.T) {
+	h := newV7(t, v2(), func(o *Options) { o.RecheckAfter = time.Second })
+	h.clk.Add(time.Minute)
+	rec := h.post("/fuel/items", map[string]any{"client_id": "93000000-0001", "items": []any{
+		map[string]any{"item": "rice", "portion_g": 100, "kcal": 130, "protein_g": 2.7, "carbs_g": 28, "fat_g": 0.3, "sat_fat_g": 0.1, "fiber_g": 0.4}}})
+	if rec.Code != 200 {
+		t.Fatalf("items: %d %s", rec.Code, rec.Body)
+	}
+	id := decode[LogResponse](t, rec).Items[0].ItemID
+	h.clk.Add(time.Second)
+	body := map[string]any{"client_id": "93000000-0002", "item_id": id, "revised": map[string]any{
+		"item": "rice with lentils", "portion_g": 200, "kcal": 290, "protein_g": 12, "carbs_g": 50, "net_carbs_g": nil,
+		"fat_g": 2, "sat_fat_g": 0.3, "fiber_g": 6, "food_class": "mixed_dish"}}
+	if rec = h.post("/fuel/fix", body); rec.Code != 200 {
+		t.Fatalf("revised: %d %s", rec.Code, rec.Body)
+	}
+	rows := len(h.vars.rows("var-food"))
+	// The final response is lost; the recovery writes it again.
+	h.svc.idem.mu.Lock()
+	delete(h.svc.idem.recs, "93000000-0002")
+	h.svc.idem.mu.Unlock()
+	h.svc.materializeFeed(context.Background(), 0)
+	if got, ok := h.svc.idem.Get("93000000-0002"); !ok || got.Kind != "fix" || len(got.Response) == 0 {
+		t.Fatalf("recovered record: ok=%v kind=%q response=%d bytes", ok, got.Kind, len(got.Response))
+	}
+	if rec = h.post("/fuel/fix", body); rec.Code != 200 {
+		t.Fatalf("retry after recovery: %d %s", rec.Code, rec.Body)
+	}
+	// A record stored as "revise" by an older binary replays too.
+	h.svc.idem.mu.Lock()
+	h.svc.idem.recs["93000000-0002"].Kind = "revise"
+	h.svc.idem.mu.Unlock()
+	if rec = h.post("/fuel/fix", body); rec.Code != 200 {
+		t.Fatalf("retry on a stored revise record: %d %s", rec.Code, rec.Body)
+	}
+	if n := len(h.vars.rows("var-food")); n != rows {
+		t.Fatalf("a retry wrote %d new rows", n-rows)
+	}
+}

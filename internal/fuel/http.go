@@ -195,6 +195,9 @@ type idemResult struct {
 func (s *Service) lookupIdem(clientID string) (idemRec, bool) {
 	now := s.o.Now()
 	if rec, ok := s.idem.Get(clientID); ok && now.Sub(rec.At) <= idemRetention {
+		if rec.Kind == "revise" {
+			rec.Kind = "fix" // stored by an older recovery under the op's reason
+		}
 		return rec, true
 	}
 	if id, ok := s.journal.Ident(clientID); ok && now.Sub(id.At) <= idemRetention {
