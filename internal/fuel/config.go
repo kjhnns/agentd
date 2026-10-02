@@ -190,6 +190,10 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 	if c.QuestionBackend != "model" && c.QuestionBackend != "agent" {
 		return c, fmt.Errorf("question_backend %q is not \"model\" or \"agent\"", c.QuestionBackend)
 	}
+	if d, _ := time.ParseDuration(c.QuestionAgentTimeout); d > 135*time.Second {
+		// The app polls for 60 s after the 75 s wait of the request.
+		return c, fmt.Errorf("question_agent_timeout %q is over 135s", c.QuestionAgentTimeout)
+	}
 	if c.QuestionBackend == "agent" && c.RecalibrateAgentdToken == "" {
 		return c, errors.New("question_backend \"agent\" needs recalibrate_agentd_token")
 	}

@@ -271,6 +271,9 @@ func New(o Options) (*Service, error) {
 // the feed append: an entry without its user line, an undo / fraction
 // without its reply line, a failed op without its notice. Idempotent.
 func (s *Service) materializeFeed(ctx context.Context, minAge time.Duration) {
+	// A pending question without a running turn becomes final first (spec
+	// 21): at a start (minAge 0) every one; the agent is never asked again.
+	s.questionSweep(minAge == 0)
 	now := s.o.Now()
 	for _, e := range s.journal.Entries() {
 		if now.Sub(e.CreatedAt) < minAge {
@@ -482,7 +485,6 @@ func (s *Service) Start(ctx context.Context) {
 			_ = s.journal.Append(journalRec{T: "state", OpID: op.ID, State: OpUncertain, At: op.LastTryOr()})
 		}
 	}
-	s.questionSweep() // a question a stop left pending is never asked again
 	s.materializeFeed(lctx, 0)
 	if lctx.Err() != nil {
 		return

@@ -33,11 +33,19 @@ func clipRunes(s string, max int) string {
 // history returns today's last feed turns (user texts, Fuel replies, coach
 // lines), oldest first, bounded in count and size. It is DATA for the model.
 func (s *Service) history(now time.Time, loc *time.Location) []HistoryTurn {
+	return s.historyOf(now, loc, nil)
+}
+
+// historyOf is history without the feed lines skip names.
+func (s *Service) historyOf(now time.Time, loc *time.Location, skip func(FeedItem) bool) []HistoryTurn {
 	page, _ := s.feed.Page(0, 200)
 	today := now.In(loc).Format("2006-01-02")
 	var out []HistoryTurn
 	for _, it := range page {
 		if it.At.In(loc).Format("2006-01-02") != today {
+			continue
+		}
+		if skip != nil && skip(it) {
 			continue
 		}
 		text := ""

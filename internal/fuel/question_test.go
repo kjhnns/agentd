@@ -2,6 +2,7 @@ package fuel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -303,8 +304,14 @@ func TestQuestionAgentErrorFallsBack(t *testing.T) {
 	}
 	// An empty answer and an unreachable daemon fall back too.
 	fa.answer = func(string) (int, string) { return 200, "  \n " }
+	c0, _, _ := fa.counts()
 	if tb := textBlocks(decode[LogResponse](t, h.logText(cid(), "empty?")).Blocks); tb[len(tb)-1] != questionFallbackLine {
 		t.Errorf("empty answer: %+v", tb)
+	}
+	fa.answer = func(string) (int, string) { return 200, "fine" }
+	h.logText(cid(), "after the empty one?")
+	if c, _, _ := fa.counts(); c != c0+1 {
+		t.Errorf("the session of an empty answer was used again (creates %d, before %d)", c, c0)
 	}
 	fa.srv.Close()
 	rec = h.logText(cid(), "anyone there?")
@@ -398,6 +405,41 @@ func TestQuestionAgentRestartWhilePending(t *testing.T) {
 	}
 	if _, _, tried := fa.counts(); tried != 1 || h.vars.posts != 0 {
 		t.Errorf("tried %d posts %d", tried, h.vars.posts)
+	}
+	// The session of the interrupted turn was stopped and is not used again.
+	fa.mu.Lock()
+	ints := fa.interrupt
+	fa.mu.Unlock()
+	h.logText(cid(), "next question?")
+	if c, turns, _ := fa.counts(); ints < 1 || c != 2 || turns != 2 {
+		t.Errorf("interrupts %d creates %d turns %d", ints, c, turns)
+	}
+}
+
+// A turn that ended without a journaled answer (a storage failure) does
+// not stay pending: the next recovery pass makes it a fallback.
+func TestQuestionAgentSweepOrphan(t *testing.T) {
+	h, fa := newQ(t)
+	r := decode[LogResponse](t, h.logText(cid(), "orphan?"))
+	e, _ := h.svc.journal.Entry(r.EntryID)
+	e.ID, e.ClientID, e.Agent, e.AgentText = "en_orphan", "c0ffee00-0001", agentPending, ""
+	if err := h.svc.journal.Append(journalRec{T: "txn", Entry: &e}); err != nil {
+		t.Fatal(err)
+	}
+	h.svc.materializeFeed(context.Background(), 0*time.Second+time.Nanosecond) // not a start: too young
+	if cur, _ := h.svc.journal.Entry("en_orphan"); cur.Agent != agentPending {
+		t.Fatal("a young pending entry was swept")
+	}
+	h.clk.Add(10 * time.Minute)
+	h.svc.materializeFeed(context.Background(), time.Nanosecond)
+	if cur, _ := h.svc.journal.Entry("en_orphan"); cur.Agent != agentFallback {
+		t.Fatalf("the orphan stayed %q", cur.Agent)
+	}
+	if rec := h.get("/fuel/entry/en_orphan"); rec.Code != 200 {
+		t.Errorf("entry: %d", rec.Code)
+	}
+	if _, turns, _ := fa.counts(); turns != 1 {
+		t.Errorf("the sweep asked the agent (%d turns)", turns)
 	}
 }
 
@@ -554,7 +596,7 @@ func TestQuestionConfig(t *testing.T) {
 	if err != nil || c.QuestionBackend != "agent" || c.QuestionAgentTimeout != "90s" || c.QuestionAgentModel != "claude-opus-5-5" {
 		t.Errorf("agent: %+v %v", c, err)
 	}
-	for _, bad := range []string{"question_backend = \"codex\"\n", "question_agent_timeout = \"0s\"\n", "question_agent_timeout = \"soon\"\n"} {
+	for _, bad := range []string{"question_backend = \"codex\"\n", "question_agent_timeout = \"0s\"\n", "question_agent_timeout = \"soon\"\n", "question_agent_timeout = \"10m\"\n"} {
 		if _, err := ParseDaemonConfig([]byte(base + bad)); err == nil {
 			t.Errorf("%q was accepted", bad)
 		}

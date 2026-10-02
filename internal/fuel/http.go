@@ -819,7 +819,7 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 		// A question for the agent (spec 21): the entry is journaled as
 		// pending with the model text as its fallback, then the agent is asked.
 		entry.Agent = agentPending
-		questionTask = s.questionTask(foodText, preSnap, s.dayItems(date), mi.History, now, targets.loc)
+		questionTask = s.questionTask(foodText, preSnap, s.dayItems(date), s.questionHistory(now, targets.loc), now, targets.loc)
 	}
 	if err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: items, Ops: ops}); err != nil {
 		switch {

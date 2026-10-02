@@ -163,20 +163,11 @@ func (s *Service) questionTask(text string, snap Snapshot, items []DayItem, hist
 			"run_adjust_kcal": snap.Energy.RunAdjustKcal, "deficit_kcal": snap.Energy.DeficitKcal},
 		"levers": levers,
 	}
-	// A clinical turn never reaches the agent: the reply with the fixed line
-	// goes, and so does the user turn it answered.
+	// history is questionHistory: the lines of clinical entries are not in
+	// it. The word check is a second net.
 	var hist []HistoryTurn
 	for _, h := range history {
-		if strings.Contains(h.Text, clinicalLine) {
-			for i := len(hist) - 1; i >= 0; i-- {
-				if hist[i].Role == "user" {
-					hist = append(hist[:i], hist[i+1:]...)
-					break
-				}
-			}
-			continue
-		}
-		if clinicalWords(h.Text) {
+		if clinicalWords(h.Text) || strings.Contains(h.Text, clinicalLine) {
 			continue
 		}
 		hist = append(hist, h)
@@ -199,6 +190,18 @@ func (s *Service) questionTask(text string, snap Snapshot, items []DayItem, hist
 		"\nTARGETS SUMMARY: " + j(summary) +
 		"\nCHAT TODAY (oldest first; what he wrote, what the app answered): " + j(hist) +
 		"\nJOE'S MESSAGE (between the markers):\n<<<\n" + text + "\n>>>"
+}
+
+// questionHistory is today's chat without every line (user and reply) of an
+// entry the chat guard handled (spec 18.4), so no clinical turn is sent.
+func (s *Service) questionHistory(now time.Time, loc *time.Location) []HistoryTurn {
+	return s.historyOf(now, loc, func(it FeedItem) bool {
+		if it.EntryID == nil {
+			return false
+		}
+		e, ok := s.journal.Entry(*it.EntryID)
+		return ok && e.Clinical
+	})
 }
 
 // cleanAnswer makes the agent's text fit a text block: trimmed, no em-dash,
@@ -240,7 +243,15 @@ type questionState struct {
 	mu   sync.Mutex
 	sess questionSession
 	read bool
+	live map[string]bool // entry ids whose agent turn runs in this process
 }
+
+// errEmptyAnswer is an agent turn that ended without text.
+var errEmptyAnswer = errors.New("empty answer")
+
+// questionRequestCap bounds POST /fuel/log for a question, the classifier
+// step included: iOS build 7 gives the request 120 s.
+const questionRequestCap = 100 * time.Second
 
 func (s *Service) qSessionPath() string { return filepath.Join(s.o.StateDir, questionSessionFile) }
 
@@ -294,20 +305,41 @@ func (s *Service) questionAsk(ctx context.Context, date, task string) (string, e
 		}
 		answer, err := ag.Turn(ctx, id, task)
 		if err == nil {
-			return answer, nil
+			if answer = cleanAnswer(answer); answer != "" {
+				return answer, nil
+			}
+			s.qSetSession(date, "") // a session that answers nothing is not used again
+			return "", errEmptyAnswer
 		}
 		s.qSetSession(date, "")
 		if errors.Is(err, errAgentSessionGone) && attempt == 0 {
 			id = ""
 			continue
 		}
-		if ctx.Err() != nil {
+		if !errors.Is(err, errAgentSessionGone) {
 			// The turn may still run in the daemon: stop it (not a DELETE).
-			ictx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			ag.Interrupt(ictx, id)
-			cancel()
+			s.qInterrupt(ctx, id)
 		}
 		return "", err
+	}
+}
+
+func (s *Service) qInterrupt(ctx context.Context, id string) {
+	ictx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	s.o.Question.Agent.Interrupt(ictx, id)
+}
+
+func (s *Service) qLive(id string, on bool) {
+	s.q.mu.Lock()
+	defer s.q.mu.Unlock()
+	if s.q.live == nil {
+		s.q.live = map[string]bool{}
+	}
+	if on {
+		s.q.live[id] = true
+	} else {
+		delete(s.q.live, id)
 	}
 }
 
@@ -328,21 +360,22 @@ func (s *Service) questionStart(e Entry, task string, lat map[string]int, t0 tim
 	for k, v := range lat {
 		l[k] = v
 	}
+	s.qLive(e.ID, true)
 	s.writers.Add(1)
 	go func() {
 		defer s.writers.Done()
 		defer close(done)
+		defer s.qLive(e.ID, false)
 		ctx, cancel := context.WithTimeout(base, s.o.Question.Timeout)
 		tA := time.Now()
 		answer, err := s.questionAsk(ctx, s.o.Now().In(s.locOr()).Format("2006-01-02"), task)
 		cancel()
-		answer = cleanAnswer(answer)
 		outcome := "ok"
 		switch {
+		case errors.Is(err, errEmptyAnswer):
+			outcome = "empty answer"
 		case err != nil:
 			outcome = errClass(err)
-		case answer == "":
-			outcome = "empty answer"
 		}
 		// Never the question, the task or the answer in a log line.
 		log.Printf("fuel: question %s agent=%s agent_ms=%d", e.ID, outcome, ms(time.Since(tA)))
@@ -388,17 +421,50 @@ func (s *Service) questionFinish(e Entry, lat map[string]int) {
 	s.persistFinal(idemRec{ClientID: e.ClientID, Hash: e.ReqHash, Kind: "log", At: e.CreatedAt, EntryID: e.ID}, resp)
 }
 
-// questionSweep ends the question entries a stop left pending: the agent is
-// NOT asked again (a question turn runs at most once); the model text and
-// the fallback line are the answer. Called at start, before the recovery.
-func (s *Service) questionSweep() {
+// questionSweep ends the pending question entries that have no running
+// turn: at a start every one (a stop interrupted them), later the ones whose
+// turn ended without a journaled answer. The agent is NOT asked again (a
+// question turn runs at most once); the model text and the fallback line are
+// the answer. The recovery (materializeFeed) then makes the feed lines and
+// the stored response.
+func (s *Service) questionSweep(startup bool) {
+	now := s.o.Now()
+	swept := false
 	for _, e := range s.journal.Entries() {
 		if e.Agent != agentPending {
 			continue
 		}
+		if !startup {
+			s.q.mu.Lock()
+			live := s.q.live[e.ID]
+			s.q.mu.Unlock()
+			if live || now.Sub(e.CreatedAt) < 2*s.o.LogBudget {
+				continue // its request or its turn still runs
+			}
+		}
 		e.Agent = agentFallback
 		if err := s.journal.Append(journalRec{T: "txn", Entry: &e}); err != nil {
 			log.Printf("fuel: question %s: could not end the pending state (%s)", e.ID, errClass(err))
+			continue
+		}
+		swept = true
+	}
+	if startup && swept && s.o.Question.Agent != nil {
+		// The interrupted turn may still run in the daemon: its session is
+		// stopped and never used again (a late answer would land on the
+		// next question).
+		s.q.mu.Lock()
+		if !s.q.read {
+			s.q.read = true
+			if b, err := os.ReadFile(s.qSessionPath()); err == nil {
+				_ = json.Unmarshal(b, &s.q.sess)
+			}
+		}
+		old := s.q.sess
+		s.q.mu.Unlock()
+		if old.ID != "" {
+			s.qInterrupt(context.Background(), old.ID)
+			s.qSetSession(old.Date, "")
 		}
 	}
 }
@@ -430,20 +496,25 @@ func questionBlocks(e Entry) []Block {
 func (s *Service) finishQuestion(w http.ResponseWriter, e Entry, task string, lat map[string]int, t0 time.Time, release func()) {
 	done := s.questionStart(e, task, lat, t0)
 	release()
-	wait := time.NewTimer(s.o.Question.SyncWait)
-	defer wait.Stop()
-	select {
-	case <-done:
-	case <-wait.C:
+	d := s.o.Question.SyncWait
+	if rest := questionRequestCap - time.Since(t0); rest < d {
+		d = rest // the classifier step was slow: the request still ends in time
 	}
-	if cur, ok := s.journal.Entry(e.ID); ok && cur.Agent != agentPending {
-		// Final: the stored response when the finish stored one (a replay
-		// answers the same bytes).
-		if rec, ok := s.idem.Get(e.ClientID); ok && len(rec.Response) > 0 {
-			writeStored(w, rec)
-			return
+	if d > 0 {
+		wait := time.NewTimer(d)
+		defer wait.Stop()
+		select {
+		case <-done:
+		case <-wait.C:
 		}
 	}
+	if rec, ok := s.idem.Get(e.ClientID); ok && len(rec.Response) > 0 {
+		writeStored(w, rec) // final and stored: a replay answers the same bytes
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.o.Budget)
+	defer cancel()
+	ready := s.renderReady(ctx, e.Date)
 	resp, status := s.buildLogResponse(e)
 	if resp.renderErr != nil {
 		writeErr(w, errf(http.StatusServiceUnavailable, "targets_invalid", false, "targets invalid; the request itself was saved, retry to see it"))
@@ -451,10 +522,20 @@ func (s *Service) finishQuestion(w http.ResponseWriter, e Entry, task string, la
 	}
 	lat["total"] = ms(time.Since(t0))
 	resp.LatencyMs = lat
-	code := http.StatusOK
-	if status == StatusPending {
-		code = http.StatusAccepted
-	}
 	s.logLine("log", e.ID, 0, resp.LatencyMs, status)
-	writeJSON(w, code, resp)
+	if status == StatusPending {
+		writeJSON(w, http.StatusAccepted, resp)
+		return
+	}
+	if ready {
+		// Final but not stored yet (the finish is between its journal line
+		// and its stored response): ONE stored response wins, and it is the
+		// one that is sent.
+		rec := idemRec{ClientID: e.ClientID, Hash: e.ReqHash, Kind: "log", At: e.CreatedAt, EntryID: e.ID, Status: http.StatusOK}
+		if stored, ok := s.storeFinalOnce(rec, resp); ok {
+			writeStored(w, stored)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
