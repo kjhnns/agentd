@@ -1688,6 +1688,9 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		}
 		if o == nil && turn != nil {
 			// Already counted at that amount: nothing to write in the turn.
+			// The call is kept (not as a write), so a repeat of its client_id
+			// replays this answer and another body is a conflict.
+			turn.note(body.ClientID, hash)
 			l.Unlock()
 			s.turnAnswer(ctx, w, turn, it.Date, nil, []string{it.ID}, []string{describeFix(it, nil)})
 			return

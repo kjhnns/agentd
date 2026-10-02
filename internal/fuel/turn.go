@@ -196,6 +196,13 @@ func (t *chatTurn) admit(clientID, hash string) {
 	t.writes++
 }
 
+// note keeps a call that wrote nothing (a fix to the amount the item already
+// has): its client_id replays, and it does not count as a write of the turn.
+func (t *chatTurn) note(clientID, hash string) {
+	t.calls[clientID] = &turnCall{hash: hash}
+	t.cur = clientID
+}
+
 // unadmit takes an admission back when the journal line failed (nothing was
 // written, the call may come again).
 func (t *chatTurn) unadmit(clientID string) {

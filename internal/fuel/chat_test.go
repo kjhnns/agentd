@@ -1172,6 +1172,28 @@ func TestChatAddedCountsOnce(t *testing.T) {
 	if !strings.Contains(string(added), `"kcal":130`) {
 		t.Errorf("added: %s", added)
 	}
+	// Next turn: a fix to the amount the item already has writes nothing. Its
+	// client_id is kept: a repeat replays, another request with it is a conflict.
+	id := r.Items[0].ItemID
+	h.clk.Add(time.Minute)
+	fa.script = func(msg string) (int, string) {
+		c, noop := capOf(msg), opID()
+		n1 := h.op("POST", "/fuel/fix", c, map[string]any{"client_id": noop, "item_id": id, "share": 0.5})
+		n2 := h.op("POST", "/fuel/fix", c, map[string]any{"client_id": noop, "item_id": id, "share": 0.5})
+		if n1.Code != 200 || decode[turnWriteResponse](t, n1).Result != "nothing" || n2.Code != 200 || decode[turnWriteResponse](t, n2).Result != "nothing" {
+			t.Errorf("a no-op fix and its repeat: %d %s / %d %s", n1.Code, n1.Body, n2.Code, n2.Body)
+		}
+		other := h.op("POST", "/fuel/fix", c, map[string]any{"client_id": noop, "item_id": id, "portion_g": 300})
+		if other.Code != 409 || errCode(t, other) != "idempotency_conflict" {
+			t.Errorf("the client_id of a no-op with another body: %d %s", other.Code, other.Body)
+		}
+		return 200, end(msg, "The rice is at half already.")
+	}
+	rows := len(h.vars.rows("var-food"))
+	r2 := decode[LogResponse](t, h.logText(cid(), "the rice was half"))
+	if len(h.vars.rows("var-food")) != rows || r2.Intent != "question" {
+		t.Errorf("a no-op turn wrote: rows %d -> %d, intent %s", rows, len(h.vars.rows("var-food")), r2.Intent)
+	}
 }
 
 // fakeRecalAgent fails the test's expectation when a job runs: none is made.
