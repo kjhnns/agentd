@@ -851,6 +851,11 @@ func (s *Service) handleRecordVoid(w http.ResponseWriter, r *http.Request) {
 		RecordDate: e.rec.date, ClientID: body.ClientID, RequestHash: hash, State: OpPending, At: now}
 	op.Payload = map[string]any{"type": e.rec.Type, "voids": body.RecordID, "source": "fuel", "op_id": op.OpID, "record_id": op.RecordID,
 		"measured_at": e.rec.MeasuredAt, "voided_at": now.Format(time.RFC3339)}
+	if e.rec.Type == recWaist {
+		// The Body composition variable has a schema that requires `method`
+		// (and measured_at) on every row, a void row included.
+		op.Payload["method"] = "tape"
+	}
 	if err := s.records.put(op); err != nil {
 		writeErr(w, errf(http.StatusInternalServerError, "internal", true, "could not persist the request; nothing was written"))
 		return

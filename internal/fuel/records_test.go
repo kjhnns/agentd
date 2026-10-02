@@ -129,6 +129,14 @@ func TestT9RecordsRoundTrip(t *testing.T) {
 	if l := decode[recList](t, h.get("/fuel/records?type=waist&from=2026-09-01&to=2026-09-30")); len(l.Records) != 1 || string(l.Clinician) != "null" {
 		t.Errorf("waist list by date: %+v", l)
 	}
+	// A waist record can be voided: the void row carries `method` too (the
+	// Body composition schema requires it on every row).
+	if rec := h.post("/fuel/record/void", map[string]any{"client_id": cid(), "record_id": r.Record.RecordID}); rec.Code != 200 {
+		t.Fatalf("void of a waist record: %d %s", rec.Code, rec.Body)
+	}
+	if w := h.snap(t, "").Progress.Waist; num(w.LatestCm) != "84" || w.PreviousCm != nil {
+		t.Errorf("waist after the void: %+v", w)
+	}
 
 	// Void: hidden at once, for every date filter.
 	rec := h.post("/fuel/record/void", map[string]any{"client_id": cid(), "record_id": id})

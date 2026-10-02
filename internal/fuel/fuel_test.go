@@ -106,6 +106,18 @@ func (f *fakeVars) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `data is missing required key "kcal"`, 400)
 			return
 		}
+		// The schema of the production Body composition variable: every row
+		// needs method and measured_at.
+		if body.VariableID == "var-body" || body.VariableID == "var-body2" {
+			if _, ok := data["method"].(string); !ok {
+				http.Error(w, `data is missing required key "method"`, 400)
+				return
+			}
+			if _, ok := data["measured_at"].(string); !ok {
+				http.Error(w, `data is missing required key "measured_at"`, 400)
+				return
+			}
+		}
 		f.mu.Lock()
 		f.posts++
 		if f.postsTo == nil {
