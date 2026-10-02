@@ -1,0 +1,160 @@
+{
+ "as_of": "2026-10-01T10:25:00Z",
+ "body_fat": {
+  "latest_date": "2026-09-30",
+  "latest_pct": 17.5,
+  "points": [
+   {
+    "date": "2026-09-30",
+    "pct": 17.5
+   }
+  ]
+ },
+ "data_as_of": "2026-10-01T10:25:00Z",
+ "date": "2026-09-30",
+ "day_score": {
+  "hit": 2,
+  "of": 5
+ },
+ "day_type": "rest",
+ "intake": [
+  {
+   "consumed": 0,
+   "key": "fluids_ml",
+   "kind": "floor",
+   "label": "Fluids",
+   "pace_target_now": 2500,
+   "status": "behind",
+   "target": 2500,
+   "unit": "ml",
+   "unknown_rows": 0
+  },
+  {
+   "consumed": 0,
+   "key": "caffeine_mg",
+   "kind": "cap",
+   "label": "Caffeine",
+   "pace_target_now": null,
+   "status": "on_pace",
+   "target": 400,
+   "unit": "mg",
+   "unknown_rows": 0
+  },
+  {
+   "consumed": 0,
+   "key": "alcohol_g",
+   "kind": "cap",
+   "label": "Alcohol today",
+   "pace_target_now": null,
+   "status": "on_pace",
+   "target": null,
+   "unit": "g",
+   "unknown_rows": 0
+  },
+  {
+   "consumed": 0,
+   "key": "alcohol_g_week",
+   "kind": "cap",
+   "label": "Alcohol this week",
+   "pace_target_now": null,
+   "status": "on_pace",
+   "target": 30,
+   "unit": "g",
+   "unknown_rows": 0
+  }
+ ],
+ "macros": [
+  {
+   "consumed": 60.1,
+   "key": "protein_g",
+   "kind": "floor",
+   "label": "Protein",
+   "pace_target_now": 160,
+   "status": "behind",
+   "target": 160,
+   "unit": "g",
+   "unknown_rows": 0
+  },
+  {
+   "consumed": 5.1,
+   "key": "sat_fat_g",
+   "kind": "cap",
+   "label": "Sat fat",
+   "pace_target_now": null,
+   "status": "on_pace",
+   "target": 20,
+   "unit": "g",
+   "unknown_rows": 0
+  },
+  {
+   "consumed": 18,
+   "key": "fiber_g",
+   "kind": "floor",
+   "label": "Fibre",
+   "pace_target_now": 35,
+   "status": "behind",
+   "target": 35,
+   "unit": "g",
+   "unknown_rows": 0
+  },
+  {
+   "consumed": 873.5,
+   "key": "kcal",
+   "kind": "pace",
+   "label": "Energy",
+   "pace_target_now": 2600,
+   "status": "behind",
+   "target": 2600,
+   "unit": "kcal",
+   "unknown_rows": 0
+  },
+  {
+   "consumed": 66.1,
+   "key": "net_carbs_g",
+   "kind": "pace",
+   "label": "Net carbs",
+   "pace_target_now": 120,
+   "status": "behind",
+   "target": 120,
+   "unit": "g",
+   "unknown_rows": 0
+  }
+ ],
+ "missing": [],
+ "next_action": null,
+ "revision": 2,
+ "streaks": {
+  "fiber_g": 0,
+  "protein_g": 0,
+  "sat_fat_g": 1
+ },
+ "week": {
+  "run_km": 0,
+  "runs": 0,
+  "strava_as_of": "2026-10-01T08:00:00Z",
+  "strength_sessions": 0,
+  "strength_target": 3
+ },
+ "weight": {
+  "avg7_kg": 80.07,
+  "delta7_kg": null,
+  "points": [
+   {
+    "date": "2026-09-27",
+    "kg": 80
+   },
+   {
+    "date": "2026-09-28",
+    "kg": 79.9
+   },
+   {
+    "date": "2026-09-29",
+    "kg": 80.3
+   },
+   {
+    "date": "2026-09-30",
+    "kg": 80.1
+   }
+  ]
+ }
+}

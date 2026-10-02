@@ -1,0 +1,298 @@
+{
+ "date": "2026-10-01",
+ "items": [
+  {
+   "actions": [
+    "delete",
+    "repeat",
+    "fix"
+   ],
+   "alcohol_g": null,
+   "caffeine_mg": null,
+   "eaten_at": "2026-10-01T10:20:00Z",
+   "item": "skyr",
+   "kind": "food",
+   "macros": {
+    "alcohol_g": null,
+    "caffeine_mg": null,
+    "carbs_g": 5,
+    "fat_g": 0.3,
+    "fiber_g": 0,
+    "kcal": 78.8,
+    "net_carbs_g": 5,
+    "protein_g": 13.8,
+    "sat_fat_g": 0.2,
+    "volume_ml": null
+   },
+   "photo_id": null,
+   "photo_ids": [],
+   "portion_g": 125,
+   "recent_key": "d22ca58a73a7c24b",
+   "row_key": "it#10",
+   "source": "fuel",
+   "volume_ml": null
+  },
+  {
+   "actions": [
+    "delete",
+    "repeat",
+    "fix"
+   ],
+   "alcohol_g": null,
+   "caffeine_mg": null,
+   "eaten_at": "2026-10-01T10:10:00Z",
+   "item": "water",
+   "kind": "drink",
+   "macros": {
+    "alcohol_g": null,
+    "caffeine_mg": null,
+    "carbs_g": 0,
+    "fat_g": 0,
+    "fiber_g": null,
+    "kcal": 0,
+    "net_carbs_g": 0,
+    "protein_g": 0,
+    "sat_fat_g": 0,
+    "volume_ml": 250
+   },
+   "photo_id": null,
+   "photo_ids": [],
+   "portion_g": null,
+   "recent_key": "91fb47b162394fa2",
+   "row_key": "it#12",
+   "source": "fuel",
+   "volume_ml": 250
+  },
+  {
+   "actions": [
+    "delete",
+    "repeat",
+    "fix"
+   ],
+   "alcohol_g": null,
+   "caffeine_mg": null,
+   "eaten_at": "2026-10-01T10:05:00Z",
+   "item": "walnuts",
+   "kind": "food",
+   "macros": {
+    "alcohol_g": null,
+    "caffeine_mg": null,
+    "carbs_g": 5,
+    "fat_g": 1,
+    "fiber_g": null,
+    "kcal": 98,
+    "net_carbs_g": 5,
+    "protein_g": 2.3,
+    "sat_fat_g": 0.5,
+    "volume_ml": null
+   },
+   "photo_id": null,
+   "photo_ids": [],
+   "portion_g": 15,
+   "recent_key": "2da81c1895fcd574",
+   "row_key": "it#7",
+   "source": "fuel",
+   "volume_ml": null
+  },
+  {
+   "actions": [
+    "delete",
+    "repeat",
+    "fix"
+   ],
+   "alcohol_g": null,
+   "caffeine_mg": 80,
+   "eaten_at": "2026-10-01T06:30:00Z",
+   "item": "coffee",
+   "kind": "drink",
+   "macros": {
+    "alcohol_g": null,
+    "caffeine_mg": 80,
+    "carbs_g": 0,
+    "fat_g": 0,
+    "fiber_g": null,
+    "kcal": 4,
+    "net_carbs_g": null,
+    "protein_g": 0,
+    "sat_fat_g": 0,
+    "volume_ml": 200
+   },
+   "photo_id": null,
+   "photo_ids": [],
+   "portion_g": null,
+   "recent_key": "bb314ce2f00c0bdd",
+   "row_key": "v:val#13",
+   "source": "agentd",
+   "volume_ml": 200
+  }
+ ],
+ "snapshot": {
+  "as_of": "2026-10-01T10:25:00Z",
+  "body_fat": {
+   "latest_date": "2026-09-30",
+   "latest_pct": 17.5,
+   "points": [
+    {
+     "date": "2026-09-30",
+     "pct": 17.5
+    }
+   ]
+  },
+  "data_as_of": "2026-10-01T10:25:00Z",
+  "date": "2026-10-01",
+  "day_score": {
+   "hit": 1,
+   "of": 4
+  },
+  "day_type": "training",
+  "intake": [
+   {
+    "consumed": 450,
+    "key": "fluids_ml",
+    "kind": "floor",
+    "label": "Fluids",
+    "pace_target_now": 1203.7,
+    "status": "behind",
+    "target": 3000,
+    "unit": "ml",
+    "unknown_rows": 0
+   },
+   {
+    "consumed": 80,
+    "key": "caffeine_mg",
+    "kind": "cap",
+    "label": "Caffeine",
+    "pace_target_now": null,
+    "status": "on_pace",
+    "target": 400,
+    "unit": "mg",
+    "unknown_rows": 0
+   },
+   {
+    "consumed": 0,
+    "key": "alcohol_g",
+    "kind": "cap",
+    "label": "Alcohol today",
+    "pace_target_now": null,
+    "status": "on_pace",
+    "target": null,
+    "unit": "g",
+    "unknown_rows": 0
+   },
+   {
+    "consumed": 0,
+    "key": "alcohol_g_week",
+    "kind": "cap",
+    "label": "Alcohol this week",
+    "pace_target_now": null,
+    "status": "on_pace",
+    "target": 30,
+    "unit": "g",
+    "unknown_rows": 0
+   }
+  ],
+  "macros": [
+   {
+    "consumed": 16.1,
+    "key": "protein_g",
+    "kind": "floor",
+    "label": "Protein",
+    "pace_target_now": 64.2,
+    "status": "behind",
+    "target": 160,
+    "unit": "g",
+    "unknown_rows": 0
+   },
+   {
+    "consumed": 0.7,
+    "key": "sat_fat_g",
+    "kind": "cap",
+    "label": "Sat fat",
+    "pace_target_now": null,
+    "status": "on_pace",
+    "target": 20,
+    "unit": "g",
+    "unknown_rows": 0
+   },
+   {
+    "consumed": 0,
+    "key": "fiber_g",
+    "kind": "floor",
+    "label": "Fibre",
+    "pace_target_now": 14,
+    "status": "behind",
+    "target": 35,
+    "unit": "g",
+    "unknown_rows": 3
+   },
+   {
+    "consumed": 180.8,
+    "key": "kcal",
+    "kind": "pace",
+    "label": "Energy",
+    "pace_target_now": 1203.7,
+    "status": "behind",
+    "target": 3000,
+    "unit": "kcal",
+    "unknown_rows": 0
+   },
+   {
+    "consumed": 10,
+    "key": "net_carbs_g",
+    "kind": "pace",
+    "label": "Net carbs",
+    "pace_target_now": null,
+    "status": "on_pace",
+    "target": null,
+    "unit": "g",
+    "unknown_rows": 1
+   }
+  ],
+  "missing": [],
+  "next_action": {
+   "by": "13:00",
+   "grams": 16,
+   "key": "fiber_g",
+   "text": "Eat 16 g fibre by 13:00"
+  },
+  "revision": 4,
+  "streaks": {
+   "fiber_g": 0,
+   "protein_g": 0,
+   "sat_fat_g": 2
+  },
+  "week": {
+   "run_km": 10,
+   "runs": 1,
+   "strava_as_of": "2026-10-01T08:00:00Z",
+   "strength_sessions": 1,
+   "strength_target": 3
+  },
+  "weight": {
+   "avg7_kg": 80.14,
+   "delta7_kg": null,
+   "points": [
+    {
+     "date": "2026-09-27",
+     "kg": 80
+    },
+    {
+     "date": "2026-09-28",
+     "kg": 79.9
+    },
+    {
+     "date": "2026-09-29",
+     "kg": 80.3
+    },
+    {
+     "date": "2026-09-30",
+     "kg": 80.1
+    },
+    {
+     "date": "2026-10-01",
+     "kg": 80.4
+    }
+   ]
+  }
+ }
+}

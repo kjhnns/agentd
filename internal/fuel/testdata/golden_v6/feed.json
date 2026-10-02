@@ -1,0 +1,726 @@
+{
+ "items": [
+  {
+   "at": "2026-10-01T10:00:00Z",
+   "blocks": [],
+   "entry_id": "en#1",
+   "id": "f1",
+   "items": [],
+   "photo_ids": [],
+   "role": "user",
+   "text": "250 g skyr and 30 g walnuts"
+  },
+  {
+   "at": "2026-10-01T10:00:00Z",
+   "blocks": [
+    {
+     "text": "Logged for Wed 30 Sep: skyr and walnuts. Wed 30 Sep: Protein 60.1 of 160 g, protein is the gap.",
+     "type": "text"
+    },
+    {
+     "text": "Good protein with sources.",
+     "type": "text"
+    },
+    {
+     "as_of": "2026-10-01T10:00:00Z",
+     "data": {
+      "added": {
+       "fiber_g": 2,
+       "kcal": 353.5,
+       "net_carbs_g": 12.1,
+       "protein_g": 32.1,
+       "sat_fat_g": 2.1
+      },
+      "macros": [
+       {
+        "consumed": 60.1,
+        "key": "protein_g",
+        "kind": "floor",
+        "label": "Protein",
+        "pace_target_now": 160,
+        "status": "behind",
+        "target": 160,
+        "unit": "g",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 5.1,
+        "key": "sat_fat_g",
+        "kind": "cap",
+        "label": "Sat fat",
+        "pace_target_now": null,
+        "status": "on_pace",
+        "target": 20,
+        "unit": "g",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 18,
+        "key": "fiber_g",
+        "kind": "floor",
+        "label": "Fibre",
+        "pace_target_now": 35,
+        "status": "behind",
+        "target": 35,
+        "unit": "g",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 873.5,
+        "key": "kcal",
+        "kind": "pace",
+        "label": "Energy",
+        "pace_target_now": 2600,
+        "status": "behind",
+        "target": 2600,
+        "unit": "kcal",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 66.1,
+        "key": "net_carbs_g",
+        "kind": "pace",
+        "label": "Net carbs",
+        "pace_target_now": 120,
+        "status": "behind",
+        "target": 120,
+        "unit": "g",
+        "unknown_rows": 0
+       }
+      ]
+     },
+     "date": "2026-09-30",
+     "revision": 2,
+     "type": "widget",
+     "widget": "macros_today"
+    }
+   ],
+   "entry_id": "en#1",
+   "id": "f2",
+   "items": [
+    {
+     "actions": [
+      "undo"
+     ],
+     "alcohol_g": null,
+     "caffeine_mg": null,
+     "carbs_g": 10,
+     "effective": {
+      "alcohol_g": null,
+      "caffeine_mg": null,
+      "carbs_g": 10,
+      "fat_g": 0.5,
+      "fiber_g": 0,
+      "kcal": 157.5,
+      "net_carbs_g": 10,
+      "protein_g": 27.5,
+      "sat_fat_g": 0.3,
+      "volume_ml": null
+     },
+     "fat_g": 0.5,
+     "fiber_g": 0,
+     "fraction": null,
+     "item": "skyr",
+     "item_id": "it#2",
+     "kcal": 157.5,
+     "kind": "food",
+     "needs_fraction": false,
+     "net_carbs_g": 10,
+     "portion_basis": "stated",
+     "portion_g": 250,
+     "protein_g": 27.5,
+     "sat_fat_g": 0.3,
+     "undone": false,
+     "value_id": "val#3",
+     "volume_ml": null
+    },
+    {
+     "actions": [
+      "undo"
+     ],
+     "alcohol_g": null,
+     "caffeine_mg": null,
+     "carbs_g": 4.1,
+     "effective": {
+      "alcohol_g": null,
+      "caffeine_mg": null,
+      "carbs_g": 4.1,
+      "fat_g": 19.6,
+      "fiber_g": 2,
+      "kcal": 196,
+      "net_carbs_g": 2.1,
+      "protein_g": 4.6,
+      "sat_fat_g": 1.8,
+      "volume_ml": null
+     },
+     "fat_g": 19.6,
+     "fiber_g": 2,
+     "fraction": null,
+     "item": "walnuts",
+     "item_id": "it#4",
+     "kcal": 196,
+     "kind": "food",
+     "needs_fraction": false,
+     "net_carbs_g": 2.1,
+     "portion_basis": "stated",
+     "portion_g": 30,
+     "protein_g": 4.6,
+     "sat_fat_g": 1.8,
+     "undone": false,
+     "value_id": "val#5",
+     "volume_ml": null
+    }
+   ],
+   "photo_ids": [],
+   "role": "fuel",
+   "text": null
+  },
+  {
+   "at": "2026-10-01T10:05:00Z",
+   "blocks": [],
+   "entry_id": "en#6",
+   "id": "f3",
+   "items": [],
+   "photo_ids": [],
+   "role": "user",
+   "text": "30 g walnuts"
+  },
+  {
+   "at": "2026-10-01T10:05:00Z",
+   "blocks": [
+    {
+     "text": "Protein 4.6 of 160 g, fibre is the gap.",
+     "type": "text"
+    },
+    {
+     "as_of": "2026-10-01T10:05:00Z",
+     "data": {
+      "added": {
+       "fiber_g": null,
+       "kcal": 196,
+       "net_carbs_g": 10,
+       "protein_g": 4.6,
+       "sat_fat_g": 1
+      },
+      "macros": [
+       {
+        "consumed": 4.6,
+        "key": "protein_g",
+        "kind": "floor",
+        "label": "Protein",
+        "pace_target_now": 60.2,
+        "status": "behind",
+        "target": 160,
+        "unit": "g",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 1,
+        "key": "sat_fat_g",
+        "kind": "cap",
+        "label": "Sat fat",
+        "pace_target_now": null,
+        "status": "on_pace",
+        "target": 20,
+        "unit": "g",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 0,
+        "key": "fiber_g",
+        "kind": "floor",
+        "label": "Fibre",
+        "pace_target_now": 13.2,
+        "status": "behind",
+        "target": 35,
+        "unit": "g",
+        "unknown_rows": 2
+       },
+       {
+        "consumed": 200,
+        "key": "kcal",
+        "kind": "pace",
+        "label": "Energy",
+        "pace_target_now": 1129.6,
+        "status": "behind",
+        "target": 3000,
+        "unit": "kcal",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 10,
+        "key": "net_carbs_g",
+        "kind": "pace",
+        "label": "Net carbs",
+        "pace_target_now": null,
+        "status": "on_pace",
+        "target": null,
+        "unit": "g",
+        "unknown_rows": 1
+       }
+      ]
+     },
+     "date": "2026-10-01",
+     "revision": 1,
+     "type": "widget",
+     "widget": "macros_today"
+    }
+   ],
+   "entry_id": "en#6",
+   "id": "f4",
+   "items": [
+    {
+     "actions": [
+      "undo"
+     ],
+     "alcohol_g": null,
+     "caffeine_mg": null,
+     "carbs_g": 10,
+     "effective": {
+      "alcohol_g": null,
+      "caffeine_mg": null,
+      "carbs_g": 5,
+      "fat_g": 1,
+      "fiber_g": null,
+      "kcal": 98,
+      "net_carbs_g": 5,
+      "protein_g": 2.3,
+      "sat_fat_g": 0.5,
+      "volume_ml": null
+     },
+     "fat_g": 2,
+     "fiber_g": null,
+     "fraction": null,
+     "item": "walnuts",
+     "item_id": "it#7",
+     "kcal": 196,
+     "kind": "food",
+     "needs_fraction": false,
+     "net_carbs_g": 10,
+     "portion_basis": "stated",
+     "portion_g": 30,
+     "protein_g": 4.6,
+     "sat_fat_g": 1,
+     "undone": false,
+     "value_id": "val#8",
+     "volume_ml": null
+    }
+   ],
+   "photo_ids": [],
+   "role": "fuel",
+   "text": null
+  },
+  {
+   "at": "2026-10-01T10:10:00Z",
+   "blocks": [],
+   "entry_id": "en#14",
+   "id": "f5",
+   "items": [],
+   "photo_ids": [],
+   "role": "user",
+   "text": "a glass of water"
+  },
+  {
+   "at": "2026-10-01T10:10:00Z",
+   "blocks": [
+    {
+     "text": "Protein 4.6 of 160 g, fibre is the gap.",
+     "type": "text"
+    },
+    {
+     "as_of": "2026-10-01T10:10:00Z",
+     "data": {
+      "added": {
+       "fiber_g": null,
+       "kcal": 0,
+       "net_carbs_g": 0,
+       "protein_g": 0,
+       "sat_fat_g": 0
+      },
+      "macros": [
+       {
+        "consumed": 4.6,
+        "key": "protein_g",
+        "kind": "floor",
+        "label": "Protein",
+        "pace_target_now": 61.2,
+        "status": "behind",
+        "target": 160,
+        "unit": "g",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 1,
+        "key": "sat_fat_g",
+        "kind": "cap",
+        "label": "Sat fat",
+        "pace_target_now": null,
+        "status": "on_pace",
+        "target": 20,
+        "unit": "g",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 0,
+        "key": "fiber_g",
+        "kind": "floor",
+        "label": "Fibre",
+        "pace_target_now": 13.4,
+        "status": "behind",
+        "target": 35,
+        "unit": "g",
+        "unknown_rows": 3
+       },
+       {
+        "consumed": 200,
+        "key": "kcal",
+        "kind": "pace",
+        "label": "Energy",
+        "pace_target_now": 1148.1,
+        "status": "behind",
+        "target": 3000,
+        "unit": "kcal",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 10,
+        "key": "net_carbs_g",
+        "kind": "pace",
+        "label": "Net carbs",
+        "pace_target_now": null,
+        "status": "on_pace",
+        "target": null,
+        "unit": "g",
+        "unknown_rows": 1
+       }
+      ]
+     },
+     "date": "2026-10-01",
+     "revision": 2,
+     "type": "widget",
+     "widget": "macros_today"
+    },
+    {
+     "as_of": "2026-10-01T10:10:00Z",
+     "data": [
+      {
+       "consumed": 450,
+       "key": "fluids_ml",
+       "kind": "floor",
+       "label": "Fluids",
+       "pace_target_now": 1148.1,
+       "status": "behind",
+       "target": 3000,
+       "unit": "ml",
+       "unknown_rows": 0
+      },
+      {
+       "consumed": 80,
+       "key": "caffeine_mg",
+       "kind": "cap",
+       "label": "Caffeine",
+       "pace_target_now": null,
+       "status": "on_pace",
+       "target": 400,
+       "unit": "mg",
+       "unknown_rows": 0
+      },
+      {
+       "consumed": 0,
+       "key": "alcohol_g",
+       "kind": "cap",
+       "label": "Alcohol today",
+       "pace_target_now": null,
+       "status": "on_pace",
+       "target": null,
+       "unit": "g",
+       "unknown_rows": 0
+      },
+      {
+       "consumed": 0,
+       "key": "alcohol_g_week",
+       "kind": "cap",
+       "label": "Alcohol this week",
+       "pace_target_now": null,
+       "status": "on_pace",
+       "target": 30,
+       "unit": "g",
+       "unknown_rows": 0
+      }
+     ],
+     "date": "2026-10-01",
+     "revision": 2,
+     "type": "widget",
+     "widget": "fluids"
+    }
+   ],
+   "entry_id": "en#14",
+   "id": "f6",
+   "items": [
+    {
+     "actions": [
+      "undo"
+     ],
+     "alcohol_g": null,
+     "caffeine_mg": null,
+     "carbs_g": 0,
+     "effective": {
+      "alcohol_g": null,
+      "caffeine_mg": null,
+      "carbs_g": 0,
+      "fat_g": 0,
+      "fiber_g": null,
+      "kcal": 0,
+      "net_carbs_g": 0,
+      "protein_g": 0,
+      "sat_fat_g": 0,
+      "volume_ml": 250
+     },
+     "fat_g": 0,
+     "fiber_g": null,
+     "fraction": null,
+     "item": "water",
+     "item_id": "it#12",
+     "kcal": 0,
+     "kind": "drink",
+     "needs_fraction": false,
+     "net_carbs_g": 0,
+     "portion_basis": "stated",
+     "portion_g": null,
+     "protein_g": 0,
+     "sat_fat_g": 0,
+     "undone": false,
+     "value_id": "val#15",
+     "volume_ml": 250
+    }
+   ],
+   "photo_ids": [],
+   "role": "fuel",
+   "text": null
+  },
+  {
+   "at": "2026-10-01T10:15:00Z",
+   "blocks": [
+    {
+     "text": "Corrected walnuts to 15 g. Protein 2.3 of 160 g, fibre is the gap.",
+     "type": "text"
+    },
+    {
+     "as_of": "2026-10-01T10:15:00Z",
+     "data": {
+      "added": {
+       "fiber_g": null,
+       "kcal": -98,
+       "net_carbs_g": -5,
+       "protein_g": -2.3,
+       "sat_fat_g": -0.5
+      },
+      "macros": [
+       {
+        "consumed": 2.3,
+        "key": "protein_g",
+        "kind": "floor",
+        "label": "Protein",
+        "pace_target_now": 62.2,
+        "status": "behind",
+        "target": 160,
+        "unit": "g",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 0.5,
+        "key": "sat_fat_g",
+        "kind": "cap",
+        "label": "Sat fat",
+        "pace_target_now": null,
+        "status": "on_pace",
+        "target": 20,
+        "unit": "g",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 0,
+        "key": "fiber_g",
+        "kind": "floor",
+        "label": "Fibre",
+        "pace_target_now": 13.6,
+        "status": "behind",
+        "target": 35,
+        "unit": "g",
+        "unknown_rows": 3
+       },
+       {
+        "consumed": 102,
+        "key": "kcal",
+        "kind": "pace",
+        "label": "Energy",
+        "pace_target_now": 1166.7,
+        "status": "behind",
+        "target": 3000,
+        "unit": "kcal",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 5,
+        "key": "net_carbs_g",
+        "kind": "pace",
+        "label": "Net carbs",
+        "pace_target_now": null,
+        "status": "on_pace",
+        "target": null,
+        "unit": "g",
+        "unknown_rows": 1
+       }
+      ]
+     },
+     "date": "2026-10-01",
+     "revision": 3,
+     "type": "widget",
+     "widget": "macros_today"
+    }
+   ],
+   "entry_id": "en#6",
+   "id": "f7",
+   "items": [],
+   "photo_ids": [],
+   "role": "fuel",
+   "text": "Corrected walnuts to 15 g. Protein 2.3 of 160 g, fibre is the gap."
+  },
+  {
+   "at": "2026-10-01T10:20:00Z",
+   "blocks": [],
+   "entry_id": "en#9",
+   "id": "f8",
+   "items": [],
+   "photo_ids": [],
+   "role": "user",
+   "text": "again: skyr"
+  },
+  {
+   "at": "2026-10-01T10:20:00Z",
+   "blocks": [
+    {
+     "text": "Protein 16.1 of 160 g, fibre is the gap.",
+     "type": "text"
+    },
+    {
+     "as_of": "2026-10-01T10:20:00Z",
+     "data": {
+      "added": {
+       "fiber_g": 0,
+       "kcal": 78.8,
+       "net_carbs_g": 5,
+       "protein_g": 13.8,
+       "sat_fat_g": 0.2
+      },
+      "macros": [
+       {
+        "consumed": 16.1,
+        "key": "protein_g",
+        "kind": "floor",
+        "label": "Protein",
+        "pace_target_now": 63.2,
+        "status": "behind",
+        "target": 160,
+        "unit": "g",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 0.7,
+        "key": "sat_fat_g",
+        "kind": "cap",
+        "label": "Sat fat",
+        "pace_target_now": null,
+        "status": "on_pace",
+        "target": 20,
+        "unit": "g",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 0,
+        "key": "fiber_g",
+        "kind": "floor",
+        "label": "Fibre",
+        "pace_target_now": 13.8,
+        "status": "behind",
+        "target": 35,
+        "unit": "g",
+        "unknown_rows": 3
+       },
+       {
+        "consumed": 180.8,
+        "key": "kcal",
+        "kind": "pace",
+        "label": "Energy",
+        "pace_target_now": 1185.2,
+        "status": "behind",
+        "target": 3000,
+        "unit": "kcal",
+        "unknown_rows": 0
+       },
+       {
+        "consumed": 10,
+        "key": "net_carbs_g",
+        "kind": "pace",
+        "label": "Net carbs",
+        "pace_target_now": null,
+        "status": "on_pace",
+        "target": null,
+        "unit": "g",
+        "unknown_rows": 1
+       }
+      ]
+     },
+     "date": "2026-10-01",
+     "revision": 4,
+     "type": "widget",
+     "widget": "macros_today"
+    }
+   ],
+   "entry_id": "en#9",
+   "id": "f9",
+   "items": [
+    {
+     "actions": [
+      "undo"
+     ],
+     "alcohol_g": null,
+     "caffeine_mg": null,
+     "carbs_g": 5,
+     "effective": {
+      "alcohol_g": null,
+      "caffeine_mg": null,
+      "carbs_g": 5,
+      "fat_g": 0.3,
+      "fiber_g": 0,
+      "kcal": 78.8,
+      "net_carbs_g": 5,
+      "protein_g": 13.8,
+      "sat_fat_g": 0.2,
+      "volume_ml": null
+     },
+     "fat_g": 0.3,
+     "fiber_g": 0,
+     "fraction": null,
+     "item": "skyr",
+     "item_id": "it#10",
+     "kcal": 78.8,
+     "kind": "food",
+     "needs_fraction": false,
+     "net_carbs_g": 5,
+     "portion_basis": "repeat",
+     "portion_g": 125,
+     "protein_g": 13.8,
+     "sat_fat_g": 0.2,
+     "undone": false,
+     "value_id": "val#11",
+     "volume_ml": null
+    }
+   ],
+   "photo_ids": [],
+   "role": "fuel",
+   "text": null
+  }
+ ],
+ "next_before": null
+}
