@@ -1164,3 +1164,49 @@ Why: Joe, 2026-10-02: every chat turn of the Fuel app (text and photos: log, cor
 Tests.
 - T24 (a fake agentd, the fake model counts calls and must stay at zero): a text turn goes to the agent with the workspace, the model and a title with no colon, the message holds the capability, the mark and the day state and no token; a fuel-op style POST /fuel/items with the capability and the agent token adds the items to the turn's entry (one entry, one user line, one reply line, intent "log", the agent's text as the only text block, `added` in the widget, no entry of its own); a photo turn uploads each photo through the media route with no capability and names every path in the message, and makes no recalibration job; fix, undo, move and relog in a turn bind to the entry; the agent token is refused on every route outside 22.5 and on a write with no capability; a capability of a closed turn, an unknown one and one with the other prefix are 409 and write nothing; a write that arrives after the close, after a timeout and after a restart is refused; a repeat of a `client_id` in the turn writes nothing more, another body is 409; the same item name twice in a turn is refused; `likely_duplicate` and `new` (the duplicate eggs case ends with one eggs item and one butter item; "another two eggs" adds one); a second fix and a second move of an item in a turn are refused; "for yesterday" (`day`) writes on the day before the message; each failure class of 22.7 gives the clear text, no second turn, a new session for the next turn; a failure after a write keeps the rows and names them; a 404 repeats once, also with photos; a turn longer than the wait is 202 with the user line in the feed, then done through GET /fuel/entry; a repeat of the client_id never starts a turn; a restart while pending gives "failed" with the message in the feed and the rows kept; a full queue is 503 and stores nothing; the off file and the default backend use the estimator; the clinical words are not sent; POST /fuel/preview writes nothing; no log line holds the text, the answer, the capability or a token; the buttons work with the agent down.
 - T25 (22.12): no reply of either path and no button reply has a status sentence or a saturated fat line in any budget state, while the snapshot keeps the state; the v6 golden documents are contained in the replies after their status text is removed; a moka coffee is stored as "unfiltered".
+
+## 23. Web app: browser sessions and the static page (2026-10-02, Joe: "do web")
+
+Release 1 of the Fuel web app. Plan: ~/clawd/wiki/pages/fuel-web-plan-2026-10.md (sections 2.2, 2.3). Code: internal/fuel/web.go, internal/fuel/web/ (embedded), tests internal/fuel/web_test.go, browser test deploy/fuel-web/e2e.py. Nothing in sections 1 to 22 changes shape. The bearer path of the phone is unchanged.
+
+### 23.1 Config
+
+- `web_enabled` (bool, default false). False: the routes of 23.2 and 23.3 answer 404 `not_found` (with or without a token), a cookie is ignored, and no header of 23.5 is sent.
+- `public_origin` (string, required with `web_enabled`): the ONE origin the page runs on, as `scheme://host[:port]` with no path ("https://fuel.gojoe.run"). It must be https.
+- `web_insecure_test_cookie` (bool, default false): for a test instance on plain http only. The cookie is then named `fuel_session_test` and has no `Secure` attribute. fueld refuses to start with this key when `public_origin` is https or when `test_mode` is false.
+- A binary older than this section refuses the three keys (unknown key = no start): remove them before a binary rollback.
+
+### 23.2 Static page
+
+`GET /fuel/web` answers 308 to `/fuel/web/`. `GET /fuel/web/` is the shell (index.html). `GET /fuel/web/{name}` serves a file of the embedded app. The name is looked up in a fixed list built from the embed at startup; a request path is never joined to a file path. Unknown name: 404. Methods other than GET and HEAD: 405. No token and no session are needed; the files hold no data and no secret. `Cache-Control: no-cache` with an `ETag` (304 on `If-None-Match`). These routes do not wait for readiness.
+
+### 23.3 Session routes
+
+They do not wait for readiness or a valid targets file.
+
+- `POST /fuel/session`, body `{"token": "<the app token>"}`. Checks in this order, all before the body is parsed: `Origin` equal to `public_origin` (else 400 `wrong_origin`); `Content-Type: application/json` (else 415); at most 4 sign-in requests in flight (else 503 with Retry-After); body at most 4 KB (413); read deadline 5 s; strict JSON with the one key `token` (else 400 `bad_input`). Wrong token: 401; from the 6th failure in a minute 429 `rate_limited` with Retry-After. A correct token is always accepted. Only the app token signs in, never the agent token. Success: 204 and `Set-Cookie: __Host-fuel_session=<id>; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict`.
+- `GET /fuel/session`: 200 `{"csrf": string, "expires_at": RFC3339, "test_mode": bool}` (plus `"food_log_var"` when test_mode is true) for a live cookie; else 401.
+- `DELETE /fuel/session`: ends this session and clears the cookie, 204. `?all=1` ends every session. With a live cookie it needs the write rule of 23.4 (else 403 `csrf`); without one it only clears the cookie.
+
+Session store: `<state_dir>/web-sessions.json` (0600) holds per session the SHA-256 of the id, created_at, last_seen, expires_at and a user agent label; never the id. `<state_dir>/web.key` (0600, 32 random bytes) is the HMAC key. Lifetime: 30 days sliding, at most 90 days after created_at. A request that finds last_seen older than 1 hour moves expires_at and sends the cookie again. At most 5 sessions; a sixth sign-in drops the oldest. Sessions survive a restart. A changed app token drops all of them at the next start.
+
+### 23.4 Authentication of the data routes
+
+A request with an `Authorization` header is judged by the bearer alone (a wrong bearer plus a live cookie is 401). A request without that header and with a live session cookie counts as the app token. Rules for such a cookie request, else 403 `csrf`:
+
+- any method: a `Sec-Fetch-Site` header, when present, is `same-origin` or `none` (a page of a sibling host under gojoe.run is the same site and must not read with the cookie);
+- a method other than GET and HEAD: `Origin` equals `public_origin`, and `X-Fuel-CSRF` equals the `csrf` value of the session (HMAC-SHA256 of the session id, constant-time compare).
+
+An unknown or expired cookie is 401 and counts on the brake of section 3. fueld sends no CORS header on any route.
+
+### 23.5 Headers on every answer while web_enabled is true
+
+`Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; manifest-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`, `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Cross-Origin-Resource-Policy: same-origin`, `Cross-Origin-Opener-Policy: same-origin`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`, and `Strict-Transport-Security: max-age=31536000` when `public_origin` is https.
+
+### 23.6 The page (release 1)
+
+Login, Day (budgets, the item table with amount edit through POST /fuel/fix, delete with a 4 s Undo through POST /fuel/undo, Repeat through POST /fuel/relog, the last 35 days), Chat (POST /fuel/log as JSON or multipart with up to 4 photos, GET /fuel/feed, GET /fuel/entry after a 202), Week (GET /fuel/week), Dashboard (GET /fuel/snapshot with the info links of 18.8). The page stores no health data and no token in the browser. Text from the server reaches the page as text nodes only.
+
+Double writes: every user action makes one `client_id` and one request body. A retry (no answer, 503, 504, a retryable 502, a 202, a stale CSRF token) sends the identical body, so sections 6 and 15 answer the first result. One chat message is in flight at a time. A delete that waits for Undo is sent once, when the 4 s end or when the view changes; a page reload inside the 4 s sends nothing.
+
+Not in release 1: Trends, Records, export, the review of second opinions, PWA, offline, voice, reload recovery of an unanswered photo send (plan 17.7).
