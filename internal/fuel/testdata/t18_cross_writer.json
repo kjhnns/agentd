@@ -1,0 +1,29 @@
+{
+ "about": "T18 of the Fuel contract (18.11): one staples fixture, read by scripts/food-log (clawd) and by fueld (agentd, internal/fuel/testdata). The two copies of this file must be equal.",
+ "date": "2026-10-01",
+ "staples": [
+  {"key": "bread", "aliases": ["bread"], "default_g": 100, "carbs_basis": "available",
+   "per_100g": {"kcal": 250, "protein_g": 8, "carbs_g": 60, "fat_g": 2, "sat_fat_g": 0.5, "fiber_g": 10}},
+  {"key": "walnuts", "aliases": ["walnuts"], "default_g": 30,
+   "per_100g": {"kcal": 654, "protein_g": 15.2, "carbs_g": 13.7, "fat_g": 65.2, "sat_fat_g": 6.1, "fiber_g": 6.7, "nuts_g": 100, "plant_protein_g": 15.2}}
+ ],
+ "foods": [
+  {"item": "bread", "portion_g": 100},
+  {"item": "walnuts", "portion_g": 30}
+ ],
+ "rows": [
+  {"item": "bread", "kcal": 250.0, "protein_g": 8.0, "carbs_g": 70.0, "fat_g": 2.0, "sat_fat_g": 0.5, "fiber_g": 10.0, "net_carbs_g": 60.0,
+   "portion_g": 100.0, "portion_basis": "label", "food_keys": ["bread"], "kind": "food"},
+  {"item": "walnuts", "kcal": 196.2, "protein_g": 4.6, "carbs_g": 4.1, "fat_g": 19.6, "sat_fat_g": 1.8, "fiber_g": 2.0, "net_carbs_g": 2.1,
+   "portion_g": 30.0, "portion_basis": "label", "food_keys": ["walnuts"], "kind": "food", "nuts_g": 30.0, "plant_protein_g": 4.6}
+ ],
+ "fix": {"row": 1, "portion_g": 15,
+  "correction": {"item": "correction: walnuts", "source": "agentd", "reason": "fix", "kind": "food", "share_after": 0.5,
+   "kcal": -98.1, "protein_g": -2.3, "carbs_g": -2.1, "net_carbs_g": -1.1, "fat_g": -9.8, "sat_fat_g": -0.9, "fiber_g": -1.0,
+   "nuts_g": -15.0, "plant_protein_g": -2.3, "portion_g_after": 15.0}},
+ "expect_after_fix": {
+  "sums": {"kcal": 348.1, "protein_g": 10.3, "carbs_g": 72.0, "net_carbs_g": 61.0, "fat_g": 11.8, "sat_fat_g": 1.4, "fiber_g": 11.0},
+  "walnuts": {"portion_g": 15.0, "nuts_g": 15.0, "plant_protein_g": 2.3, "kcal": 98.1},
+  "day_levers": {"nuts_g": {"consumed": 15.0, "untagged_rows": 1}, "plant_protein_g": {"consumed": 2.3, "untagged_rows": 1}}
+ }
+}

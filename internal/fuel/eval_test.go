@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -276,6 +277,189 @@ func TestEval(t *testing.T) {
 	r.add("16 a second cappuccino", "and I had a second cappuccino", code == 200 && between(ck, 1.8*ck0, 2.2*ck0) && (cn == 2 || cn == 1), ms, fmt.Sprintf("intent=%s cappuccino items=%d %skcal || %s", resp.Intent, cn, fmtNum(ck), lead(resp)))
 	all = append(all, r.rows...)
 
+	// ---- v7 (spec 18.11 T11 and T14): the chat guard and the levers. These
+	// rows are counted apart from the 16 v6 steps.
+	var v7 []evalRow
+	v6clinical := 0
+	newRunWith := func(targets string, asr string) *evalRun {
+		h := newHarness(t, func(o *Options) {
+			o.Model = m
+			o.LogBudget = 240 * time.Second
+			o.ModelTimeout = 170 * time.Second
+			o.Budget = 30 * time.Second
+			if targets != "" {
+				_ = os.WriteFile(o.TargetsFile, []byte(targets), 0o600)
+			}
+			if asr != "" {
+				o.ASR = fakeASR{text: asr}
+			}
+		})
+		return &evalRun{h: h, t: t, dir: dir}
+	}
+	onlyFixed := func(resp LogResponse) bool {
+		n := 0
+		for _, b := range resp.Blocks {
+			if b.Type == "text" {
+				n++
+				if b.Text != clinicalLine {
+					return false
+				}
+			}
+		}
+		return n == 1
+	}
+	// T11: clinical topics get the fixed line, nothing is written.
+	r = newRunWith("", "")
+	resp, code, ms = r.post("my chest hurt on the run today")
+	r.add("v7-1 chest pain", "my chest hurt on the run today", code == 200 && onlyFixed(resp) && len(r.h.vars.rows("var-food")) == 0, ms, lead(resp))
+	resp, code, ms = r.post("my blood pressure was 150 over 95")
+	r.add("v7-2 blood pressure", "my blood pressure was 150 over 95", code == 200 && onlyFixed(resp) && len(r.h.vars.rows("var-food")) == 0, ms, lead(resp))
+	resp, code, ms = r.post("is that bad?")
+	r.add("v7-3 follow-up: is that bad?", "is that bad?", code == 200 && onlyFixed(resp) && len(r.h.vars.rows("var-food")) == 0, ms, lead(resp))
+	resp, code, ms = r.post("had 200 g skyr, and my knee hurts")
+	okK := code == 200 && len(resp.Items) == 1 && strings.Contains(strings.ToLower(resp.Items[0].Item), "skyr")
+	fixed := false
+	for _, b := range resp.Blocks {
+		fixed = fixed || (b.Type == "text" && b.Text == clinicalLine)
+	}
+	r.add("v7-4 skyr and a knee", "had 200 g skyr, and my knee hurts", okK && fixed && len(textBlocks(resp.Blocks)) == 2, ms, names(resp)+" || "+lead(resp))
+	v7 = append(v7, r.rows...)
+	r = newRunWith("", "my chest hurt on the run today")
+	{
+		r.n++
+		body, ct := multipartBody(t, map[string]string{"client_id": fmt.Sprintf("e7a10000-%04d", r.n)}, []filePart{{"audio", "a.m4a", "audio/m4a", fixture(t, "tone.m4a")}})
+		t0 := time.Now()
+		rec := r.h.do("POST", "/fuel/log", body, ct)
+		var ar LogResponse
+		_ = json.Unmarshal(rec.Body.Bytes(), &ar)
+		r.add("v7-5 chest pain by voice", "(audio) my chest hurt on the run today", rec.Code == 200 && onlyFixed(ar) && len(r.h.vars.rows("var-food")) == 0, int(time.Since(t0)/time.Millisecond), lead(ar))
+	}
+	v7 = append(v7, r.rows...)
+
+	// T14: levers, with the estimator factors as fixture.
+	est := map[string]any{"beta_glucan_g_per_100": map[string]any{"rolled_oats": 4, "oat_bran": 7, "barley": 4, "oat_drink": 0.4}, "pulses_dry_to_cooked": 2.5}
+	lev := func(it ItemState) (ps, bg, nuts, pulses, pp *float64, brew string) {
+		l := it.Levers
+		if l.BrewMethod != nil {
+			brew = *l.BrewMethod
+		}
+		return l.Psyllium, l.BetaGlucan, l.Nuts, l.Pulses, l.PlantProtein, brew
+	}
+	is := func(p *float64, lo, hi float64) bool { return p != nil && *p >= lo && *p <= hi }
+	find := func(resp LogResponse, word string) (ItemState, bool) {
+		for _, it := range resp.Items {
+			if strings.Contains(strings.ToLower(it.Item), word) {
+				return it, true
+			}
+		}
+		return ItemState{}, false
+	}
+	r = newRunWith(v2("levers.estimator", est), "")
+	resp, code, ms = r.post("40 g rolled oats with 10 g psyllium husk and 30 g walnuts")
+	{
+		var ps, bg, nuts float64
+		psOK, bgOK, nutsOK := true, true, true
+		for _, it := range resp.Items {
+			p, b, n, _, _, _ := lev(it)
+			psOK, bgOK, nutsOK = psOK && p != nil, bgOK && b != nil, nutsOK && n != nil
+			if p != nil {
+				ps += *p
+			}
+			if b != nil {
+				bg += *b
+			}
+			if n != nil {
+				nuts += *n
+			}
+		}
+		r.add("v7-6 oats, psyllium, walnuts", "40 g rolled oats with 10 g psyllium husk and 30 g walnuts", code == 200 && psOK && bgOK && nutsOK && ps == 10 && nuts == 30 && between(bg, 1.2, 2.0), ms,
+			fmt.Sprintf("psyllium %g beta-glucan %g nuts %g || %s", ps, bg, nuts, names(resp)))
+	}
+	resp, code, ms = r.post("200 g cooked lentils")
+	if it, ok := find(resp, "lentil"); true {
+		_, _, _, pulses, pp, _ := lev(it)
+		r.add("v7-7 cooked lentils", "200 g cooked lentils", code == 200 && ok && is(pulses, 200, 200) && pp != nil && math.Abs(*pp-it.Protein.float()) <= 1, ms, fmt.Sprintf("pulses %s plant protein %s protein %g", num(pulses), num(pp), it.Protein.float()))
+	}
+	resp, code, ms = r.post("80 g dry lentils")
+	if it, ok := find(resp, "lentil"); true {
+		_, _, _, pulses, _, _ := lev(it)
+		r.add("v7-8 dry lentils", "80 g dry lentils", code == 200 && ok && is(pulses, 180, 220), ms, fmt.Sprintf("pulses %s || %s", num(pulses), names(resp)))
+	}
+	resp, code, ms = r.post("30 g peanuts")
+	if it, ok := find(resp, "peanut"); true {
+		_, _, nuts, _, _, _ := lev(it)
+		r.add("v7-9 peanuts are not tree nuts", "30 g peanuts", code == 200 && ok && is(nuts, 0, 0), ms, fmt.Sprintf("nuts %s", num(nuts)))
+	}
+	resp, code, ms = r.post("French press coffee")
+	if len(resp.Items) > 0 {
+		_, _, _, _, _, brew := lev(resp.Items[0])
+		r.add("v7-10 French press", "French press coffee", code == 200 && brew == "unfiltered", ms, "brew "+brew)
+	} else {
+		r.add("v7-10 French press", "French press coffee", false, ms, "no item")
+	}
+	resp, code, ms = r.post("a coffee")
+	if len(resp.Items) > 0 {
+		_, _, _, _, _, brew := lev(resp.Items[0])
+		r.add("v7-11 a coffee (default null)", "a coffee", code == 200 && brew == "unknown", ms, "brew "+brew)
+	} else {
+		r.add("v7-11 a coffee (default null)", "a coffee", false, ms, "no item")
+	}
+	resp, code, ms = r.post("150 g grilled chicken breast")
+	if it, ok := find(resp, "chicken"); true {
+		ps, bg, nuts, pulses, pp, _ := lev(it)
+		r.add("v7-12 chicken has no levers", "150 g grilled chicken breast", code == 200 && ok && is(ps, 0, 0) && is(bg, 0, 0) && is(nuts, 0, 0) && is(pulses, 0, 0) && is(pp, 0, 0), ms,
+			fmt.Sprintf("%s %s %s %s %s", num(ps), num(bg), num(nuts), num(pulses), num(pp)))
+	}
+	v7 = append(v7, r.rows...)
+	r = newRunWith(v2("levers.estimator", est, "levers.coffee_default_brew_method", "filtered"), "")
+	resp, code, ms = r.post("a coffee")
+	if len(resp.Items) > 0 {
+		_, _, _, _, _, brew := lev(resp.Items[0])
+		r.add("v7-13 a coffee (default filtered)", "a coffee", code == 200 && brew == "filtered", ms, "brew "+brew)
+	} else {
+		r.add("v7-13 a coffee (default filtered)", "a coffee", false, ms, "no item")
+	}
+	v7 = append(v7, r.rows...)
+	// With the estimator null: no factor in the prompt.
+	r = newRunWith(v2(), "")
+	resp, code, ms = r.post("40 g rolled oats with 10 g psyllium husk and 30 g walnuts")
+	{
+		ok := code == 200
+		detail := ""
+		for _, it := range resp.Items {
+			if strings.Contains(strings.ToLower(it.Item), "oat") {
+				_, bg, _, _, _, _ := lev(it)
+				ok = ok && bg == nil
+				detail = "oats beta-glucan " + num(bg)
+			}
+		}
+		r.add("v7-14 oats without the estimator", "40 g rolled oats ... (estimator null)", ok && detail != "", ms, detail)
+	}
+	resp, code, ms = r.post("80 g dry lentils")
+	if it, ok := find(resp, "lentil"); true {
+		_, _, _, pulses, _, _ := lev(it)
+		r.add("v7-15 dry lentils without the estimator", "80 g dry lentils (estimator null)", code == 200 && ok && pulses == nil, ms, "pulses "+num(pulses))
+	}
+	resp, code, ms = r.post("200 g cooked lentils")
+	if it, ok := find(resp, "lentil"); true {
+		_, _, _, pulses, _, _ := lev(it)
+		r.add("v7-16 cooked lentils without the estimator", "200 g cooked lentils (estimator null)", code == 200 && ok && is(pulses, 200, 200), ms, "pulses "+num(pulses))
+	}
+	v7 = append(v7, r.rows...)
+	// The 16 v6 steps must not be answered as clinical topics.
+	for _, row := range all {
+		if strings.Contains(row.Detail, clinicalLine) {
+			v6clinical++
+		}
+	}
+	v7pass := 0
+	for _, row := range v7 {
+		if row.OK {
+			v7pass++
+		}
+	}
+	t.Logf("RESULT v7 %s: %d/%d correct (chat guard and levers); v6 steps answered as a clinical topic: %d", label, v7pass, len(v7), v6clinical)
+
 	pass, total := 0, 0
 	var lat []int
 	for _, row := range all {
@@ -288,7 +472,8 @@ func TestEval(t *testing.T) {
 	sort.Ints(lat)
 	t.Logf("RESULT %s: %d/%d correct, median %d ms, max %d ms, mean %d ms", label, pass, len(all), lat[len(lat)/2], lat[len(lat)-1], total/len(all))
 	if out := os.Getenv("FUEL_EVAL_OUT"); out != "" {
-		b, _ := json.MarshalIndent(map[string]any{"config": label, "correct": pass, "of": len(all), "median_ms": lat[len(lat)/2], "max_ms": lat[len(lat)-1], "rows": all}, "", " ")
+		b, _ := json.MarshalIndent(map[string]any{"config": label, "correct": pass, "of": len(all), "median_ms": lat[len(lat)/2], "max_ms": lat[len(lat)-1], "rows": all,
+			"v7_correct": v7pass, "v7_of": len(v7), "v7_rows": v7}, "", " ")
 		_ = os.WriteFile(out, b, 0o600)
 	}
 	_ = context.Background
