@@ -17,12 +17,16 @@ import (
 // section 15). Flat TOML: `key = "string"` or `test_mode = true|false`,
 // comments with #. Unknown keys are refused.
 type DaemonConfig struct {
-	Listen        string
-	Token         string // literal or "env:VAR"
-	VariablesURL  string
-	VariablesKey  string // literal or "env:VAR"
-	FoodLogVar    string
-	BodyVar       string
+	Listen       string
+	Token        string // literal or "env:VAR"
+	VariablesURL string
+	VariablesKey string // literal or "env:VAR"
+	FoodLogVar   string
+	BodyVar      string
+	// BPVar and SymptomVar name the record variables (spec 18.4). No
+	// defaults: an absent key means that record type is not set up.
+	BPVar         string
+	SymptomVar    string
 	ModelProvider string
 	Model         string
 	ModelKey      string // literal or "env:VAR"
@@ -143,6 +147,7 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 		dst := map[string]*string{
 			"listen": &c.Listen, "token": &c.Token, "variables_url": &c.VariablesURL,
 			"variables_key": &c.VariablesKey, "food_log_var": &c.FoodLogVar, "body_var": &c.BodyVar,
+			"bp_var": &c.BPVar, "symptom_var": &c.SymptomVar,
 			"model_provider": &c.ModelProvider, "model": &c.Model, "model_key": &c.ModelKey,
 			"model_effort": &c.ModelEffort, "model_chat": &c.ModelChat, "model_chat_effort": &c.ModelChatEffort,
 			"log_budget": &c.LogBudget, "model_timeout": &c.ModelTimeout,

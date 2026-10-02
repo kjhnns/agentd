@@ -26,6 +26,22 @@ type Snapshot struct {
 	BodyFat    BodyFat      `json:"body_fat"`
 	Streaks    Streaks      `json:"streaks"`
 	Missing    []string     `json:"missing"`
+
+	// v7 (spec 18.7, 19.7): NEW keys only; every key above is as in v6.
+	Wire             int           `json:"wire"`
+	DayClass         string        `json:"day_class"`
+	Budgets          []Budget      `json:"budgets"`
+	BudgetScore      DayScore      `json:"budget_score"`
+	BudgetNextAction *NextAction   `json:"budget_next_action"`
+	Levers           []LeverState  `json:"levers"`
+	Coffee           Coffee        `json:"coffee"`
+	Energy           EnergyState   `json:"energy"`
+	Context          SnapContext   `json:"context"`
+	Progress         Progress      `json:"progress"`
+	Records          SnapRecords   `json:"records"`
+	Strength         StrengthState `json:"strength"`
+	Info             SnapInfo      `json:"info"`
+	WeekBudgets      *WeekCompact  `json:"week_budgets"`
 }
 
 type MacroState struct {
@@ -121,12 +137,20 @@ type snapInput struct {
 	now      time.Time
 	targets  *Targets
 	rowsFor  func(date string) ([]Value, bool)
-	strength func(date string) bool
+	strength func(date string) bool // the v6 predicate (used when si is not set)
 	dataAsOf time.Time
 	revision int
 	body     []Value
 	acts     []Activity
 	stravaAt time.Time
+
+	// v7 inputs.
+	fetched func(date string) time.Time // last server read of a date
+	si      strengthInput
+	recs    *recordsView
+	calib   CalibResult
+	drift   bool
+	days    map[string]*dayData // memo of day()
 }
 
 func dateAdd(date string, days int) string {
@@ -182,7 +206,7 @@ func dayTypeFor(date string, acts []Activity) string {
 
 // dayChecks evaluates the day-score checks for totals; nil entries are
 // skipped checks (target null, or net carbs on a training day).
-func dayChecks(t *Targets, dayType string, tot DayTotals) map[string]*bool {
+func dayChecks(t *Targets, dayType string, tot DayTotals, kcalTarget *float64) map[string]*bool {
 	c := func(key string) float64 { return float64(tot.Sum[key]) / 10 }
 	out := map[string]*bool{}
 	b := func(v bool) *bool { return &v }
@@ -195,7 +219,7 @@ func dayChecks(t *Targets, dayType string, tot DayTotals) map[string]*bool {
 	if tg := t.SatFat.For(dayType); tg != nil {
 		out["sat_fat_g"] = b(c("sat_fat_g") <= *tg)
 	}
-	if tg := t.Kcal.For(dayType); tg != nil {
+	if tg := kcalTarget; tg != nil {
 		out["kcal"] = b(math.Abs(c("kcal")-*tg) <= 0.1**tg)
 	}
 	if dayType != "training" {
@@ -217,11 +241,19 @@ func computeSnapshot(in snapInput) Snapshot {
 		minute = float64(24 * 60) // a past date is evaluated at its end
 	}
 	s := Snapshot{Revision: in.revision, AsOf: in.now.UTC(), DataAsOf: in.dataAsOf.UTC(), Date: in.date, Missing: []string{}}
+	in.days = map[string]*dayData{}
+	if in.si.legacy == nil {
+		in.si.legacy = in.strength
+	}
+	if in.si.acts == nil {
+		in.si.acts = in.acts
+	}
 
-	// Day type.
-	s.DayType = dayTypeFor(in.date, in.acts)
-	if isToday && (in.stravaAt.IsZero() || in.now.Sub(in.stravaAt) > 36*time.Hour) && s.DayType != "training" {
-		s.DayType = "unknown"
+	// Day type (and, with it, the day class and the targets that depend on
+	// the day): one function for the snapshot and the week view.
+	plan := in.day(in.date).plan
+	s.DayType = plan.DayType
+	if plan.Stale {
 		s.Missing = append(s.Missing, "strava_stale")
 	}
 	targetDay := s.DayType
@@ -233,6 +265,9 @@ func computeSnapshot(in snapInput) Snapshot {
 	for _, d := range macroDefs {
 		tg := d.target(t)
 		target := tg.For(targetDay)
+		if d.key == "kcal" {
+			target = plan.EnergyTarget // the v7 energy target (18.5); the v6 value in states legacy and provisional
+		}
 		consumed := round1(float64(tot.Sum[d.key]) / 10)
 		ms := MacroState{Key: d.key, Label: d.label, Unit: d.unit, Kind: tg.Kind, Consumed: consumed, UnknownRows: tot.Unknown[d.key], Target: target}
 		if target != nil && tg.Kind != "cap" {
@@ -277,7 +312,7 @@ func computeSnapshot(in snapInput) Snapshot {
 	}
 
 	// Day score.
-	checks := dayChecks(t, targetDay, tot)
+	checks := dayChecks(t, targetDay, tot, plan.EnergyTarget)
 	for _, v := range checks {
 		s.DayScore.Of++
 		if *v {
@@ -294,7 +329,7 @@ func computeSnapshot(in snapInput) Snapshot {
 			return false
 		}
 		dt := dayTypeFor(date, in.acts)
-		ch := dayChecks(t, dt, totalsFromRows(r))[key]
+		ch := dayChecks(t, dt, totalsFromRows(r), t.Kcal.For(dt))[key]
 		return ch != nil && *ch
 	}
 	streak := func(key string) int {
@@ -319,7 +354,8 @@ func computeSnapshot(in snapInput) Snapshot {
 	sunday := d0.AddDate(0, 0, 6-wd).Format("2006-01-02")
 	s.Week.StrengthTarget = t.StrengthPerWeek
 	for i := 0; i <= wd; i++ {
-		if in.strength != nil && in.strength(dateAdd(monday, i)) {
+		// The session dates of 18.6 (with `strength` null: the v6 predicate).
+		if in.si.day(dateAdd(monday, i)).Session {
 			s.Week.StrengthSessions++
 		}
 	}
@@ -348,6 +384,7 @@ func computeSnapshot(in snapInput) Snapshot {
 	if in.dataAsOf.IsZero() {
 		s.Missing = append(s.Missing, "food_log")
 	}
+	in.fillV7(&s, isToday, minute, el)
 	return s
 }
 

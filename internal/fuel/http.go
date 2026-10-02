@@ -162,6 +162,14 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("GET /fuel/recent", s.handleRecent)
 	mux.HandleFunc("POST /fuel/relog", s.handleRelog)
 	mux.HandleFunc("GET /fuel/day", s.handleDay)
+	// v7 (spec 18.4, 18.5 and section 19): records, calibration, the week.
+	mux.HandleFunc("GET /fuel/week", s.handleWeek)
+	mux.HandleFunc("POST /fuel/record", s.handleRecord)
+	mux.HandleFunc("POST /fuel/record/void", s.handleRecordVoid)
+	mux.HandleFunc("GET /fuel/record/{id}", s.handleRecordGet)
+	mux.HandleFunc("GET /fuel/records", s.handleRecords)
+	mux.HandleFunc("POST /fuel/calibration/run", s.handleCalibrationRun)
+	mux.HandleFunc("POST /fuel/calibration/accept", s.handleCalibrationAccept)
 	mux.HandleFunc("/fuel/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errf(http.StatusNotFound, "not_found", false, "no such route"))
 	})
@@ -588,6 +596,9 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 	preSnap, _ := s.snapshotFor(date)
 	mi := ModelInput{Text: foodText, Staples: s.staples, Snapshot: &preSnap, LastItems: s.lastItems(), Now: now.In(targets.loc),
 		History: s.history(now, targets.loc), Yesterday: s.yesterdayItems(now, targets.loc), Recent: s.recentItems(targets.loc)}
+	if targets.V2 != nil {
+		mi.Estimator = targets.V2.Levers.Estimator // the lever factors of the file, when set (spec 18.6)
+	}
 	for _, p := range imgs {
 		mi.Images = append(mi.Images, p.Model)
 	}
@@ -684,6 +695,16 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errf(http.StatusGatewayTimeout, "timeout", true, "took too long; nothing was written, retry"))
 		return
 	}
+	// The chat guard (spec 18.4): on a clinical topic the model's text is
+	// dropped and never stored or shown; food in the same message is processed
+	// normally and the reply ends with the fixed line.
+	clinical := out.clinical()
+	if clinical {
+		out.Text = ""
+		if out.Intent == "question" {
+			out.Widgets = nil
+		}
+	}
 	if out.Intent == "undo" {
 		s.finishUndo(ctx, w, out, in.ClientID, hash, foodText, now, t0,
 			map[string]int{"upload": ms(upload), "asr": ms(asrD), "model": ms(modelD)})
@@ -717,7 +738,7 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entry := Entry{ID: newID("en_"), ClientID: in.ClientID, Date: date, EatenAt: eatenAt, CreatedAt: now,
-		Intent: out.Intent, Transcript: transcript, PhotoIDs: []string{}, ReqHash: hash, Note: note}
+		Intent: out.Intent, Transcript: transcript, PhotoIDs: []string{}, ReqHash: hash, Note: note, Clinical: clinical}
 	if out.Intent == "log" && (date != now.In(targets.loc).Format("2006-01-02") || date != requestDate) {
 		entry.DayLabel = dayLabel(date)
 	}
@@ -967,6 +988,8 @@ func (s *Service) leadText(e Entry, states []ItemState, snap Snapshot) string {
 		return e.Note
 	case e.NoFood:
 		return noFoodText
+	case e.Clinical && len(states) == 0:
+		return clinicalLine // nothing was written: the fixed line is the only text
 	case e.DayLabel != "" && e.Intent == "log" && len(states) > 0:
 		var names []string
 		for _, st := range states {
@@ -976,6 +999,10 @@ func (s *Service) leadText(e Entry, states []ItemState, snap Snapshot) string {
 	}
 	return statusSentence(snap)
 }
+
+// clinicalLine is the fixed reply to a clinical topic in the chat (spec
+// 18.4). Fuel stores records and never interprets them.
+const clinicalLine = "Use the Records tab for that. Fuel does not interpret it."
 
 // noFoodText answers a caption-less photo in which no food was seen.
 const noFoodText = "I could not see any food in that photo. Add a word about what it is."
@@ -1000,6 +1027,9 @@ func (s *Service) buildLogResponse(e Entry) (LogResponse, string) {
 	blocks := []Block{textBlock(s.leadText(e, states, snap))}
 	if isChatFix(e) {
 		blocks = correctBlocks(s, e, snap)
+		if e.Clinical {
+			blocks = withClinicalLine(blocks)
+		}
 		photos := e.PhotoIDs
 		if photos == nil {
 			photos = []string{}
@@ -1010,11 +1040,14 @@ func (s *Service) buildLogResponse(e Entry) (LogResponse, string) {
 	if len(e.Checks) > 0 {
 		blocks = append(blocks, textBlock(strings.Join(e.Checks, " ")))
 	}
-	if e.ModelText != "" {
+	if e.ModelText != "" && !e.Clinical {
 		blocks = append(blocks, textBlock(e.ModelText))
 	}
+	if e.Clinical && len(states) > 0 {
+		blocks = append(blocks, textBlock(clinicalLine))
+	}
 	widgets := e.Widgets
-	if e.Intent == "log" || len(widgets) == 0 {
+	if e.Intent == "log" || (len(widgets) == 0 && !e.Clinical) {
 		widgets = append([]string{"macros_today"}, widgets...)
 	}
 	seenW := map[string]bool{}
@@ -1038,6 +1071,24 @@ func (s *Service) buildLogResponse(e Entry) (LogResponse, string) {
 	}
 	return LogResponse{Status: status, EntryID: e.ID, Intent: e.Intent, Transcript: e.Transcript, PhotoIDs: photos,
 		Items: states, Blocks: blocks, Snapshot: snap}, status
+}
+
+// withClinicalLine puts the fixed line after the text blocks of a reply
+// (before its widgets).
+func withClinicalLine(blocks []Block) []Block {
+	out := make([]Block, 0, len(blocks)+1)
+	done := false
+	for _, b := range blocks {
+		if b.Type != "text" && !done {
+			out = append(out, textBlock(clinicalLine))
+			done = true
+		}
+		out = append(out, b)
+	}
+	if !done {
+		out = append(out, textBlock(clinicalLine))
+	}
+	return out
 }
 
 // appendEntryFeed writes the user line and the reply line of an entry, each
@@ -1133,6 +1184,9 @@ func (s *Service) buildItems(out *ModelOutput, e Entry) []Item {
 		}
 		m := Macros{Kcal: tenthFromPtr(mi.Kcal), Protein: tenthFromPtr(mi.ProteinG), Carbs: tenthFromPtr(mi.CarbsG),
 			NetCarbs: tenthFromPtr(net), Fat: tenthFromPtr(mi.FatG), SatFat: tenthFromPtr(mi.SatFatG), Fiber: tenthFromPtr(mi.FiberG)}
+		// Levers (spec 18.6): the model's amounts (already scaled with a
+		// scale override), then the staple's values, then the code checks.
+		lev, brew := mi.Levers.vals(), mi.Levers.brew()
 		if mi.StapleKey != nil {
 			for _, st := range s.staples {
 				if st.Key == *mi.StapleKey {
@@ -1144,6 +1198,14 @@ func (s *Service) buildItems(out *ModelOutput, e Entry) []Item {
 					it.StapleKey = st.Key
 					m = st.macros(g)
 					it.Kind = "food"
+					for l, p := range st.leverAmounts(g) {
+						if p != nil {
+							lev[l] = known(toTenth(*p)) // a staple's lever values replace the model's
+						}
+					}
+					if st.BrewMethod != "" {
+						brew, it.Kind = st.BrewMethod, "drink" // a coffee staple
+					}
 					break
 				}
 			}
@@ -1153,6 +1215,15 @@ func (s *Service) buildItems(out *ModelOutput, e Entry) []Item {
 		if it.Kind == "" {
 			it.Kind = "food"
 		}
+		var est *EstimatorCfg
+		if t, _ := s.loadTargets(); t != nil && t.V2 != nil {
+			est = t.V2.Levers.Estimator
+			// The user's words win; else the file's default method; else unknown.
+			if d := t.V2.Levers.CoffeeDefaultBrew; brew == "unknown" && d != nil {
+				brew = *d
+			}
+		}
+		it.levers, it.brew = checkLevers(it.ID, lev, brew, it.Kind, it.PortionG, m, est)
 		it.Orig = m
 		items = append(items, it)
 	}
@@ -1445,6 +1516,7 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 	case "undo":
 		// Cancels the known sum of every field; deleted outside = zeros.
 		o := s.newCorrectionOp(it, requiredKnown(ic.cancel()), "undo", nil)
+		leverCancel(reduceLevers(itemGroup(dayRows, it.ID))).putInto(o.Data)
 		if external {
 			s.deterministicOp(&o, "op_undo_"+strings.TrimPrefix(it.ID, "v:"))
 		}
@@ -1756,6 +1828,11 @@ func (s *Service) writeEntry(w http.ResponseWriter, e Entry) {
 	blocks := []Block{textBlock(s.leadText(e, states, snap))}
 	if isChatFix(e) {
 		blocks = correctBlocks(s, e, snap)
+		if e.Clinical {
+			blocks = withClinicalLine(blocks)
+		}
+	} else if e.Clinical && len(states) == 0 {
+		// The fixed line alone: no widget on a clinical question.
 	} else if b, ok := widgetBlock("macros_today", snap, addedOf(effs)); ok {
 		blocks = append(blocks, b)
 	}

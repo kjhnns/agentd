@@ -278,11 +278,11 @@ func TestDeltaAndRevisedValidation(t *testing.T) {
 		corr(corrForm("last", `"revised":{"item":"x","portion_g":1,"kcal":100,"protein_g":null,"carbs_g":1,"net_carbs_g":null,"fat_g":1,"sat_fat_g":1,"fiber_g":null}`)),
 		corr(corrForm("last", `"share":0.5,`+revisedChicken)),
 	} {
-		if _, err := validateOutput(json.RawMessage(bad)); err == nil {
+		if _, err := validateOutput(json.RawMessage(withClinical(bad))); err == nil {
 			t.Errorf("accepted %s", bad)
 		}
 	}
-	if _, err := validateOutput(json.RawMessage(corr(corrForm("last", revisedChicken)))); err != nil {
+	if _, err := validateOutput(json.RawMessage(withClinical(corr(corrForm("last", revisedChicken))))); err != nil {
 		t.Fatal(err)
 	}
 }

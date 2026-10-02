@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kjhnns/agentd/internal/media"
@@ -24,10 +25,14 @@ import (
 // Options configures a Service. Durations left zero take the spec defaults;
 // tests shorten them.
 type Options struct {
-	Token       string
-	Vars        Variables
-	FoodVar     string
-	BodyVar     string
+	Token   string
+	Vars    Variables
+	FoodVar string
+	BodyVar string
+	// BPVar and SymptomVar name the record variables (spec 18.4); empty =
+	// that record type is not set up (503 variable_missing).
+	BPVar       string
+	SymptomVar  string
 	Model       Model
 	ASR         media.Transcriber
 	TargetsFile string
@@ -102,6 +107,18 @@ type Service struct {
 	recalMu   sync.Mutex // one recalibration job at a time
 	recalLast time.Time  // start of the last job (min interval)
 
+	// v7: record operations (their own store), the calibration, the kept
+	// variable list (strength set variables resolve against it).
+	records        *recordStore
+	recMu          sync.Mutex // one record or void operation at a time
+	calib          *calibStore
+	calibMu        sync.Mutex // one calibration run or accept at a time
+	calibLast      time.Time
+	calibDirty     atomic.Bool
+	varMu          sync.Mutex
+	varList        []VarInfo
+	strengthLogged string // the missing-variables line that was logged last
+
 	slots chan struct{} // at most 2 logs processed at once
 	fails authFailures
 	kick  chan struct{}
@@ -129,6 +146,12 @@ func (o Options) Validate() error {
 	}
 	if o.TestMode && strings.EqualFold(strings.TrimSpace(o.FoodVar), "Food log") {
 		return errors.New(`fuel: test_mode refuses food_log_var "Food log" (the production log)`)
+	}
+	if o.TestMode && strings.EqualFold(strings.TrimSpace(o.BPVar), prodBPVar) {
+		return errors.New(`fuel: test_mode refuses bp_var "Blood pressure" (the production variable)`)
+	}
+	if o.TestMode && strings.EqualFold(strings.TrimSpace(o.SymptomVar), prodSymptomVar) {
+		return errors.New(`fuel: test_mode refuses symptom_var "Symptom log" (the production variable)`)
 	}
 	return nil
 }
@@ -196,6 +219,12 @@ func New(o Options) (*Service, error) {
 		return nil, fmt.Errorf("fuel: recal: %w", err)
 	}
 	s.recal = rs
+	if s.records, err = openRecordStore(filepath.Join(o.StateDir, "records.jsonl")); err != nil {
+		return nil, fmt.Errorf("fuel: records: %w", err)
+	}
+	if s.calib, err = openCalibStore(o.StateDir); err != nil {
+		return nil, fmt.Errorf("fuel: calibration: %w", err)
+	}
 	s.coachSeen = map[string]bool{}
 	_ = loadLines(filepath.Join(o.StateDir, "coach-events.jsonl"), false, func(b []byte) error {
 		var ev struct {
@@ -300,8 +329,23 @@ func (s *Service) loadTargets() (*Targets, error) {
 		path = filepath.Join(s.o.StateDir, "no-targets-file")
 	}
 	t, isDefault, err := LoadTargets(path)
+	if err == nil && t.V2 != nil && s.calib != nil {
+		// The adoption check of 18.2: a result_id needs its stored candidate
+		// and an accepted line.
+		if aerr := s.calib.checkAdoption(t.V2.Energy.Maintenance); aerr != nil {
+			t, err = nil, aerr
+		}
+	}
+	reload := s.targetsSeen
 	s.targetsSeen, s.targetsMod = true, mod
 	s.targets, s.targetsErr = t, err
+	if reload {
+		// A reload re-reads the variable list (strength names) and makes the
+		// calibration run again; both outside this lock.
+		s.calibDirty.Store(true)
+		s.calibLastReset()
+		go s.refreshVarList(context.Background())
+	}
 	switch {
 	case err != nil:
 		log.Printf("fuel: targets file invalid, routes answer 503 targets_invalid: %v", err)
@@ -325,10 +369,38 @@ func (s *Service) Close() {
 func (s *Service) Resolve(ctx context.Context) error {
 	rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	ids, err := ResolveVars(rctx, s.o.Vars, s.o.FoodVar, s.o.BodyVar)
+	list, err := s.o.Vars.ListVariables(rctx)
 	if err != nil {
 		return err
 	}
+	ids, err := resolveFromList(list, s.o.FoodVar, s.o.BodyVar)
+	if err != nil {
+		return err
+	}
+	// The record variables are optional: an absent key or a missing variable
+	// does not stop fueld (that record type answers 503 variable_missing).
+	for _, rv := range []struct {
+		name string
+		id   *string
+	}{{s.o.BPVar, &ids.BP}, {s.o.SymptomVar, &ids.Symptom}} {
+		if rv.name == "" {
+			continue
+		}
+		var hits []VarInfo
+		for _, x := range list {
+			if x.Name == rv.name {
+				hits = append(hits, x)
+			}
+		}
+		if len(hits) == 1 && hits[0].Type == "json" {
+			*rv.id = hits[0].ID
+		} else {
+			log.Printf("fuel: record variable %q does not resolve (found %d); that record type is unavailable", rv.name, len(hits))
+		}
+	}
+	s.varMu.Lock()
+	s.varList = list
+	s.varMu.Unlock()
 	s.mu.Lock()
 	s.ids = ids
 	s.cache = newCache(s.o.Vars, ids, s.journal, s.o.Now)
@@ -363,6 +435,15 @@ func (s *Service) Start(ctx context.Context) {
 	if lctx.Err() != nil {
 		return
 	}
+	// Record operations that were pending at a stop may or may not have
+	// reached Variables: uncertain, checked by op_id. Rows are the truth.
+	for _, op := range s.records.all() {
+		if op.State == OpPending || op.State == OpRetry {
+			op.State = OpUncertain
+			_ = s.records.put(op)
+		}
+	}
+	s.adoptRecordRows()
 	// Ops still pending from before a restart may or may not have reached
 	// Variables: they become uncertain and are checked by op_id.
 	for _, op := range s.journal.NonTerminal() {
@@ -381,6 +462,7 @@ func (s *Service) Start(ctx context.Context) {
 	go func() {
 		defer s.workers.Done()
 		s.reconcileOnce(lctx)
+		s.calibTick(lctx, true)
 		s.loop(lctx)
 	}()
 	if s.recalOn() {
@@ -484,9 +566,13 @@ func (s *Service) loop(ctx context.Context) {
 		case <-body.C:
 			if err := s.cache.RefreshBody(ctx); err != nil {
 				log.Printf("fuel: refresh body composition: %v", err)
+			} else {
+				s.adoptRecordRows()
 			}
+			s.refreshVarList(ctx)
 		case <-rec.C:
 			s.reconcileOnce(ctx)
+			s.calibTick(ctx, false)
 		case <-s.kick:
 			s.reconcileOnce(ctx)
 		case <-prune.C:
@@ -549,6 +635,11 @@ func originalRowData(it Item, opID string, photoRef string) map[string]any {
 		d["note"] = "check: " + it.Check
 	}
 	it.Orig.putInto(d)
+	// Lever keys are written only when known, never as null (spec 18.6).
+	it.levers.putInto(d)
+	if it.brew != "" {
+		d["brew_method"] = it.brew
+	}
 	return d
 }
 
@@ -639,8 +730,54 @@ func (s *Service) markDone(opID, valueID string, attempts int, now time.Time) {
 		// together. A restart without the record re-finds it by op_id.
 		if done, ok := s.journal.Op(opID); ok && done.State == OpDone {
 			s.cache.mergeLocked(done)
+			if done.Date < now.UTC().Format("2006-01-02") {
+				s.calibDirty.Store(true) // a write for a past day: the calibration runs again
+			}
 		}
 	})
+}
+
+// calibLastReset lets the next calibration tick run at once.
+func (s *Service) calibLastReset() {
+	go func() {
+		s.calibMu.Lock()
+		s.calibLast = time.Time{}
+		s.calibMu.Unlock()
+	}()
+}
+
+// refreshVarList re-reads the variable list (every 20 min and when the
+// targets file reloads); a failed read keeps the list it has.
+func (s *Service) refreshVarList(ctx context.Context) {
+	rctx, cancel := context.WithTimeout(ctx, s.o.VarTimeout)
+	defer cancel()
+	list, err := s.o.Vars.ListVariables(rctx)
+	if err != nil {
+		log.Printf("fuel: variable list: %s; the previous list stays", errClass(err))
+		return
+	}
+	s.varMu.Lock()
+	s.varList = list
+	s.varMu.Unlock()
+}
+
+// strengthInputFor resolves the set variables against the kept list.
+func (s *Service) strengthInputFor(t *Targets) strengthInput {
+	si := strengthInput{}
+	if t.V2 == nil || t.V2.Strength == nil {
+		return si
+	}
+	si.cfg = t.V2.Strength
+	s.varMu.Lock()
+	si.vars, si.missing = resolveStrengthVars(si.cfg, s.varList)
+	line := strings.Join(si.missing, ", ")
+	logIt := line != s.strengthLogged
+	s.strengthLogged = line
+	s.varMu.Unlock()
+	if logIt && line != "" {
+		log.Printf("fuel: strength set variables that do not resolve: %s", line)
+	}
+	return si
 }
 
 // failOp marks an op failed (which fails its entry, derived on replay too)
@@ -705,6 +842,7 @@ func (s *Service) repairMoves() {
 			continue
 		}
 		c := s.newCorrectionOp(ni, requiredKnown(pair.Macros.Neg()), "compensation", nil)
+		leversFromData(pair.Data).scale(-1).putInto(c.Data) // the destination row's levers are cancelled with it
 		c.Compensates = pair.ID
 		// ONE identity per destination row: a second writer of the same
 		// cancellation would count once.
@@ -746,6 +884,7 @@ func (s *Service) reconcileOnce(ctx context.Context) {
 		l.Unlock()
 	}
 	s.repairMoves()
+	s.reconcileRecords(ctx)
 	s.refreshFailedDays(ctx, now, readDays)
 	s.compensate(ctx, readDays)
 	s.coachCatchUp(ctx, now)
@@ -871,9 +1010,11 @@ func (s *Service) compensate(ctx context.Context, readDays map[string]bool) {
 			for _, op := range s.journal.ItemOps(itemID) {
 				outstanding = outstanding || !terminal(op.State)
 			}
+			var resLev leverVals
 			residual := func() (Macros, bool) {
 				rows, _, _ := s.cache.RowsRaw(e.Date)
 				c, _, found := itemContrib(rows, itemID)
+				resLev = leverCancel(reduceLevers(itemGroup(rows, itemID)))
 				return c.cancel(), found && c.residual()
 			}
 			res, need := residual()
@@ -892,6 +1033,7 @@ func (s *Service) compensate(ctx context.Context, readDays map[string]bool) {
 			}
 			it, _ := s.journal.Item(itemID)
 			c := s.newCorrectionOp(it, requiredKnown(res), "compensation", nil)
+			resLev.putInto(c.Data)
 			c.Attempts, c.LastTry = 1, now
 			err := s.journal.Append(journalRec{T: "txn", Ops: []Op{c}})
 			l.Unlock()
@@ -1001,6 +1143,10 @@ type ItemState struct {
 	Recalibration *Recalibration `json:"recalibration,omitempty"`
 	// Check is why the estimate looks implausible (spec 17 E); absent = fine.
 	Check string `json:"check,omitempty"`
+	// v7 (spec 18.7): the entry that holds the item, and its current lever
+	// amounts (null = untagged) and brew method.
+	EntryID string `json:"entry_id"`
+	Levers  Levers `json:"levers"`
 }
 
 type itemView struct {
@@ -1015,7 +1161,7 @@ func (s *Service) viewItem(it Item) itemView {
 	e, _ := s.journal.Entry(it.EntryID)
 	v := itemView{failed: e.Failed}
 	st := ItemState{ItemID: it.ID, Item: it.Name, Kind: it.KindOr(), PortionG: it.PortionG, PortionBasis: it.Basis,
-		Macros: it.Orig, NeedsFraction: it.NeedsFraction, Actions: []string{}, Check: it.Check}
+		Macros: it.Orig, NeedsFraction: it.NeedsFraction, Actions: []string{}, Check: it.Check, EntryID: it.EntryID}
 	var eff Macros
 	init := false
 	for _, op := range ops {
@@ -1096,8 +1242,18 @@ func (s *Service) viewItem(it Item) itemView {
 		if n := baseName(g); n != "" {
 			st.Item = n // a re-estimate renamed the item
 		}
+		// The current lever amounts, by the reducer over the same rows.
+		ls := reduceLevers(g)
+		st.Levers = wireLevers(ls.amount, ls.brew)
 	} else {
 		eff = zeroMacros()
+		// No row cached yet (still saving): what the original row carries.
+		for _, op := range ops {
+			if op.Kind == "original" && op.State != OpFailed {
+				b, _ := op.Data["brew_method"].(string)
+				st.Levers = wireLevers(leversFromData(op.Data), b)
+			}
+		}
 	}
 	st.Effective = eff
 	st.Recalibration = s.itemRecal(it)
@@ -1195,9 +1351,19 @@ func (s *Service) itemStates(e Entry) []ItemState {
 // snapshotFor computes the snapshot of a date from the cache. Rows and the
 // revision are captured under the cache lock, so they always match.
 func (s *Service) snapshotFor(date string) (Snapshot, error) {
-	t, err := s.loadTargets()
+	in, err := s.snapInputFor(date)
 	if err != nil {
 		return Snapshot{}, err
+	}
+	return computeSnapshot(in), nil
+}
+
+// snapInputFor captures ONE view of the cache for a date: what the snapshot
+// and the week view (section 19) are both computed from.
+func (s *Service) snapInputFor(date string) (snapInput, error) {
+	t, err := s.loadTargets()
+	if err != nil {
+		return snapInput{}, err
 	}
 	var acts []Activity
 	var stravaAt time.Time
@@ -1205,35 +1371,58 @@ func (s *Service) snapshotFor(date string) (Snapshot, error) {
 	rows := map[string][]Value{}
 	have := map[string]bool{}
 	strength := map[string]bool{}
+	nums := map[string][]numVal{}
+	read := map[string]time.Time{}
 	var fetched time.Time
 	var rev int
 	var asOf time.Time
+	si := s.strengthInputFor(t)
 	s.cache.View(func() {
 		asOf = s.o.Now() // captured with the rows, the revision and the body data
 		body = s.cache.body
 		acts, stravaAt = s.strava.Load()
+		take := func(d string) {
+			if _, done := have[d]; done {
+				return
+			}
+			r, f, ok := s.cache.rowsLocked(d)
+			rows[d], have[d], read[d] = r, ok, f
+			strength[d] = s.cache.strengthLocked(d)
+			nums[d] = s.cache.numsLocked(d)
+		}
 		for i := 0; i <= 31; i++ {
-			d := dateAdd(date, -i)
-			r, _, ok := s.cache.rowsLocked(d)
-			rows[d], have[d] = r, ok
-			if i <= 7 {
-				strength[d] = s.cache.strengthLocked(d)
+			take(dateAdd(date, -i))
+		}
+		// The week of the date up to the real today (the week view).
+		today := asOf.In(t.loc).Format("2006-01-02")
+		mon := mondayOf(date)
+		for i := 0; i < 7; i++ {
+			if d := dateAdd(mon, i); d <= today {
+				take(d)
 			}
 		}
 		_, fetched, _ = s.cache.rowsLocked(date)
 		rev = s.journal.Revision(date)
 	})
+	si.nums = func(d string) []numVal { return nums[d] }
+	si.legacy = func(d string) bool { return strength[d] }
+	si.acts = acts
 	in := snapInput{
 		date: date, now: asOf, targets: t,
 		rowsFor:  func(d string) ([]Value, bool) { return rows[d], have[d] },
 		strength: func(d string) bool { return strength[d] },
+		fetched:  func(d string) time.Time { return read[d] },
 		dataAsOf: fetched,
 		revision: rev,
 		body:     body,
 		acts:     acts,
 		stravaAt: stravaAt,
+		si:       si,
+		recs:     s.recordsViewNow(),
+		days:     map[string]*dayData{},
 	}
-	return computeSnapshot(in), nil
+	in.calib, in.drift = s.calibFor(t, asOf.In(t.loc).Format("2006-01-02"))
+	return in, nil
 }
 
 // mutationKey keys an undo / fraction reply line by the request's durable

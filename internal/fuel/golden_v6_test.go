@@ -234,12 +234,88 @@ func goldenFixture(t *testing.T, targets string) (*harness, []string, map[string
 	return h, order, docs
 }
 
+// pruneToGolden rewrites a response with ONLY the keys that the v6 golden
+// document has, in the order of the response. Random ids are numbered by
+// their first appearance, so a NEW key that carries an id (v7: entry_id on
+// an item) must not move the numbers of the v6 keys.
+func pruneToGolden(raw []byte, want any) []byte {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var out bytes.Buffer
+	pruneValue(dec, want, &out)
+	return out.Bytes()
+}
+
+func pruneValue(dec *json.Decoder, want any, out *bytes.Buffer) {
+	tok, err := dec.Token()
+	if err != nil {
+		return
+	}
+	d, isDelim := tok.(json.Delim)
+	switch {
+	case isDelim && d == '{':
+		wm, isObj := want.(map[string]any)
+		out.WriteByte('{')
+		first := true
+		for dec.More() {
+			kt, _ := dec.Token()
+			key, _ := kt.(string)
+			wv, keep := wm[key]
+			if !isObj {
+				keep = true // the golden has no object here: the compare reports it
+			}
+			if !keep {
+				var skip json.RawMessage
+				_ = dec.Decode(&skip)
+				continue
+			}
+			if !first {
+				out.WriteByte(',')
+			}
+			first = false
+			kb, _ := json.Marshal(key)
+			out.Write(kb)
+			out.WriteByte(':')
+			pruneValue(dec, wv, out)
+		}
+		_, _ = dec.Token()
+		out.WriteByte('}')
+	case isDelim && d == '[':
+		wa, _ := want.([]any)
+		out.WriteByte('[')
+		for i := 0; dec.More(); i++ {
+			if i > 0 {
+				out.WriteByte(',')
+			}
+			var wv any
+			if i < len(wa) {
+				wv = wa[i]
+			}
+			pruneValue(dec, wv, out)
+		}
+		_, _ = dec.Token()
+		out.WriteByte(']')
+	default:
+		b, _ := json.Marshal(tok)
+		out.Write(b)
+	}
+}
+
 func TestGoldenV6(t *testing.T) {
 	_, order, docs := goldenFixture(t, goldenTargetsV1)
 	n := &goldenNorm{seen: map[string]string{}}
 	for _, name := range order {
-		got := n.norm(docs[name])
 		path := filepath.Join("testdata", "golden_v6", name+".json")
+		raw := docs[name]
+		if os.Getenv("FUEL_GOLDEN_UPDATE") != "1" {
+			if wantB, err := os.ReadFile(path); err == nil {
+				var want any
+				if json.Unmarshal(wantB, &want) == nil {
+					raw = pruneToGolden(raw, want)
+				}
+			}
+		}
+		got := n.norm(raw)
 		if os.Getenv("FUEL_GOLDEN_UPDATE") == "1" {
 			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 				t.Fatal(err)

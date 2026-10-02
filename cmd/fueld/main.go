@@ -142,6 +142,8 @@ func build(cfg fuel.DaemonConfig) (*fuel.Service, error) {
 		Vars:         &fuel.VariablesHTTP{Base: cfg.VariablesURL, Key: varsKey, Client: &http.Client{Timeout: 30 * time.Second}},
 		FoodVar:      cfg.FoodLogVar,
 		BodyVar:      cfg.BodyVar,
+		BPVar:        cfg.BPVar,
+		SymptomVar:   cfg.SymptomVar,
 		Model:        &fuel.OpenAI{Key: modelKey, Model: cfg.Model, Effort: cfg.ModelEffort, Client: &http.Client{Timeout: modelTimeout + 5*time.Second}},
 		LogBudget:    logBudget,
 		ModelTimeout: modelTimeout,

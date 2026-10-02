@@ -103,6 +103,15 @@ func applyScale(out *ModelOutput) []string {
 					*p = *p * f
 				}
 			}
+			// The known lever amounts scale by the same factor (spec 18.6).
+			if it.Levers != nil {
+				for _, p := range it.Levers.ptrs() {
+					if *p != nil {
+						v := **p * f
+						*p = &v
+					}
+				}
+			}
 			it.PortionG, it.PortionBasis = &sg, "scale"
 			notes = append(notes, fmt.Sprintf("Used the scale reading for %s: %s g, not the estimate of %s g.", it.Item, fmtNum(sg), fmtNum(round1(old))))
 		}
@@ -500,11 +509,48 @@ func (s *Service) reviseOp(it Item, g *group, r ModelRevised) (*Op, string) {
 		name = it.Name
 	}
 	samePortion := (portion == nil && curP == nil) || (portion != nil && curP != nil && math.Abs(*portion-*curP) < 0.05)
-	if !changed && samePortion && name == it.Name {
+	// Levers (spec 18.6): for each lever the answer knows, new minus current
+	// (current = 0 when untagged), which makes the item tagged. For a lever
+	// the answer gives as null: a tagged lever is retained (delta 0), an
+	// untagged one stays untagged (no key).
+	ls := reduceLevers(g)
+	want2 := r.Levers.vals()
+	kind := it.KindOr()
+	var est *EstimatorCfg
+	if t, _ := s.loadTargets(); t != nil && t.V2 != nil {
+		est = t.V2.Levers.Estimator
+	}
+	newBrew := r.Levers.brew()
+	want2, newBrew = checkLevers(it.ID, want2, newBrew, kind, portion, after, est)
+	var levDelta, levAfter leverVals
+	levChanged := false
+	for l := range leverKeys {
+		switch {
+		case want2[l].OK:
+			curL := int64(0)
+			if ls.amount[l].OK {
+				curL = ls.amount[l].V
+			}
+			levDelta[l], levAfter[l] = known(want2[l].V-curL), want2[l]
+			levChanged = levChanged || !ls.amount[l].OK || want2[l].V != curL
+		case ls.amount[l].OK:
+			levDelta[l], levAfter[l] = known(0), ls.amount[l]
+		}
+	}
+	brewChanged := newBrew != "" && newBrew != ls.brew
+	if !changed && samePortion && name == it.Name && !levChanged && !brewChanged {
 		return nil, ""
 	}
 	from, to := valuesOf(cur, curP), valuesOf(after, portion)
+	from.Levers, to.Levers = ls.amount.asMap(), levAfter.asMap()
+	if brewChanged {
+		to.BrewMethod = newBrew
+	}
 	op := s.newCorrectionOp(it, requiredKnown(delta), "revise", nil)
+	levDelta.putInto(op.Data)
+	if brewChanged {
+		op.Data["brew_method"] = newBrew
+	}
 	meta := map[string]any{"from": from, "to": to, "reason": "restated by the user", "by": "user", "item": name}
 	if cur.VolumeML.OK || cur.CaffeineMG.OK || cur.AlcoholG.OK {
 		meta["intake"] = recalIntake{VolumeML: cur.VolumeML.ptr(), CaffeineMG: cur.CaffeineMG.ptr(), AlcoholG: cur.AlcoholG.ptr()}

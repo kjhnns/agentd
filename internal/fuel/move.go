@@ -198,7 +198,7 @@ func (s *Service) finishMove(ctx context.Context, w http.ResponseWriter, out *Mo
 	today := s.today()
 	answer := func(date string, lines []FixLine, stand []Item, items []Item, ops []Op, release func()) {
 		entry := Entry{ID: newID("en_"), ClientID: clientID, Date: date, EatenAt: now, CreatedAt: now,
-			Intent: "move", PhotoIDs: []string{}, ReqHash: hash, UserText: userText, FixLines: lines, FixText: joinLines(lines), MoveTo: date}
+			Intent: "move", PhotoIDs: []string{}, ReqHash: hash, UserText: userText, FixLines: lines, FixText: joinLines(lines), MoveTo: date, Clinical: out.clinical()}
 		for i := range items {
 			items[i].EntryID = entry.ID
 			entry.ItemIDs = append(entry.ItemIDs, items[i].ID)
@@ -319,6 +319,10 @@ func (s *Service) finishMove(ctx context.Context, w http.ResponseWriter, out *Mo
 		kind, _ := g.orig.Data["kind"].(string)
 		ni := Item{ID: newID("it_"), Date: date, Name: d.Item, PortionG: portion, Basis: basis, Kind: kind,
 			Orig: requiredKnown(eff), EatenAt: at}
+		// The new row carries the item's CURRENT lever amounts (tagged levers
+		// only) and its brew method (spec 18.6).
+		ls := reduceLevers(g)
+		ni.levers, ni.brew = ls.amount, ls.brew
 		nopID := newID("op_")
 		photoRef, _ := g.orig.Data["photo_ref"].(string)
 		data := originalRowData(ni, nopID, photoRef)
@@ -327,6 +331,7 @@ func (s *Service) finishMove(ctx context.Context, w http.ResponseWriter, out *Mo
 		nop := Op{ID: nopID, Kind: "original", ItemID: ni.ID, RowItemID: ni.ID, Date: date, Data: data,
 			Macros: ni.Orig, CreatedAt: now, State: OpPending, Attempts: 1, LastTry: now}
 		uop := s.newCorrectionOp(old, requiredKnown(g.c.cancel()), "undo", nil)
+		leverCancel(ls).putInto(uop.Data)
 		if ext {
 			s.deterministicOp(&uop, "op_undo_"+strings.TrimPrefix(old.ID, "v:"))
 			stand = append(stand, old)

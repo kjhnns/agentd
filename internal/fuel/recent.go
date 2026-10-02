@@ -30,6 +30,11 @@ type RecentItem struct {
 	Times       int       `json:"times"`
 	PhotoID     *string   `json:"photo_id"`
 	Source      string    `json:"source"`
+
+	// The current lever amounts and brew method (not on the wire): a relog
+	// copies them (spec 18.6).
+	levers leverVals
+	brew   string
 }
 
 const recentDays = 35
@@ -230,6 +235,8 @@ func (s *Service) recentAll() []RecentItem {
 		at      time.Time
 		source  string
 		photos  []string
+		levers  leverVals
+		brew    string
 	}
 	byKey := map[string][]occ{}
 	for _, rows := range dayRows {
@@ -271,8 +278,9 @@ func (s *Service) recentAll() []RecentItem {
 				photos = strings.Split(ref, ",")
 			}
 			k := recentKey(kind, name, portion, volume)
+			ls := reduceLevers(g)
 			byKey[k] = append(byKey[k], occ{name: strings.TrimSpace(name), kind: kind, volume: volume, portion: portion,
-				macros: eff, at: at.UTC(), source: src, photos: photos})
+				macros: eff, at: at.UTC(), source: src, photos: photos, levers: ls.amount, brew: ls.brew})
 		}
 	}
 	out := make([]RecentItem, 0, len(byKey))
@@ -281,7 +289,7 @@ func (s *Service) recentAll() []RecentItem {
 		last := os[0]
 		it := RecentItem{Key: k, Item: last.name, Kind: last.kind, PortionG: last.portion, VolumeML: last.volume, Macros: last.macros,
 			CaffeineMG: last.macros.CaffeineMG.ptr(), AlcoholG: last.macros.AlcoholG.ptr(),
-			LastEatenAt: last.at, Times: len(os), Source: last.source}
+			LastEatenAt: last.at, Times: len(os), Source: last.source, levers: last.levers, brew: last.brew}
 		for _, o := range os {
 			for _, p := range o.photos {
 				if s.photos.path(p) != "" {
@@ -440,7 +448,8 @@ func (s *Service) handleRelog(w http.ResponseWriter, r *http.Request) {
 	entry := Entry{ID: newID("en_"), ClientID: body.ClientID, Date: date, EatenAt: eatenAt, CreatedAt: now,
 		Intent: "log", PhotoIDs: []string{}, ReqHash: hash, UserText: "again: " + src.Item}
 	m := src.Macros.Scale(scale) // required macros are known (checked above)
-	it := Item{ID: newID("it_"), EntryID: entry.ID, Date: date, Name: src.Item, Basis: "repeat", Orig: m, EatenAt: eatenAt, Kind: src.Kind}
+	it := Item{ID: newID("it_"), EntryID: entry.ID, Date: date, Name: src.Item, Basis: "repeat", Orig: m, EatenAt: eatenAt, Kind: src.Kind,
+		levers: src.levers.scale(scale), brew: src.brew}
 	if src.VolumeML != nil {
 		m.VolumeML = known(toTenth(*src.VolumeML * scale)) // the current volume, scaled
 		it.Orig = m

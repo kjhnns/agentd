@@ -197,12 +197,29 @@ type fakeModel struct {
 	fn    func(in ModelInput) string
 	delay time.Duration
 	calls int
+	// raw returns the fixture as it is. Without it the fake adds the v7 key
+	// `clinical_topic: false` to a fixture that has none (the v6 fixtures).
+	raw bool
+}
+
+// withClinical adds "clinical_topic": false to a model answer without it.
+func withClinical(s string) string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal([]byte(s), &m) != nil {
+		return s
+	}
+	if _, ok := m["clinical_topic"]; ok {
+		return s
+	}
+	m["clinical_topic"] = json.RawMessage("false")
+	b, _ := json.Marshal(m)
+	return string(b)
 }
 
 func (m *fakeModel) Estimate(ctx context.Context, in ModelInput) (json.RawMessage, error) {
 	m.mu.Lock()
 	m.calls++
-	fn, d := m.fn, m.delay
+	fn, d, raw := m.fn, m.delay, m.raw
 	m.mu.Unlock()
 	if d > 0 {
 		select {
@@ -211,7 +228,10 @@ func (m *fakeModel) Estimate(ctx context.Context, in ModelInput) (json.RawMessag
 			return nil, ctx.Err()
 		}
 	}
-	return json.RawMessage(fn(in)), nil
+	if raw {
+		return json.RawMessage(fn(in)), nil
+	}
+	return json.RawMessage(withClinical(fn(in))), nil
 }
 
 type fakeASR struct{ text string }
@@ -1556,11 +1576,11 @@ func TestModelOutputStrictness(t *testing.T) {
 		"kcal out of bounds":  `{"intent":"log","items":[{"item":"x","staple_key":null,"portion_g":null,"portion_basis":"unspecified","kcal":3001,"protein_g":1,"carbs_g":1,"net_carbs_g":null,"fat_g":1,"sat_fat_g":1,"fiber_g":null,"needs_fraction":false}],"text":"","widgets":[]}`,
 	}
 	for name, raw := range cases {
-		if _, err := validateOutput(json.RawMessage(raw)); err == nil {
+		if _, err := validateOutput(json.RawMessage(withClinical(raw))); err == nil {
 			t.Errorf("%s accepted", name)
 		}
 	}
-	if _, err := validateOutput(json.RawMessage(skyrWalnuts)); err != nil {
+	if _, err := validateOutput(json.RawMessage(withClinical(skyrWalnuts))); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1841,7 +1861,7 @@ func TestForgedAudioMetadataRejected(t *testing.T) {
 
 func TestUnknownIntentWithItemsRejected(t *testing.T) {
 	raw := strings.Replace(skyrWalnuts, `"intent":"log"`, `"intent":"unexpected"`, 1)
-	if _, err := validateOutput(json.RawMessage(raw)); err == nil {
+	if _, err := validateOutput(json.RawMessage(withClinical(raw))); err == nil {
 		t.Fatal("unknown intent with items accepted")
 	}
 }
@@ -2823,7 +2843,7 @@ func TestPhotoOnlyEmptyLogOutputsTakeTheSamePaths(t *testing.T) {
 		}
 	}
 	// A non-photo empty log is still invalid output.
-	if _, err := validateOutput(json.RawMessage(emptyLog)); err == nil {
+	if _, err := validateOutput(json.RawMessage(withClinical(emptyLog))); err == nil {
 		t.Fatal("empty log accepted outside the photo-only path")
 	}
 }

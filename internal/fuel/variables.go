@@ -206,6 +206,8 @@ func (v *VariablesHTTP) All(ctx context.Context) ([]Value, error) {
 type VarIDs struct {
 	Food, Body       string
 	PushUps, PullUps string
+	// Record variables (spec 18.4); "" = not set up.
+	BP, Symptom string
 }
 
 // errConfig marks a definitive startup misconfiguration (not a network blip).
@@ -218,6 +220,12 @@ func ResolveVars(ctx context.Context, v Variables, food, body string) (VarIDs, e
 	if err != nil {
 		return VarIDs{}, err
 	}
+	return resolveFromList(list, food, body)
+}
+
+// resolveFromList is ResolveVars on a variable list that was read already.
+func resolveFromList(list []VarInfo, food, body string) (VarIDs, error) {
+	var err error
 	find := func(name string, wantJSON bool, required bool) (string, error) {
 		var hits []VarInfo
 		for _, x := range list {

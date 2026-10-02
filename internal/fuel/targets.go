@@ -80,6 +80,9 @@ type Targets struct {
 	} `json:"eating_window"`
 	TZ string `json:"tz"`
 
+	// V2 holds the schema 2 keys (spec 18.2); nil for a schema 1 file.
+	V2 *V2 `json:"-"`
+
 	loc        *time.Location
 	startMin   int
 	endMin     int
@@ -115,14 +118,28 @@ func ParseTargets(b []byte) (*Targets, error) {
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return nil, fmt.Errorf("targets: %w", err)
 	}
+	// A file without `schema` is schema 1 (the v6 rules). `schema` must be
+	// the integer 2 otherwise (spec 18.2).
+	schema2 := false
+	if sr, ok := raw["schema"]; ok {
+		var n float64
+		if json.Unmarshal(sr, &n) != nil || n != 2 {
+			return nil, errors.New("targets: schema must be the integer 2 (or absent)")
+		}
+		schema2 = true
+	}
 	for _, k := range requiredTargetKeys {
 		if _, ok := raw[k]; !ok {
 			return nil, fmt.Errorf("targets: missing key %q", k)
 		}
 	}
+	allowed := append(append([]string{}, requiredTargetKeys...), optionalTargetKeys...)
+	if schema2 {
+		allowed = append(append(allowed, schema2Keys...), "schema", "info_url")
+	}
 	for k := range raw {
 		found := false
-		for _, r := range append(append([]string{}, requiredTargetKeys...), optionalTargetKeys...) {
+		for _, r := range allowed {
 			found = found || r == k
 		}
 		if !found {
@@ -130,8 +147,29 @@ func ParseTargets(b []byte) (*Targets, error) {
 		}
 	}
 	var t Targets
-	if err := json.Unmarshal(b, &t); err != nil {
+	v1 := map[string]json.RawMessage{}
+	for _, k := range append(append([]string{}, requiredTargetKeys...), optionalTargetKeys...) {
+		if v, ok := raw[k]; ok {
+			v1[k] = v
+		}
+	}
+	v1b, _ := json.Marshal(v1)
+	if err := json.Unmarshal(v1b, &t); err != nil {
 		return nil, fmt.Errorf("targets: %w", err)
+	}
+	if schema2 {
+		v2, err := parseV2(raw)
+		if err != nil {
+			return nil, err
+		}
+		t.V2 = v2
+		if t.WaterML != nil {
+			// Water is context, not a target (spec 18.7): accepted and ignored.
+			logWaterIgnored()
+			t.WaterML = nil
+		}
+		// Net carbohydrate is retired as a target: null on every day.
+		t.NetCarbs.Value, t.NetCarbs.Rest, t.NetCarbs.Training = nil, nil, nil
 	}
 	all := map[string]Target{"protein_g": t.Protein, "sat_fat_g": t.SatFat, "fiber_g": t.Fiber, "kcal": t.Kcal, "net_carbs_g": t.NetCarbs}
 	for name, p := range map[string]*Target{"water_ml": t.WaterML, "caffeine_mg": t.CaffeineMG, "alcohol_g_week": t.AlcoholGWeek} {
@@ -149,8 +187,8 @@ func ParseTargets(b []byte) (*Targets, error) {
 			return nil, fmt.Errorf("targets: %s needs value, or rest and training", name)
 		}
 		for _, v := range []*float64{tg.Value, tg.Rest, tg.Training} {
-			if v != nil && *v < 0 {
-				return nil, fmt.Errorf("targets: %s is negative", name)
+			if v != nil && (*v < 0 || math.IsNaN(*v) || math.IsInf(*v, 0)) {
+				return nil, fmt.Errorf("targets: %s is negative or not finite", name)
 			}
 		}
 	}
@@ -212,6 +250,11 @@ type Staple struct {
 	Aliases  []string `json:"aliases"`
 	Per100g  Per100g  `json:"per_100g"`
 	DefaultG float64  `json:"default_g"`
+	// CarbsBasis (spec 18.3): "total" (default; per_100g.carbs_g holds fibre)
+	// or "available" (the EU label value without fibre).
+	CarbsBasis string `json:"carbs_basis,omitempty"`
+	// BrewMethod of a coffee staple (spec 18.6).
+	BrewMethod string `json:"brew_method,omitempty"`
 }
 
 // Per100g are the label macros of a staple per 100 g. fiber_g may be null.
@@ -222,6 +265,17 @@ type Per100g struct {
 	Fat     *float64 `json:"fat_g"`
 	SatFat  *float64 `json:"sat_fat_g"`
 	Fiber   *float64 `json:"fiber_g"`
+	// Lever amounts per 100 g (spec 18.6), each optional.
+	Psyllium     *float64 `json:"psyllium_g,omitempty"`
+	BetaGlucan   *float64 `json:"beta_glucan_g,omitempty"`
+	Nuts         *float64 `json:"nuts_g,omitempty"`
+	Pulses       *float64 `json:"pulses_g,omitempty"`
+	PlantProtein *float64 `json:"plant_protein_g,omitempty"`
+}
+
+// levers are the staple's lever values per 100 g, in leverKeys order.
+func (p Per100g) levers() [5]*float64 {
+	return [5]*float64{p.Psyllium, p.BetaGlucan, p.Nuts, p.Pulses, p.PlantProtein}
 }
 
 var slugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,47}$`)
@@ -254,6 +308,17 @@ func ParseStaples(b []byte) ([]Staple, error) {
 		}
 		if p.Fiber != nil && *p.Fiber < 0 {
 			return nil, fmt.Errorf("staples[%s]: per_100g.fiber_g negative", s.Key)
+		}
+		for i, v := range p.levers() {
+			if v != nil && (*v < 0 || *v > 100) {
+				return nil, fmt.Errorf("staples[%s]: per_100g.%s must be 0 to 100", s.Key, leverKeys[i])
+			}
+		}
+		if s.CarbsBasis != "" && s.CarbsBasis != "total" && s.CarbsBasis != "available" {
+			return nil, fmt.Errorf("staples[%s]: carbs_basis must be total or available", s.Key)
+		}
+		if s.BrewMethod != "" && !isBrewMethod(s.BrewMethod) {
+			return nil, fmt.Errorf("staples[%s]: unknown brew_method", s.Key)
 		}
 		if s.DefaultG <= 0 || s.DefaultG > 3000 {
 			return nil, fmt.Errorf("staples[%s]: default_g must be in (0, 3000]", s.Key)
@@ -288,6 +353,17 @@ func (s Staple) macros(grams float64) Macros {
 		Fat: sc(s.Per100g.Fat), SatFat: sc(s.Per100g.SatFat), Fiber: sc(s.Per100g.Fiber)}
 	// Net carbs from the unrounded scaled values, rounded once.
 	if s.Per100g.Carbs != nil {
+		if s.CarbsBasis == "available" {
+			// The label value is WITHOUT fibre: total = label + fibre, net =
+			// label (a null fibre counts as 0 for this sum; spec 18.3).
+			total := *s.Per100g.Carbs * f
+			if s.Per100g.Fiber != nil {
+				total += *s.Per100g.Fiber * f
+			}
+			m.Carbs = known(toTenth(total))
+			m.NetCarbs = known(toTenth(*s.Per100g.Carbs * f))
+			return m
+		}
 		net := *s.Per100g.Carbs * f
 		if s.Per100g.Fiber != nil {
 			net = math.Max(0, net-*s.Per100g.Fiber*f)
@@ -295,6 +371,19 @@ func (s Staple) macros(grams float64) Macros {
 		m.NetCarbs = known(toTenth(net))
 	}
 	return m
+}
+
+// leverAmounts scales the staple's lever values to grams; nil = the staple
+// does not state that lever.
+func (s Staple) leverAmounts(grams float64) [5]*float64 {
+	var out [5]*float64
+	for i, p := range s.Per100g.levers() {
+		if p != nil {
+			v := *p * grams / 100
+			out[i] = &v
+		}
+	}
+	return out
 }
 
 func expandHome(p string) string {

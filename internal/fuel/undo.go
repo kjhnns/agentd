@@ -176,7 +176,7 @@ func (s *Service) finishUndo(ctx context.Context, w http.ResponseWriter, out *Mo
 	// target makes the whole message a question (spec 15.4).
 	answerOnly := func(lines []FixLine) {
 		entry := Entry{ID: newID("en_"), ClientID: clientID, Date: today, EatenAt: now, CreatedAt: now,
-			Intent: "undo", PhotoIDs: []string{}, ReqHash: hash, UserText: userText, FixLines: lines, FixText: joinLines(lines)}
+			Intent: "undo", PhotoIDs: []string{}, ReqHash: hash, UserText: userText, FixLines: lines, FixText: joinLines(lines), Clinical: out.clinical()}
 		s.finishUndoEntry(ctx, w, entry, nil, nil, clientID, hash, now, t0, lat, func() {})
 	}
 	targets, clean := resolve()
@@ -244,7 +244,7 @@ func (s *Service) finishUndo(ctx context.Context, w http.ResponseWriter, out *Mo
 	}
 	rows, _, _ := s.cache.Rows(today)
 	entry := Entry{ID: newID("en_"), ClientID: clientID, Date: today, EatenAt: now, CreatedAt: now,
-		Intent: "undo", PhotoIDs: []string{}, ReqHash: hash, UserText: userText}
+		Intent: "undo", PhotoIDs: []string{}, ReqHash: hash, UserText: userText, Clinical: out.clinical()}
 	var ops []Op
 	var stand []Item
 	for _, tg := range targets {
@@ -263,6 +263,7 @@ func (s *Service) finishUndo(ctx context.Context, w http.ResponseWriter, out *Mo
 			continue
 		}
 		op := s.newCorrectionOp(tg.it, requiredKnown(g.c.cancel()), "undo", nil)
+		leverCancel(reduceLevers(g)).putInto(op.Data)
 		if tg.ext {
 			s.deterministicOp(&op, "op_undo_"+strings.TrimPrefix(tg.it.ID, "v:"))
 			stand = append(stand, tg.it)

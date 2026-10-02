@@ -26,6 +26,15 @@ type DayItem struct {
 	RecentKey  string    `json:"recent_key"`
 	// Recalibration is the second opinion on a Fuel photo item (spec 16).
 	Recalibration *Recalibration `json:"recalibration,omitempty"`
+	// v7 (spec 18.7, the build 7 gap): the Fuel item and entry ids (null for
+	// a row of another writer), the plausibility flag (absent when fine),
+	// the stored basis and the current levers. For a Fuel item they equal
+	// the same fields of its ItemState.
+	ItemID       *string `json:"item_id"`
+	EntryID      *string `json:"entry_id"`
+	Check        string  `json:"check,omitempty"`
+	PortionBasis *string `json:"portion_basis"`
+	Levers       Levers  `json:"levers"`
 
 	// For resolution (not on the wire).
 	origPortion *float64
@@ -89,9 +98,23 @@ func (s *Service) dayItems(date string) []DayItem {
 		if v, ok := d["volume_ml"].(float64); ok && v > 0 {
 			it.origVolume = &v
 		}
+		ls := reduceLevers(g)
+		it.Levers = wireLevers(ls.amount, ls.brew)
+		if b, _ := d["portion_basis"].(string); b != "" {
+			it.PortionBasis = &b
+		}
+		if !isExternalKey(it.RowKey) {
+			id := it.RowKey
+			it.ItemID = &id
+			if eid, _ := d["entry_id"].(string); eid != "" {
+				it.EntryID = &eid
+			}
+		}
 		if src == "fuel" {
 			if ji, ok := s.journal.Item(it.RowKey); ok {
 				it.Recalibration = s.itemRecal(ji)
+				eid, basis := ji.EntryID, ji.Basis
+				it.EntryID, it.PortionBasis, it.Check = &eid, &basis, ji.Check
 			}
 		}
 		it.PhotoIDs = []string{}

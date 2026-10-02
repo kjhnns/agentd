@@ -51,6 +51,12 @@ type Item struct {
 	EatenAt       time.Time `json:"eaten_at"`
 	// Check is set when the estimate stayed implausible after a re-ask.
 	Check string `json:"check,omitempty"`
+
+	// Lever amounts and brew method of a NEW item (spec 18.6). They are not
+	// journaled here: they live in the row data of the original op, so the
+	// journal gets no new line shape and a v6 binary replays it.
+	levers leverVals
+	brew   string
 }
 
 // FixLine is one line of a chat correction reply: the success text of an
@@ -102,6 +108,9 @@ type Entry struct {
 	// Checks are code-generated lines of a log reply: a scale reading that
 	// replaced an estimate, items whose numbers look implausible.
 	Checks []string `json:"checks,omitempty"`
+	// Clinical marks a turn the chat guard handled (spec 18.4): the model
+	// text was dropped and the reply ends with the fixed line.
+	Clinical bool `json:"clinical,omitempty"`
 }
 
 // Op is one journaled row write.

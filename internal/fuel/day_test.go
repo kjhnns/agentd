@@ -124,7 +124,7 @@ func TestUndoIntentValidation(t *testing.T) {
 		`{"intent":"correct","items":[],"corrections":[{"ref":"last","portion_g":1,"volume_ml":null,"share":null}],"targets":[{"ref":"x","which":null,"volume_ml":null,"portion_g":null}],"text":"","widgets":[]}`,
 	}
 	for i, b := range bad {
-		if _, err := validateOutput(json.RawMessage(b)); err == nil {
+		if _, err := validateOutput(json.RawMessage(withClinical(b))); err == nil {
 			t.Fatalf("case %d accepted", i)
 		}
 	}

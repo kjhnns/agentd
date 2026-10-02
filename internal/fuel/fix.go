@@ -94,6 +94,9 @@ func (s *Service) absoluteCorrection(it Item, rows []Value, tgt FixTarget, reaso
 		}
 	}
 	op := s.newCorrectionOp(it, requiredKnown(delta), reason, fraction)
+	// The delta of each lever the item is tagged for, by the same arithmetic
+	// as the macros; no key for an untagged lever (spec 18.6).
+	leverScaleDeltas(reduceLevers(g), share).putInto(op.Data)
 	op.Data["share_after"] = math.Round(share*1000) / 1000
 	if origPortion != nil {
 		op.Data["portion_g_after"] = round1(*origPortion * share)
@@ -632,7 +635,7 @@ func (s *Service) finishCorrect(ctx context.Context, w http.ResponseWriter, out 
 		}
 	}
 	entry := Entry{ID: newID("en_"), ClientID: clientID, Date: date, EatenAt: now, CreatedAt: now,
-		Intent: "correct", PhotoIDs: []string{}, ReqHash: hash, UserText: userText}
+		Intent: "correct", PhotoIDs: []string{}, ReqHash: hash, UserText: userText, Clinical: out.clinical()}
 	var ops []Op
 	for _, f := range fixes {
 		if f.it.ID == "" {

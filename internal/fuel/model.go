@@ -39,6 +39,9 @@ type ModelItem struct {
 	ScaleG *float64 `json:"scale_g"`
 	// FoodClass is the class the plausibility bounds use (spec 17 E).
 	FoodClass string `json:"food_class"`
+	// Levers are the lever amounts of the item as logged (spec 18.6): null =
+	// not known, 0 = the item has none.
+	Levers *Levers `json:"levers"`
 }
 
 // ModelRevised is a re-estimate of an already logged item (spec 17 B): the
@@ -55,6 +58,7 @@ type ModelRevised struct {
 	SatFatG   *float64 `json:"sat_fat_g"`
 	FiberG    *float64 `json:"fiber_g"`
 	FoodClass string   `json:"food_class"`
+	Levers    *Levers  `json:"levers"`
 }
 
 // asItem views a re-estimate as an item, for the plausibility rules.
@@ -131,7 +135,14 @@ type ModelOutput struct {
 	// "YYYY-MM-DD" | null (= today). Time is "HH:MM" | null.
 	Day  *string `json:"day"`
 	Time *string `json:"time"`
+	// ClinicalTopic (spec 18.4, the chat guard): the message reports or asks
+	// about a symptom, an injury, blood pressure, a medical or lab result, a
+	// medicine or a training limit. REQUIRED: a missing key is invalid output.
+	ClinicalTopic *bool `json:"clinical_topic"`
 }
+
+// clinical reports whether the chat guard applies.
+func (o *ModelOutput) clinical() bool { return o != nil && o.ClinicalTopic != nil && *o.ClinicalTopic }
 
 // ModelInput is everything one call sees. Food text, transcripts and photos
 // are untrusted DATA; the prompt says so and the schema has no action field.
@@ -166,6 +177,9 @@ type ModelInput struct {
 	// additive message answered with a reduction); it goes into the system
 	// message.
 	Hint string
+	// Estimator are the lever estimator factors of the targets file (spec
+	// 18.6); nil = the prompt carries no factor.
+	Estimator *EstimatorCfg
 }
 
 // LastItem is one item the model may correct.
@@ -237,6 +251,11 @@ func validateOutputFor(raw json.RawMessage, emptyLogOK bool) (*ModelOutput, erro
 		return nil, errors.New("unknown intent")
 	}
 	out.RawIntent = out.Intent
+	if out.clinical() && len(out.Items) == 0 && len(out.Corrections) == 0 && len(out.Targets) == 0 {
+		// The chat guard: with nothing to write the answer is a question,
+		// whatever intent the model named (spec 18.4).
+		out.Intent = "question"
+	}
 	if out.Day != nil && *out.Day != "today" && *out.Day != "yesterday" && !isoDateRe.MatchString(*out.Day) {
 		return nil, errors.New("day must be today, yesterday, YYYY-MM-DD or null")
 	}
@@ -326,6 +345,9 @@ func validateOutputFor(raw json.RawMessage, emptyLogOK bool) (*ModelOutput, erro
 				if _, ok := foodClasses[r.FoodClass]; !ok && r.FoodClass != "" {
 					return nil, fmt.Errorf("correction %d: unknown food_class", i)
 				}
+				if err := checkModelLevers(r.Levers); err != nil {
+					return nil, fmt.Errorf("correction %d: %v", i, err)
+				}
 			}
 		}
 		return finishWidgets(&out)
@@ -363,6 +385,9 @@ func validateOutputFor(raw json.RawMessage, emptyLogOK bool) (*ModelOutput, erro
 		if _, ok := foodClasses[it.FoodClass]; !ok && it.FoodClass != "" {
 			return nil, fmt.Errorf("item %d: unknown food_class", i)
 		}
+		if err := checkModelLevers(it.Levers); err != nil {
+			return nil, fmt.Errorf("item %d: %v", i, err)
+		}
 		req := map[string]*float64{"kcal": it.Kcal, "protein_g": it.ProteinG, "carbs_g": it.CarbsG, "fat_g": it.FatG, "sat_fat_g": it.SatFatG}
 		for k, v := range req {
 			if v == nil {
@@ -397,6 +422,23 @@ func validateOutputFor(raw json.RawMessage, emptyLogOK bool) (*ModelOutput, erro
 		}
 	}
 	return finishWidgets(&out)
+}
+
+// checkModelLevers bounds the model's lever amounts (0 to 5000 g) and the
+// brew method.
+func checkModelLevers(l *Levers) error {
+	if l == nil {
+		return nil
+	}
+	for i, p := range l.ptrs() {
+		if *p != nil && (**p < 0 || **p > 5000) {
+			return fmt.Errorf("%s out of bounds", leverKeys[i])
+		}
+	}
+	if l.BrewMethod != nil && !isBrewMethod(*l.BrewMethod) {
+		return errors.New("unknown brew_method")
+	}
+	return nil
 }
 
 func finishWidgets(out *ModelOutput) (*ModelOutput, error) {
@@ -434,6 +476,10 @@ func checkPresence(raw json.RawMessage) error {
 		if !ok || string(v) == "null" {
 			return fmt.Errorf("missing or null %s", k)
 		}
+	}
+	// clinical_topic is REQUIRED and a boolean (spec 18.4).
+	if v := strings.TrimSpace(string(top["clinical_topic"])); v != "true" && v != "false" {
+		return errors.New("missing clinical_topic")
 	}
 	var items []map[string]json.RawMessage
 	if err := json.Unmarshal(top["items"], &items); err != nil {
@@ -485,6 +531,11 @@ Task: decide whether the input logs what was eaten or drunk ("log"), corrects an
 - undo: the input asks to REMOVE, delete, cancel or undo something already logged ("remove that one", "delete the first water", "I logged the coffee twice, take one out", "I did not eat the banana"). A removal is NEVER a correction: do not turn it into an amount. Return items and corrections empty and targets: one per thing to remove; ref = the item_id from LAST LOGGED ITEMS when clear, else the item name, else "last"; names = the exact item names from LAST LOGGED ITEMS that the user's words refer to ("remove the water" -> ["water"]; include a synonym such as "sparkling water" only if the user's words plausibly mean it), empty only if the user names no food; which = "first" or "last" when the user says which of several by order or time ("I just logged", "the last one" = "last"), else null; volume_ml or portion_g = the amount the user uses to identify it ("the one with 250 ml" is volume_ml 250), else null.
 - move: the input says that something already logged belongs to ANOTHER DAY ("that was supposed to be yesterday", "move the champagne to yesterday", "the last entry was for Monday", "the alcohol was all for yesterday"). Return items and corrections empty, day = the day it belongs to, and targets: the items to move, with the same ref / names / which rules as undo; leave targets EMPTY to move every item of the newest log entry, or list names to move only some of them (for "the alcohol": the names of the alcoholic items). A move is never a new log and never a removal.
 - day and time: when the user says WHEN the food was consumed, set day ("today", "yesterday", or the date as YYYY-MM-DD worked out from Now: "last night" and "yesterday" are yesterday, "this morning" is today, "on Monday" is the most recent Monday, "on the 28th" is the most recent 28th) and time ("HH:MM") only if a clock time is stated. Otherwise day and time are null. "Log for yesterday that I drank X" is a log with day "yesterday", never a log for today.
+- levers, per item (and in revised): amounts of the item AS LOGGED, each a number or null. null = you do not know; 0 = the item has none. Give 0 for every item that plainly has none (water, chicken, rice), so that a null is rare.
+  psyllium_g: grams of psyllium husk product. beta_glucan_g: grams of oat or barley beta-glucan; a label value or an amount the user states wins; else use the ESTIMATOR FACTORS when the server gives them below; without factors give null for oats and barley unless a label or the user states the amount. nuts_g: grams of tree nuts (almond, walnut, hazelnut, cashew, pistachio, pecan, macadamia, Brazil nut), whole, chopped or as 100 % nut butter; peanuts and seeds are NOT nuts here (0). pulses_g: COOKED-equivalent grams of beans, lentils, chickpeas and dried peas; a dry weight is multiplied by the dry-to-cooked factor when the server gives it, else a dry amount gives null; soy foods are not pulses (0), they count in plant_protein_g. plant_protein_g: grams of the item's protein that come from plants (pulses, soy, nuts, seeds, grains, plant protein powder); for a food without animal protein it equals protein_g.
+  brew_method: only for coffee drinks, else null. "filtered" (paper filter, drip, pour-over, AeroPress with paper), "unfiltered" (French press, boiled, Turkish, moka pot), "espresso" (espresso and espresso-based drinks: cappuccino, flat white, latte), "instant", or "unknown" when the user does not say how the coffee was made. Never guess the method from a photo of a cup.
+- carbs_g is TOTAL carbohydrate with fibre. EU and Swiss labels state carbohydrate WITHOUT fibre: from such a label carbs_g = label carbohydrate + label fibre, and net_carbs_g = label carbohydrate.
+- clinical_topic (always set): true when the user's message, also as a follow-up to CONVERSATION TODAY, reports or asks about a symptom, an injury, pain, blood pressure, a medical or lab result, a medicine, or a training limit ("my chest hurt on the run", "my blood pressure was 150 over 95", "is that bad?" after such a message, "my knee hurts"). Else false. When it is true, still return the food items of the same message as usual (a meal named in it is logged) and leave text empty: the app answers such topics with a fixed line and never interprets them.
 - question: items, corrections and targets must be empty.
 - Mixed input ("I had X, how am I doing?") is a log of X. For log and question, corrections and targets are empty; for correct, targets is empty.
 
@@ -504,6 +555,11 @@ func systemFor(in ModelInput) string {
 	if len(in.Images) > 1 {
 		p += fmt.Sprintf("\n\nThis request has %d photos. They all show the SAME meal or item (different angles, package, nutrition label, menu): every food appears once in items, however many photos show it. Prefer label values where a label is readable.", len(in.Images))
 	}
+	if e := in.Estimator; e != nil {
+		b := e.BetaGlucanPer100
+		p += fmt.Sprintf("\n\nESTIMATOR FACTORS (from the server): beta-glucan grams per 100 g dry rolled oats %s, per 100 g oat bran %s, per 100 g barley %s, per 100 ml oat drink %s. Dry pulses to cooked: multiply the dry weight by %s.",
+			fmtNum(b.RolledOats), fmtNum(b.OatBran), fmtNum(b.Barley), fmtNum(b.OatDrink), fmtNum(e.PulsesDryToCooked))
+	}
 	if in.Hint != "" {
 		p += "\n\nServer note for this retry: " + in.Hint
 	}
@@ -514,6 +570,18 @@ func systemFor(in ModelInput) string {
 }
 
 func numOrNull() map[string]any { return map[string]any{"type": []string{"number", "null"}} }
+
+func leversSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"psyllium_g": numOrNull(), "beta_glucan_g": numOrNull(), "nuts_g": numOrNull(), "pulses_g": numOrNull(), "plant_protein_g": numOrNull(),
+			"brew_method": map[string]any{"type": []string{"string", "null"}, "enum": []any{"filtered", "unfiltered", "espresso", "instant", "unknown", nil}},
+		},
+		"required":             []string{"psyllium_g", "beta_glucan_g", "nuts_g", "pulses_g", "plant_protein_g", "brew_method"},
+		"additionalProperties": false,
+	}
+}
 
 func outputSchema() map[string]any {
 	num := map[string]any{"type": "number"}
@@ -538,8 +606,9 @@ func outputSchema() map[string]any {
 			"volume_ml":      numOrNull(),
 			"caffeine_mg":    numOrNull(),
 			"alcohol_g":      numOrNull(),
+			"levers":         leversSchema(),
 		},
-		"required":             []string{"item", "staple_key", "portion_g", "portion_basis", "kcal", "protein_g", "carbs_g", "net_carbs_g", "fat_g", "sat_fat_g", "fiber_g", "needs_fraction", "kind", "volume_ml", "caffeine_mg", "alcohol_g", "scale_g", "food_class"},
+		"required":             []string{"item", "staple_key", "portion_g", "portion_basis", "kcal", "protein_g", "carbs_g", "net_carbs_g", "fat_g", "sat_fat_g", "fiber_g", "needs_fraction", "kind", "volume_ml", "caffeine_mg", "alcohol_g", "scale_g", "food_class", "levers"},
 		"additionalProperties": false,
 	}
 	revised := map[string]any{
@@ -548,8 +617,9 @@ func outputSchema() map[string]any {
 			"item": map[string]any{"type": "string"}, "portion_g": numOrNull(), "kcal": num, "protein_g": num, "carbs_g": num,
 			"net_carbs_g": numOrNull(), "fat_g": num, "sat_fat_g": num, "fiber_g": numOrNull(),
 			"food_class": map[string]any{"type": "string", "enum": foodClassNames},
+			"levers":     leversSchema(),
 		},
-		"required":             []string{"item", "portion_g", "kcal", "protein_g", "carbs_g", "net_carbs_g", "fat_g", "sat_fat_g", "fiber_g", "food_class"},
+		"required":             []string{"item", "portion_g", "kcal", "protein_g", "carbs_g", "net_carbs_g", "fat_g", "sat_fat_g", "fiber_g", "food_class", "levers"},
 		"additionalProperties": false,
 	}
 	target := map[string]any{
@@ -582,16 +652,17 @@ func outputSchema() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"intent":      map[string]any{"type": "string", "enum": []string{"log", "question", "correct", "undo", "move"}},
-			"day":         map[string]any{"type": []string{"string", "null"}},
-			"time":        map[string]any{"type": []string{"string", "null"}},
-			"targets":     map[string]any{"type": "array", "items": target},
-			"items":       map[string]any{"type": "array", "items": item},
-			"corrections": map[string]any{"type": "array", "items": correction},
-			"text":        map[string]any{"type": "string"},
-			"widgets":     map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": widgetNames}},
+			"intent":         map[string]any{"type": "string", "enum": []string{"log", "question", "correct", "undo", "move"}},
+			"day":            map[string]any{"type": []string{"string", "null"}},
+			"time":           map[string]any{"type": []string{"string", "null"}},
+			"targets":        map[string]any{"type": "array", "items": target},
+			"items":          map[string]any{"type": "array", "items": item},
+			"corrections":    map[string]any{"type": "array", "items": correction},
+			"text":           map[string]any{"type": "string"},
+			"widgets":        map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": widgetNames}},
+			"clinical_topic": map[string]any{"type": "boolean"},
 		},
-		"required":             []string{"intent", "items", "text", "widgets", "corrections", "targets", "day", "time"},
+		"required":             []string{"intent", "items", "text", "widgets", "corrections", "targets", "day", "time", "clinical_topic"},
 		"additionalProperties": false,
 	}
 }
@@ -610,9 +681,10 @@ func userContent(in ModelInput) []map[string]any {
 	stb, _ := json.Marshal(sts)
 	var snap []byte
 	if in.Snapshot != nil {
-		// The whole snapshot (macros, next action, day score, week, weight,
-		// body fat, streaks, missing), so questions about any of it work.
-		snap, _ = json.Marshal(in.Snapshot)
+		// The v6 keys of the snapshot (macros, next action, day score, week,
+		// weight, body fat, streaks, missing), so questions about any of it
+		// work. No record and no clinician text ever reaches the model.
+		snap = in.Snapshot.legacyJSON()
 	}
 	lb, _ := json.Marshal(in.LastItems)
 	hb := []byte("[]")

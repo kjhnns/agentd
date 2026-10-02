@@ -47,6 +47,10 @@ type RecalValues struct {
 	Fat      float64  `json:"fat_g"`
 	SatFat   float64  `json:"sat_fat_g"`
 	Fiber    *float64 `json:"fiber_g"`
+	// Levers (spec 18.6): the item's lever amounts before or after, known
+	// keys only; BrewMethod on `to` when a re-estimate gives one.
+	Levers     map[string]float64 `json:"levers,omitempty"`
+	BrewMethod string             `json:"brew_method,omitempty"`
 }
 
 func (v RecalValues) macros() Macros {
@@ -676,6 +680,24 @@ func (s *Service) recalApplyItem(ctx context.Context, it Item, o secondOpinion, 
 		return res
 	}
 	op := s.newCorrectionOp(it, requiredKnown(delta), "recalibrate", nil)
+	// The second opinion does not estimate levers: each tagged lever scales
+	// by to.portion / from.portion when both are known, else it stays
+	// (delta 0). `levers` goes into from and to (spec 18.6).
+	ls := reduceLevers(g)
+	f := 1.0
+	if it.PortionG != nil && portion != nil && *it.PortionG > 0 {
+		f = *portion / *it.PortionG
+	}
+	var levDelta, levAfter leverVals
+	for l := range leverKeys {
+		if ls.amount[l].OK {
+			levAfter[l] = ls.amount[l].scale(f)
+			levDelta[l] = known(levAfter[l].V - ls.amount[l].V)
+		}
+	}
+	levDelta.putInto(op.Data)
+	from.Levers, to.Levers = ls.amount.asMap(), levAfter.asMap()
+	res.From, res.To = &from, &to
 	op.Data["recalibrated"] = map[string]any{"from": from, "to": to, "reason": o.Reason, "confidence": o.Confidence, "by": tag, "evidence": o.Evidence}
 	op.Data["share_after"] = 1.0
 	if portion != nil {
@@ -773,6 +795,7 @@ func (s *Service) recalRevertOp(it Item, rows []Value) (*Op, *apiError) {
 		}
 	}
 	op := s.newCorrectionOp(it, requiredKnown(rop.Macros.Neg()), revertKind, nil)
+	leversFromData(rop.Data).scale(-1).putInto(op.Data) // the negated lever deltas of the row it reverts
 	op.Data["share_after"] = 1.0
 	if p, ok := g.orig.Data["portion_g"].(float64); ok && p > 0 {
 		op.Data["portion_g_after"] = round1(p)
@@ -1074,7 +1097,9 @@ func baseRow(g *group) (recalMeta, bool) {
 	found := false
 	for _, r := range g.rows {
 		reason, _ := r.Data["reason"].(string)
-		if (reason != "recalibrate" && reason != "revise") || r.Data["source"] != "fuel" {
+		// Rows written by Fuel, and re-estimate rows of the Telegram path
+		// (food-log `fix --kcal`, the same row shape, source "agentd").
+		if (reason != "recalibrate" && reason != "revise") || (r.Data["source"] != "fuel" && !(reason == "revise" && r.Data["source"] == "agentd")) {
 			continue
 		}
 		id, _ := r.Data["op_id"].(string)

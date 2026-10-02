@@ -13,8 +13,12 @@ import (
 type dayCache struct {
 	rows     []Value
 	strength bool
-	fetched  time.Time
-	ok       bool // at least one successful read
+	// nums are the non-json values of the date, of every variable (spec
+	// 18.6): the strength sets are computed from them at each snapshot, so a
+	// changed set_variables list needs no new read.
+	nums    []numVal
+	fetched time.Time
+	ok      bool // at least one successful read
 }
 
 // Cache holds the last 35 days of Food log rows and the Body composition
@@ -28,6 +32,8 @@ type Cache struct {
 	gen      map[string]uint64 // completed refreshes per date
 	body     []Value
 	bodyAt   time.Time
+	rec      map[string][]Value // record variables: "bp", "symptom" (spec 18.4)
+	recOwn   []ownRecord        // own record rows merged on 201
 	journal  *Journal
 	now      func() time.Time
 	readTO   time.Duration
@@ -38,6 +44,13 @@ type Cache struct {
 
 func newCache(v Variables, ids VarIDs, j *Journal, now func() time.Time) *Cache {
 	return &Cache{vars: v, ids: ids, days: map[string]*dayCache{}, gen: map[string]uint64{}, journal: j, now: now, readTO: 5 * time.Second, bodyTO: 20 * time.Second}
+}
+
+// ownRecord is an own record row merged on 201, kept so a refresh that does
+// not hold it yet re-adds it (written less than 60 s ago).
+type ownRecord struct {
+	vr string
+	v  Value
 }
 
 // daySlot is a one-slot semaphore per date: waiting for it honours the
@@ -88,6 +101,9 @@ func (c *Cache) RefreshDay(ctx context.Context, date string) error {
 			if v.VariableID != "" && v.Raw != "" && v.Raw != "0" {
 				dc.strength = true
 			}
+		}
+		if v.Data == nil && v.VariableID != "" && (v.RecordDate == "" || v.RecordDate == date) {
+			dc.nums = append(dc.nums, numVal{VarID: v.VariableID, ID: v.ID, Raw: v.Raw})
 		}
 	}
 	// Collect own recent rows and publish UNDER the cache lock: a done op is
@@ -295,15 +311,91 @@ func (c *Cache) RefreshBody(ctx context.Context) error {
 		return err
 	}
 	var body []Value
+	rec := map[string][]Value{}
+	seen := map[string]bool{}
+	from := c.now().AddDate(0, 0, -181).Format("2006-01-02") // the record window: 180 days
 	for _, v := range vals {
-		if v.VariableID == c.ids.Body && v.Data != nil {
+		if v.Data == nil {
+			continue
+		}
+		switch {
+		case v.VariableID == c.ids.Body:
 			body = append(body, v)
+			seen[v.ID] = true
+		case c.ids.BP != "" && v.VariableID == c.ids.BP && v.RecordDate >= from:
+			rec["bp"] = append(rec["bp"], v)
+			seen[v.ID] = true
+		case c.ids.Symptom != "" && v.VariableID == c.ids.Symptom && v.RecordDate >= from:
+			rec["symptom"] = append(rec["symptom"], v)
+			seen[v.ID] = true
 		}
 	}
-	sort.Slice(body, func(a, b int) bool { return body[a].RecordDate < body[b].RecordDate })
 	c.mu.Lock()
-	c.body, c.bodyAt = body, c.now()
+	// The read REPLACES the cached rows; own rows written less than 60 s ago
+	// that it does not hold yet are re-added (section 14 [C8]).
+	var keep []ownRecord
+	for _, o := range c.recOwn {
+		if c.now().Sub(o.v.CreatedAt) > 60*time.Second {
+			continue
+		}
+		keep = append(keep, o)
+		if seen[o.v.ID] {
+			continue
+		}
+		if o.vr == "body" {
+			body = append(body, o.v)
+		} else {
+			rec[o.vr] = append(rec[o.vr], o.v)
+		}
+	}
+	sort.SliceStable(body, func(a, b int) bool { return body[a].RecordDate < body[b].RecordDate })
+	c.recOwn = keep
+	c.body, c.bodyAt, c.rec = body, c.now(), rec
 	c.mu.Unlock()
+	return nil
+}
+
+// mergeRecord adds an own record row after its 201, by value id.
+func (c *Cache) mergeRecord(vr string, v Value) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rows := c.body
+	if vr != "body" {
+		rows = c.rec[vr]
+	}
+	for _, r := range rows {
+		if r.ID == v.ID {
+			return
+		}
+	}
+	c.recOwn = append(c.recOwn, ownRecord{vr, v})
+	if vr == "body" {
+		c.body = append(append([]Value(nil), c.body...), v)
+		return
+	}
+	if c.rec == nil {
+		c.rec = map[string][]Value{}
+	}
+	c.rec[vr] = append(c.rec[vr], v)
+}
+
+// RecordRows returns the cached rows of the record variables by var
+// ("bp", "symptom", and "body" for the waist rows).
+func (c *Cache) RecordRows() map[string][]Value {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := map[string][]Value{"body": append([]Value(nil), c.body...)}
+	for k, v := range c.rec {
+		out[k] = append([]Value(nil), v...)
+	}
+	return out
+}
+
+// numsLocked returns the non-json values of a date (the caller holds c.mu).
+func (c *Cache) numsLocked(date string) []numVal {
+	if dc := c.days[date]; dc != nil {
+		return dc.nums
+	}
 	return nil
 }
 
