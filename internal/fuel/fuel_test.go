@@ -61,6 +61,8 @@ type fakeVars struct {
 	vals      []fakeValue
 	n         int
 	posts     int
+	reads     atomic.Int64 // GET /values?date= requests
+	postsTo   map[string]int // POSTs by variable id
 	vars      []VarInfo
 	onPost    func(n int, data map[string]any) (store bool, status int) // nil = store, 201
 	failReads atomic.Bool
@@ -73,6 +75,14 @@ func newFakeVars() *fakeVars {
 		{ID: "var-prod", Name: "Food log", Type: "json"},
 		{ID: "var-body", Name: "Body composition", Type: "json"},
 		{ID: "var-push", Name: "Push ups", Type: "numeric"},
+		// v7: the record variables and the strength set variables of the tests.
+		{ID: "var-bp", Name: "Fuel e2e blood pressure", Type: "json"},
+		{ID: "var-sym", Name: "Fuel e2e symptom log", Type: "json"},
+		{ID: "var-body2", Name: "Fuel e2e body", Type: "json"},
+		{ID: "var-epush", Name: "Fuel e2e push ups", Type: "numeric"},
+		{ID: "var-epull", Name: "Fuel e2e pull ups", Type: "numeric"},
+		{ID: "var-esquat", Name: "Fuel e2e squats", Type: "numeric"},
+		{ID: "var-cold", Name: "Cold shower", Type: "numeric"},
 	}}
 }
 
@@ -92,12 +102,16 @@ func (f *fakeVars) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "data is not a JSON object", 400)
 			return
 		}
-		if _, ok := data["kcal"]; !ok && body.VariableID != "var-push" {
+		if _, ok := data["kcal"]; !ok && (body.VariableID == "var-food" || body.VariableID == "var-prod") {
 			http.Error(w, `data is missing required key "kcal"`, 400)
 			return
 		}
 		f.mu.Lock()
 		f.posts++
+		if f.postsTo == nil {
+			f.postsTo = map[string]int{}
+		}
+		f.postsTo[body.VariableID]++
 		n := f.posts
 		hook := f.onPost
 		f.mu.Unlock()
@@ -129,6 +143,9 @@ func (f *fakeVars) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		date := r.URL.Query().Get("date")
+		if date != "" {
+			f.reads.Add(1)
+		}
 		f.mu.Lock()
 		out := []map[string]any{}
 		for _, v := range f.vals {
