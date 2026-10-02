@@ -2,7 +2,7 @@
 // framework, levers, coffee, strength and the maintenance calibration, each
 // with its info link to the framework page (18.8).
 
-import { el, clear, num, clock, bar, kindWord, isOver, infoLink, dateLabel } from './util.js';
+import { el, clear, num, clock, bar, basisLine, isOver, infoLink, dateLabel } from './util.js';
 
 function card(title, right, info, ...kids) {
   return el('section', { class: 'card' }, el('div', { class: 'card-head' }, el('h3', null, title), info, right ? el('span', { class: 'right' }, right) : null), kids);
@@ -15,7 +15,7 @@ function budgetRow(b) {
       el('span', { class: 'label' }, b.label || b.key), b.provisional ? el('span', { class: 'tag' }, 'Provisional') : null, infoLink(b.info, b.label || b.key),
       el('span', { class: 'right' }, el('b', null, num(b.consumed, b.unit)), none ? ' ' + b.unit : ' / ' + num(b.target, b.unit) + ' ' + b.unit)),
     none ? null : bar(b.consumed, b.target, b.pace_target_now, isOver(b)),
-    el('div', { class: 'dim small' }, none ? (b.key === 'carbs_g' ? 'No carbohydrate floor on this day.' : 'No target.') : kindWord(b.kind) + (b.basis ? ', ' + b.basis : '') + (b.unknown_rows > 0 ? ', ' + b.unknown_rows + ' rows without a value' : '')));
+    el('div', { class: 'dim small' }, none ? (b.key === 'carbs_g' ? 'No carbohydrate floor on this day.' : 'No target.') : basisLine(b) + (b.unknown_rows > 0 ? ', ' + b.unknown_rows + ' rows without a value' : '')));
 }
 
 function coffeeWords(c) {
@@ -51,7 +51,7 @@ export function renderDashboard(ctx, box) {
     box.append(el('p', { class: 'empty' }, st.error.snapshot || 'Loading the numbers.'));
     return;
   }
-  const grid = el('div', { class: 'grid', id: 'dash-grid' });
+  const grid = el('div', { class: 'grid masonry', id: 'dash-grid' });
   const score = s.budget_score ? s.budget_score.hit + ' of ' + s.budget_score.of : '';
   const cls = s.day_class && s.day_class !== 'unknown' ? s.day_class + ' day' : '';
   grid.append(card('Budgets', [score, cls].filter(Boolean).join(' · '), null, (s.budgets || []).map(budgetRow),

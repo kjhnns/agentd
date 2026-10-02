@@ -299,10 +299,10 @@ export function createChat(ctx) {
         el('span', { class: 'at' }, clock(it.at)));
     }
     const parts = [];
-    if (it.text) parts.push(el('p', null, it.text));
     for (const b of it.blocks || []) {
       if (b.type === 'text' && b.text) parts.push(el('p', null, b.text));
     }
+    if (!parts.length && it.text) parts.push(el('p', null, it.text)); // the text is the same line as the first text block
     if ((it.items || []).length) parts.push(el('ul', { class: 'card' }, it.items.map(itemLine)));
     for (const b of it.blocks || []) {
       if (b.type === 'widget') parts.push(widget(b, newest));

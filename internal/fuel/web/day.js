@@ -5,7 +5,7 @@
 // Double writes: every action makes its client_id once, when the user acts.
 // While it runs the row is locked. A retry sends the same body.
 
-import { el, clear, clientId, localTime, num, amountOf, dateAdd, dateLabel, clock, bar, kindWord, isOver, infoLink } from './util.js';
+import { el, clear, clientId, localTime, num, amountOf, dateAdd, dateLabel, clock, bar, basisLine, isOver, infoLink } from './util.js';
 import { write } from './api.js';
 
 const UNDO_MS = 4000;
@@ -122,8 +122,8 @@ function row(ctx, item) {
       item.check ? el('span', { class: 'tag', title: String(item.check) }, 'check') : null,
       item.source && item.source !== 'fuel' ? el('span', { class: 'tag' }, item.source) : null),
     amountCell(ctx, item),
-    el('td', { class: 'n' }, num(m.kcal, 'kcal')),
-    el('td', { class: 'n' }, g(m.protein_g)),
+    el('td', { class: 'n kcal' }, num(m.kcal, 'kcal')),
+    el('td', { class: 'n prot' }, g(m.protein_g)),
     el('td', { class: 'n wide' }, g(m.carbs_g)),
     el('td', { class: 'n wide' }, g(m.fat_g)),
     el('td', { class: 'n wide' }, g(m.sat_fat_g)),
@@ -138,7 +138,7 @@ export function budgetTiles(budgets) {
       el('div', { class: 'tile-head' }, el('span', { class: 'label' }, b.label || b.key), b.provisional ? el('span', { class: 'tag' }, 'Provisional') : null, infoLink(b.info, b.label || b.key)),
       el('div', { class: 'tile-num' }, el('b', null, num(b.consumed, b.unit)), none ? ' ' + b.unit : ' / ' + num(b.target, b.unit) + ' ' + b.unit),
       none ? el('div', { class: 'dim small' }, b.key === 'carbs_g' ? 'No floor on this day' : 'No target') : bar(b.consumed, b.target, b.pace_target_now, isOver(b)),
-      none ? null : el('div', { class: 'dim small' }, kindWord(b.kind) + (b.basis ? ', ' + b.basis : '')));
+      none ? null : el('div', { class: 'dim small' }, basisLine(b)));
   }));
 }
 

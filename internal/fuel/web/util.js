@@ -14,7 +14,7 @@ export function el(tag, props, ...kids) {
       else n.setAttribute(k, String(v));
     }
   }
-  for (const kid of kids.flat()) {
+  for (const kid of kids.flat(Infinity)) {
     if (kid === null || kid === undefined || kid === false) continue;
     n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
   }
@@ -107,6 +107,12 @@ export function bar(consumed, target, pace, over) {
     b.append(t);
   }
   return b;
+}
+
+// The line under a budget bar: the kind word and the basis the server gives.
+export function basisLine(b) {
+  const basis = typeof b.basis === 'string' ? b.basis.replace(/^[\s,.]+/, '') : '';
+  return [kindWord(b.kind), basis].filter(Boolean).join(', ');
 }
 
 export function kindWord(kind) {
