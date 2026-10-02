@@ -185,3 +185,60 @@ func (a *AgentdClient) AskText(ctx context.Context, task string) (string, error)
 	}
 	return turn.Result, nil
 }
+
+// ---- a kept session (spec 21: questions through an agent session) ----
+
+// errAgentSessionGone is the answer 404 of a turn: the daemon no longer has
+// the session. The turn did NOT run.
+var errAgentSessionGone = fmt.Errorf("agent: session gone")
+
+// NewSession creates a session and returns its id. model "" lets the daemon
+// use its configured model. The session is NOT torn down by this client.
+func (a *AgentdClient) NewSession(ctx context.Context, title, model string) (string, error) {
+	req := map[string]string{"title": title}
+	if model != "" {
+		req["model"] = model
+	}
+	body, _ := json.Marshal(req)
+	code, b, err := a.do(ctx, http.MethodPost, "/sessions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	if code != http.StatusCreated && code != http.StatusOK {
+		return "", &statusError{"agent session", code}
+	}
+	var sess struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(b, &sess) != nil || sess.ID == "" {
+		return "", fmt.Errorf("agent: unreadable session answer")
+	}
+	return sess.ID, nil
+}
+
+// Turn sends one text turn to an existing session and returns the answer.
+func (a *AgentdClient) Turn(ctx context.Context, id, text string) (string, error) {
+	body, _ := json.Marshal(map[string]string{"text": text})
+	code, b, err := a.do(ctx, http.MethodPost, "/sessions/"+id+"/input", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	if code == http.StatusNotFound {
+		return "", errAgentSessionGone
+	}
+	if code != http.StatusOK {
+		return "", &statusError{"agent turn", code}
+	}
+	var turn struct {
+		Result string `json:"result"`
+	}
+	if json.Unmarshal(b, &turn) != nil {
+		return "", fmt.Errorf("agent: unreadable turn answer")
+	}
+	return turn.Result, nil
+}
+
+// Interrupt stops the running turn of a session (best effort).
+func (a *AgentdClient) Interrupt(ctx context.Context, id string) {
+	_, _, _ = a.do(ctx, http.MethodPost, "/sessions/"+id+"/interrupt", "", nil)
+}

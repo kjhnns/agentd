@@ -111,6 +111,10 @@ type Entry struct {
 	// Clinical marks a turn the chat guard handled (spec 18.4): the model
 	// text was dropped and the reply ends with the fixed line.
 	Clinical bool `json:"clinical,omitempty"`
+	// Agent is set on a question that went to the agent session (spec 21):
+	// pending | done | fallback. AgentText is the agent's answer (done).
+	Agent     string `json:"agent,omitempty"`
+	AgentText string `json:"agent_text,omitempty"`
 }
 
 // Op is one journaled row write.

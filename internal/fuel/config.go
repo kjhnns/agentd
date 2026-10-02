@@ -53,6 +53,12 @@ type DaemonConfig struct {
 	RecalibrateTimeout     string // Go duration ("10m")
 	RecalibrateMinInterval string // Go duration ("30s")
 	RecalibrateKillFile    string
+
+	// Questions through an agent session (spec 21). The agent daemon is the
+	// one of recalibrate_agentd_url and recalibrate_agentd_token.
+	QuestionBackend      string // "model" (default) | "agent"
+	QuestionAgentTimeout string // Go duration ("120s")
+	QuestionAgentModel   string // the model named in POST /sessions ("" = the daemon's)
 }
 
 // DefaultConfigPath is where fueld looks without -config.
@@ -79,6 +85,10 @@ func DefaultDaemonConfig() DaemonConfig {
 
 		RecalibrateTimeout:     "10m",
 		RecalibrateMinInterval: "30s",
+
+		QuestionBackend:      "model",
+		QuestionAgentTimeout: "120s",
+		QuestionAgentModel:   "claude-opus-5-5",
 	}
 }
 
@@ -157,6 +167,8 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 			"recalibrate_agentd_url": &c.RecalibrateAgentdURL, "recalibrate_agentd_token": &c.RecalibrateAgentdToken,
 			"recalibrate_timeout": &c.RecalibrateTimeout, "recalibrate_min_interval": &c.RecalibrateMinInterval,
 			"recalibrate_kill_file": &c.RecalibrateKillFile,
+			"question_backend":      &c.QuestionBackend, "question_agent_timeout": &c.QuestionAgentTimeout,
+			"question_agent_model": &c.QuestionAgentModel,
 		}[key]
 		if dst == nil {
 			return c, fmt.Errorf("line %d: unknown key %q", n, key)
@@ -170,17 +182,23 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 		return c, errors.New("listen is empty")
 	}
 	for k, v := range map[string]string{"recalibrate_timeout": c.RecalibrateTimeout, "recalibrate_min_interval": c.RecalibrateMinInterval,
-		"log_budget": c.LogBudget, "model_timeout": c.ModelTimeout} {
+		"log_budget": c.LogBudget, "model_timeout": c.ModelTimeout, "question_agent_timeout": c.QuestionAgentTimeout} {
 		if d, err := time.ParseDuration(v); err != nil || d <= 0 {
 			return c, fmt.Errorf("%s %q is not a positive duration", k, v)
 		}
 	}
-	if c.RecalibrateEnabled {
+	if c.QuestionBackend != "model" && c.QuestionBackend != "agent" {
+		return c, fmt.Errorf("question_backend %q is not \"model\" or \"agent\"", c.QuestionBackend)
+	}
+	if c.QuestionBackend == "agent" && c.RecalibrateAgentdToken == "" {
+		return c, errors.New("question_backend \"agent\" needs recalibrate_agentd_token")
+	}
+	if c.RecalibrateEnabled || c.QuestionBackend == "agent" {
 		u, err := url.Parse(c.RecalibrateAgentdURL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return c, fmt.Errorf("recalibrate_agentd_url %q is not an http(s) URL", c.RecalibrateAgentdURL)
 		}
-		if c.RecalibrateAgentdToken == "" {
+		if c.RecalibrateEnabled && c.RecalibrateAgentdToken == "" {
 			return c, errors.New("recalibrate_enabled needs recalibrate_agentd_token")
 		}
 	}

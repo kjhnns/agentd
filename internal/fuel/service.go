@@ -59,6 +59,8 @@ type Options struct {
 	ChatModel Model
 
 	Recal RecalOptions // second-opinion recalibration (spec section 16)
+
+	Question QuestionOptions // questions through an agent session (spec section 21)
 }
 
 // Service is the fast path. Construct with New, then Start, then Handler.
@@ -123,6 +125,8 @@ type Service struct {
 	varList        []VarInfo
 	strengthLogged string // the missing-variables line that was logged last
 
+	q questionState // the question agent: its session and its turn lock
+
 	slots chan struct{} // at most 2 logs processed at once
 	fails authFailures
 	kick  chan struct{}
@@ -179,6 +183,15 @@ func (o *Options) defaults() {
 	d(&o.Recal.Timeout, 10*time.Minute)
 	d(&o.Recal.MinInterval, 30*time.Second)
 	d(&o.Recal.Tick, 2*time.Second)
+	d(&o.Question.Timeout, 120*time.Second)
+	d(&o.Question.SyncWait, 75*time.Second)
+	if grace := o.Question.Timeout + 5*time.Second; o.Question.SyncWait > grace {
+		// A short timeout ends inside the request: wait for its fallback.
+		o.Question.SyncWait = grace
+	}
+	if o.Question.KillFile == "" {
+		o.Question.KillFile = filepath.Join(o.StateDir, "question-agent.off")
+	}
 	if o.Now == nil {
 		o.Now = func() time.Time { return time.Now().UTC() }
 	}
@@ -216,6 +229,7 @@ func New(o Options) (*Service, error) {
 		strava:  newStravaIndex(o.StravaDir),
 		inflReq: map[string]*inflightReq{},
 		slots:   make(chan struct{}, 2),
+		q:       questionState{turn: make(chan struct{}, 1)},
 		kick:    make(chan struct{}, 1),
 	}
 	rs, err := openRecalStore(filepath.Join(o.StateDir, "recal.jsonl"))
@@ -261,6 +275,9 @@ func (s *Service) materializeFeed(ctx context.Context, minAge time.Duration) {
 	for _, e := range s.journal.Entries() {
 		if now.Sub(e.CreatedAt) < minAge {
 			continue // its request may still be writing its own lines
+		}
+		if e.Agent == agentPending {
+			continue // the agent turn of this question still runs (spec 21)
 		}
 		needFeed := !s.feed.HasKey("u:"+e.ID) || !s.feed.HasKey("r:"+e.ID)
 		s.coachMu.Lock()
@@ -465,6 +482,7 @@ func (s *Service) Start(ctx context.Context) {
 			_ = s.journal.Append(journalRec{T: "state", OpID: op.ID, State: OpUncertain, At: op.LastTryOr()})
 		}
 	}
+	s.questionSweep() // a question a stop left pending is never asked again
 	s.materializeFeed(lctx, 0)
 	if lctx.Err() != nil {
 		return
@@ -1291,6 +1309,9 @@ func (s *Service) viewItem(it Item) itemView {
 // entryStatus: failed if the entry failed, pending while any op is not
 // terminal, else done.
 func (s *Service) entryStatus(e Entry) string {
+	if e.Agent == agentPending {
+		return StatusPending // a question whose agent turn still runs (spec 21)
+	}
 	if e.Intent == "move" {
 		// A move never fails as a whole: pending while any of its ops (or a
 		// cancellation they caused) is unsettled, then done; the per-item

@@ -268,6 +268,7 @@ func TestEval(t *testing.T) {
 	rows0 := len(r.h.vars.rows("var-food"))
 	resp, code, ms = r.post("how am I doing on protein today?")
 	r.add("14 question", "how am I doing on protein today?", code == 200 && resp.Intent == "question" && len(r.h.vars.rows("var-food")) == rows0, ms, lead(resp))
+	evalQuestions(r) // meta, general and plan questions (spec 21)
 	resp, code, ms = r.post("actually the walnuts were only 15 g")
 	k, _, g, _ = r.day("").of("walnut")
 	r.add("15 walnuts only 15 g", "actually the walnuts were only 15 g", code == 200 && resp.Intent == "correct" && g == 15 && between(k, 85, 110), ms, fmt.Sprintf("walnuts %sg %skcal || %s", fmtNum(g), fmtNum(k), lead(resp)))
@@ -477,4 +478,62 @@ func TestEval(t *testing.T) {
 		_ = os.WriteFile(out, b, 0o600)
 	}
 	_ = context.Background
+}
+
+// evalQuestionSet are the questions the classifier handled badly (Joe,
+// 2026-10-02: a status line only, or a generic food tip). Each must come
+// back as intent question and write nothing, so that it reaches the agent
+// (spec 21). With FUEL_EVAL_QUESTION_AGENT set (the agentd URL, token in
+// FUEL_EVAL_AGENTD_TOKEN) the answer block of the agent must be there too.
+var evalQuestionSet = []string{
+	"Are you opus?",
+	"Are you now primary agentd?",
+	"what can you do",
+	"Do you have any recommendation based on the typical restaurants that we go to? Based on my Wise receipts that I get from Gmail or Uber Eats recommendations?",
+	"Plan is to eat 30 g almonds, 20 g walnuts, 20 g cashews, what do I get",
+}
+
+func evalQuestions(r *evalRun) {
+	agent := os.Getenv("FUEL_EVAL_QUESTION_AGENT") != ""
+	for i, q := range evalQuestionSet {
+		rows0 := len(r.h.vars.rows("var-food"))
+		resp, code, ms := r.post(q)
+		tb := textBlocks(resp.Blocks)
+		ok := code == 200 && resp.Intent == "question" && len(resp.Items) == 0 && len(r.h.vars.rows("var-food")) == rows0
+		if agent {
+			ok = ok && len(tb) >= 2 && tb[len(tb)-1] != questionFallbackLine
+		}
+		r.add(fmt.Sprintf("Q%d question for the agent", i+1), q, ok, ms, fmt.Sprintf("intent=%s || %s", resp.Intent, strings.Join(tb, " | ")))
+	}
+}
+
+// TestEvalQuestions runs only the question set against the real classifier
+// (OPENAI_API_KEY and FUEL_EVAL_MODEL; FUEL_EVAL_CHAT_MODEL and
+// FUEL_EVAL_CHAT_EFFORT name the chat model of the deployment).
+func TestEvalQuestions(t *testing.T) {
+	key, model := os.Getenv("OPENAI_API_KEY"), os.Getenv("FUEL_EVAL_MODEL")
+	if key == "" || model == "" {
+		t.Skip("OPENAI_API_KEY and FUEL_EVAL_MODEL are required")
+	}
+	h := newHarness(t, func(o *Options) {
+		o.Model = &OpenAI{Key: key, Model: model, Effort: os.Getenv("FUEL_EVAL_EFFORT"), Client: &http.Client{Timeout: 170 * time.Second}}
+		if cm := os.Getenv("FUEL_EVAL_CHAT_MODEL"); cm != "" {
+			o.ChatModel = &OpenAI{Key: key, Model: cm, Effort: os.Getenv("FUEL_EVAL_CHAT_EFFORT"), Client: &http.Client{Timeout: 170 * time.Second}}
+		}
+		o.LogBudget = 240 * time.Second
+		o.ModelTimeout = 170 * time.Second
+		o.Budget = 30 * time.Second
+		if u := os.Getenv("FUEL_EVAL_QUESTION_AGENT"); u != "" {
+			o.Question = QuestionOptions{Backend: "agent", Model: "claude-opus-5-5", SyncWait: 200 * time.Second, Timeout: 180 * time.Second,
+				Agent: &AgentdClient{Base: u, Token: os.Getenv("FUEL_EVAL_AGENTD_TOKEN"), Client: &http.Client{}}}
+		}
+	})
+	r := &evalRun{h: h, t: t}
+	evalQuestions(r)
+	for _, row := range r.rows {
+		t.Logf("%-28s ok=%v %5d ms  %s  || %s", row.Step, row.OK, row.Ms, row.Message, row.Detail)
+		if !row.OK {
+			t.Errorf("%s: %s", row.Step, row.Detail)
+		}
+	}
 }

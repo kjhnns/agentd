@@ -707,7 +707,15 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 	// The chat guard (spec 18.4): on a clinical topic the model's text is
 	// dropped and never stored or shown; food in the same message is processed
 	// normally and the reply ends with the fixed line.
+	agentQ := out.Intent == "question" && len(imgs) == 0 && s.questionAgentOn()
+	if agentQ && !out.clinical() && clinicalWords(foodText) {
+		// The agent never gets blood pressure, the valve or the aorta (spec
+		// 21): the fixed line answers, also when the classifier missed it.
+		yes := true
+		out.ClinicalTopic = &yes
+	}
 	clinical := out.clinical()
+	agentQ = agentQ && !clinical
 	if clinical {
 		out.Text = ""
 		if out.Intent == "question" {
@@ -806,6 +814,13 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 	}
 	entry.UserText, entry.ModelText, entry.Widgets = foodText, modelText, out.Widgets
 	entry.NoFood = noFood
+	questionTask := ""
+	if agentQ && note == "" && len(items) == 0 && len(ops) == 0 {
+		// A question for the agent (spec 21): the entry is journaled as
+		// pending with the model text as its fallback, then the agent is asked.
+		entry.Agent = agentPending
+		questionTask = s.questionTask(foodText, preSnap, s.dayItems(date), mi.History, now, targets.loc)
+	}
 	if err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: items, Ops: ops}); err != nil {
 		switch {
 		case errors.Is(err, ErrDeadline):
@@ -827,6 +842,10 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.idem.Put(idemRec{ClientID: in.ClientID, Hash: hash, Kind: "log", At: now, EntryID: entry.ID, ItemIDs: entry.ItemIDs}); err != nil {
 		log.Printf("fuel: idem reservation for %s failed (the journal identity still holds)", entry.ID)
+	}
+	if entry.Agent == agentPending {
+		s.finishQuestion(w, entry, questionTask, map[string]int{"upload": ms(upload), "asr": ms(asrD), "model": ms(modelD), "write": ms(time.Since(tWrite))}, t0, release)
+		return
 	}
 	s.recalEnqueue(entry) // a photo log gets a second opinion (spec 16)
 	if len(ops) > 0 {
@@ -1063,7 +1082,9 @@ func (s *Service) buildLogResponse(e Entry) (LogResponse, string) {
 	if len(e.Checks) > 0 {
 		blocks = append(blocks, textBlock(strings.Join(e.Checks, " ")))
 	}
-	if e.ModelText != "" && !e.Clinical {
+	if e.Agent != "" && !e.Clinical {
+		blocks = append(blocks, questionBlocks(e)...) // a question that went to the agent (spec 21)
+	} else if e.ModelText != "" && !e.Clinical {
 		blocks = append(blocks, textBlock(e.ModelText))
 	}
 	if e.Clinical && len(states) > 0 {

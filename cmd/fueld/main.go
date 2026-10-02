@@ -125,6 +125,16 @@ func build(cfg fuel.DaemonConfig) (*fuel.Service, error) {
 		// No client timeout: each job runs under its own deadline.
 		recal.Agent = &fuel.AgentdClient{Base: cfg.RecalibrateAgentdURL, Token: tok, Client: &http.Client{}}
 	}
+	question := fuel.QuestionOptions{Backend: cfg.QuestionBackend, Model: cfg.QuestionAgentModel}
+	question.Timeout, _ = time.ParseDuration(cfg.QuestionAgentTimeout)
+	if cfg.QuestionBackend == "agent" {
+		tok := fuel.ResolveSecret(cfg.RecalibrateAgentdToken)
+		if tok == "" {
+			return nil, errors.New("recalibrate_agentd_token resolves to empty (question_backend \"agent\")")
+		}
+		// No client timeout: each question turn runs under its own deadline.
+		question.Agent = &fuel.AgentdClient{Base: cfg.RecalibrateAgentdURL, Token: tok, Client: &http.Client{}}
+	}
 	logBudget, _ := time.ParseDuration(cfg.LogBudget)
 	modelTimeout, _ := time.ParseDuration(cfg.ModelTimeout)
 	var chat fuel.Model
@@ -137,6 +147,7 @@ func build(cfg fuel.DaemonConfig) (*fuel.Service, error) {
 	}
 	return fuel.New(fuel.Options{
 		Recal:        recal,
+		Question:     question,
 		ChatModel:    chat,
 		Token:        fuel.ResolveSecret(cfg.Token),
 		Vars:         &fuel.VariablesHTTP{Base: cfg.VariablesURL, Key: varsKey, Client: &http.Client{Timeout: 30 * time.Second}},
