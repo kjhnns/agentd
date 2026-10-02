@@ -111,6 +111,28 @@ func goldenSubset(path string, want, got any, diffs *[]string) {
 		}
 	case []any:
 		g, ok := got.([]any)
+		if ok && strings.HasSuffix(path, ".blocks") {
+			// The ONE intended difference to v6 (spec 22.12, Joe 2026-10-02):
+			// a reply has no fixed status line. The v6 blocks without their
+			// status text must be in the reply, in order; a reply may have
+			// more text blocks (GET /fuel/entry now carries the model text).
+			w = goldenBlocksNoStatus(w)
+			j := 0
+			for i := range w {
+				found := false
+				var last []string
+				for ; j < len(g) && !found; j++ {
+					var d []string
+					goldenSubset(fmt.Sprintf("%s[%d]", path, i), w[i], g[j], &d)
+					found = len(d) == 0
+					last = d
+				}
+				if !found {
+					*diffs = append(*diffs, fmt.Sprintf("%s: the v6 block %d is not in the reply (%s)", path, i, strings.Join(last, "; ")))
+				}
+			}
+			return
+		}
 		if !ok || len(g) != len(w) {
 			*diffs = append(*diffs, fmt.Sprintf("%s: want an array of %d, got %v", path, len(w), got))
 			return
@@ -119,6 +141,10 @@ func goldenSubset(path string, want, got any, diffs *[]string) {
 			goldenSubset(fmt.Sprintf("%s[%d]", path, i), w[i], g[i], diffs)
 		}
 	default:
+		if ws, ok := want.(string); ok && strings.HasSuffix(path, ".text") {
+			// The text of a button reply: v6 ended it with the status sentence.
+			want = strings.TrimSpace(goldenStatusRe.ReplaceAllString(ws, ""))
+		}
 		if !reflect.DeepEqual(want, got) {
 			*diffs = append(*diffs, fmt.Sprintf("%s: v6 has %v, got %v", path, want, got))
 		}
@@ -276,6 +302,9 @@ func pruneValue(dec *json.Decoder, want any, out *bytes.Buffer) {
 			kb, _ := json.Marshal(key)
 			out.Write(kb)
 			out.WriteByte(':')
+			if key == "blocks" {
+				wv = nil // blocks are matched in order, not by position (goldenSubset); they carry no random id
+			}
 			pruneValue(dec, wv, out)
 		}
 		_, _ = dec.Token()
@@ -342,4 +371,32 @@ func TestGoldenV6(t *testing.T) {
 			t.Error(d)
 		}
 	}
+}
+
+var goldenStatusRe = regexp.MustCompile(`(^| )(\S[^.:]*: )?Protein [0-9.]+( of [0-9.]+)? g, [^.]*\.$`)
+
+// goldenBlocksNoStatus removes the status sentence from v6 blocks: a text
+// block that is only the status line goes, and a lead that ends with it
+// keeps its first part.
+func goldenBlocksNoStatus(blocks []any) []any {
+	var out []any
+	for _, b := range blocks {
+		m, ok := b.(map[string]any)
+		if !ok || m["type"] != "text" {
+			out = append(out, b)
+			continue
+		}
+		text, _ := m["text"].(string)
+		cut := strings.TrimSpace(goldenStatusRe.ReplaceAllString(text, ""))
+		if cut == "" {
+			continue
+		}
+		c := map[string]any{}
+		for k, v := range m {
+			c[k] = v
+		}
+		c["text"] = cut
+		out = append(out, c)
+	}
+	return out
 }

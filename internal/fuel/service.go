@@ -61,6 +61,8 @@ type Options struct {
 	Recal RecalOptions // second-opinion recalibration (spec section 16)
 
 	Question QuestionOptions // questions through an agent session (spec section 21)
+
+	Chat ChatOptions // the agent chat broker (spec section 22)
 }
 
 // Service is the fast path. Construct with New, then Start, then Handler.
@@ -127,6 +129,8 @@ type Service struct {
 
 	q questionState // the question agent: its session and its turn lock
 
+	chat chatState // the agent chat broker: its session, its queue, its open turns
+
 	slots chan struct{} // at most 2 logs processed at once
 	fails authFailures
 	kick  chan struct{}
@@ -192,6 +196,21 @@ func (o *Options) defaults() {
 	if o.Question.KillFile == "" {
 		o.Question.KillFile = filepath.Join(o.StateDir, "question-agent.off")
 	}
+	d(&o.Chat.Timeout, 130*time.Second)
+	d(&o.Chat.SyncWait, 75*time.Second)
+	d(&o.Chat.QueueWait, 5*time.Minute)
+	if grace := o.Chat.Timeout + 5*time.Second; o.Chat.SyncWait > grace {
+		o.Chat.SyncWait = grace
+	}
+	if o.Chat.QueueMax == 0 {
+		o.Chat.QueueMax = 4
+	}
+	if o.Chat.Workspace == "" {
+		o.Chat.Workspace = "fuel"
+	}
+	if o.Chat.KillFile == "" {
+		o.Chat.KillFile = filepath.Join(o.StateDir, "chat-agent.off")
+	}
 	if o.Now == nil {
 		o.Now = func() time.Time { return time.Now().UTC() }
 	}
@@ -230,6 +249,7 @@ func New(o Options) (*Service, error) {
 		inflReq: map[string]*inflightReq{},
 		slots:   make(chan struct{}, 2),
 		q:       questionState{turn: make(chan struct{}, 1)},
+		chat:    chatState{sem: make(chan struct{}, 1), turns: map[string]*chatTurn{}, live: map[string]bool{}},
 		kick:    make(chan struct{}, 1),
 	}
 	rs, err := openRecalStore(filepath.Join(o.StateDir, "recal.jsonl"))
@@ -274,6 +294,7 @@ func (s *Service) materializeFeed(ctx context.Context, minAge time.Duration) {
 	// A pending question without a running turn becomes final first (spec
 	// 21): at a start (minAge 0) every one; the agent is never asked again.
 	s.questionSweep(minAge == 0)
+	s.chatSweep(minAge == 0) // the same for a pending agent chat entry (spec 22.7)
 	now := s.o.Now()
 	for _, e := range s.journal.Entries() {
 		if now.Sub(e.CreatedAt) < minAge {
@@ -1311,6 +1332,9 @@ func (s *Service) viewItem(it Item) itemView {
 // entryStatus: failed if the entry failed, pending while any op is not
 // terminal, else done.
 func (s *Service) entryStatus(e Entry) string {
+	if e.Chat == chatAgent {
+		return s.chatStatus(e) // an entry of the agent chat (spec 22.6)
+	}
 	if e.Agent == agentPending {
 		return StatusPending // a question whose agent turn still runs (spec 21)
 	}

@@ -61,6 +61,21 @@ func (s *Service) historyOf(now time.Time, loc *time.Location, skip func(FeedIte
 			}
 			text = strings.Join(parts, " ")
 		}
+		if it.Role == "fuel" && it.ShowItems && it.EntryID != nil {
+			// What the reply logged (the cards), in words: a reply has no
+			// status line, so a log with no sentence would have no text.
+			if e, ok := s.journal.Entry(*it.EntryID); ok {
+				var names []string
+				for _, id := range e.ItemIDs {
+					if item, ok := s.journal.Item(id); ok {
+						names = append(names, item.Name)
+					}
+				}
+				if len(names) > 0 {
+					text = strings.TrimSpace("[logged: " + joinAnd(names) + "] " + text)
+				}
+			}
+		}
 		if it.Role == "user" && len(it.PhotoIDs) > 0 {
 			text = strings.TrimSpace(fmt.Sprintf("[%d photo(s)] %s", len(it.PhotoIDs), text))
 		}

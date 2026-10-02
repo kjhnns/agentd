@@ -242,3 +242,66 @@ func (a *AgentdClient) Turn(ctx context.Context, id, text string) (string, error
 func (a *AgentdClient) Interrupt(ctx context.Context, id string) {
 	_, _, _ = a.do(ctx, http.MethodPost, "/sessions/"+id+"/interrupt", "", nil)
 }
+
+// ---- the chat broker (spec 22) ----
+
+// NewSessionIn creates a session in a named workspace, with the model named
+// explicitly. The session is NOT torn down by this client.
+func (a *AgentdClient) NewSessionIn(ctx context.Context, workspace, title, model string) (string, error) {
+	req := map[string]string{"title": title}
+	if workspace != "" {
+		req["workspace"] = workspace
+	}
+	if model != "" {
+		req["model"] = model
+	}
+	body, _ := json.Marshal(req)
+	code, b, err := a.do(ctx, http.MethodPost, "/sessions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	if code != http.StatusCreated && code != http.StatusOK {
+		return "", &statusError{"agent session", code}
+	}
+	var sess struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(b, &sess) != nil || sess.ID == "" {
+		return "", fmt.Errorf("agent: unreadable session answer")
+	}
+	return sess.ID, nil
+}
+
+// Media uploads one file as a media turn (POST /sessions/:id/media) and
+// returns the path the daemon stored it at (artifact.path), where the agent
+// can read it.
+func (a *AgentdClient) Media(ctx context.Context, id string, file []byte, name, text string) (string, error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	hdr := textproto.MIMEHeader{}
+	hdr.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename=%q`, name))
+	hdr.Set("Content-Type", "image/jpeg")
+	w, _ := mw.CreatePart(hdr)
+	_, _ = w.Write(file)
+	_ = mw.WriteField("text", text)
+	_ = mw.Close()
+	code, b, err := a.do(ctx, http.MethodPost, "/sessions/"+id+"/media", mw.FormDataContentType(), &buf)
+	if err != nil {
+		return "", err
+	}
+	if code == http.StatusNotFound {
+		return "", errAgentSessionGone
+	}
+	if code != http.StatusOK {
+		return "", &statusError{"agent media turn", code}
+	}
+	var turn struct {
+		Artifact struct {
+			Path string `json:"path"`
+		} `json:"artifact"`
+	}
+	if json.Unmarshal(b, &turn) != nil || turn.Artifact.Path == "" {
+		return "", fmt.Errorf("agent: media answer without a path")
+	}
+	return turn.Artifact.Path, nil
+}

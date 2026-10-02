@@ -129,7 +129,7 @@ func TestRelogMathIdempotencyAndShape(t *testing.T) {
 	if h.model.calls != calls {
 		t.Fatal("relog called the model")
 	}
-	if resp.LatencyMs == nil || resp.Snapshot.Revision != 2 || !strings.HasPrefix(resp.Blocks[0].Text, "Protein") {
+	if resp.LatencyMs == nil || resp.Snapshot.Revision != 2 || len(resp.Blocks) != 1 || resp.Blocks[0].Widget != "macros_today" {
 		t.Fatalf("shape %+v", resp)
 	}
 	var added map[string]any

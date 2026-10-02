@@ -26,6 +26,9 @@ type itemsBody struct {
 	Time      *string           `json:"time"` // HH:MM
 	Note      string            `json:"note"` // shown as the user line of the feed
 	Items     []json.RawMessage `json:"items"`
+	// New (a turn-bound request, spec 22.5): the caller confirms that an item
+	// the duplicate guard named is MORE food, not the same food again.
+	New bool `json:"new"`
 }
 
 // itemDefaults fills the keys a caller may leave out, so that the item
@@ -107,16 +110,24 @@ func (s *Service) handleItems(w http.ResponseWriter, r *http.Request) {
 	now := s.o.Now()
 	hh := sha256.Sum256(append([]byte("items\x00"+strings.TrimSpace(body.LocalTime)+"\x00"+body.Note+"\x00"), synth...))
 	hash := hex.EncodeToString(hh[:])
-	claim, ce := s.claim(ctx, body.ClientID, "log", hash)
-	if ce != nil {
-		writeErr(w, ce)
-		return
+	turn := turnOf(r)
+	if turn != nil {
+		// A turn-bound write (spec 22.5): idempotent inside the turn.
+		if turn.replay(w, body.ClientID) {
+			return
+		}
+	} else {
+		claim, ce := s.claim(ctx, body.ClientID, "log", hash)
+		if ce != nil {
+			writeErr(w, ce)
+			return
+		}
+		if claim.replay != nil {
+			s.replayLog(ctx, w, *claim.replay)
+			return
+		}
+		defer claim.release()
 	}
-	if claim.replay != nil {
-		s.replayLog(ctx, w, *claim.replay)
-		return
-	}
-	defer claim.release()
 
 	targets, terr := s.loadTargets()
 	if terr != nil {
@@ -124,6 +135,9 @@ func (s *Service) handleItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	eatenAt := now
+	if turn != nil {
+		eatenAt = turn.at // the receipt time of the user's message, not the clock
+	}
 	if body.LocalTime != "" {
 		t, err := time.Parse(time.RFC3339, body.LocalTime)
 		if err != nil || now.Sub(t) > 48*time.Hour || t.Sub(now) > 5*time.Minute {
@@ -141,6 +155,10 @@ func (s *Service) handleItems(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		date, eatenAt = d, at
+	}
+	if turn != nil {
+		s.turnItems(ctx, w, turn, body, out, date, eatenAt, now)
+		return
 	}
 	if e := s.rateCheck(now); e != nil {
 		writeErr(w, e)
@@ -250,16 +268,29 @@ func (s *Service) handleMove(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	now := s.o.Now()
 	hash := hashOf("move", body.Day, ids)
-	claim, ce := s.claim(ctx, body.ClientID, "log", hash)
-	if ce != nil {
-		writeErr(w, ce)
-		return
+	turn := turnOf(r)
+	if turn != nil {
+		if turn.replay(w, body.ClientID) {
+			return
+		}
+		for _, id := range ids {
+			if e := turn.changed(id, "move"); e != nil {
+				writeErr(w, e)
+				return
+			}
+		}
+	} else {
+		claim, ce := s.claim(ctx, body.ClientID, "log", hash)
+		if ce != nil {
+			writeErr(w, ce)
+			return
+		}
+		if claim.replay != nil {
+			s.replayLog(ctx, w, *claim.replay)
+			return
+		}
+		defer claim.release()
 	}
-	if claim.replay != nil {
-		s.replayLog(ctx, w, *claim.replay)
-		return
-	}
-	defer claim.release()
 
 	// Find each item on its own day (fresh rows of that day).
 	var found []DayItem
@@ -299,7 +330,7 @@ func (s *Service) handleMove(w http.ResponseWriter, r *http.Request) {
 	}
 	day := body.Day
 	out := &ModelOutput{Intent: "move", RawIntent: "move", Day: &day}
-	s.finishMove(ctx, w, out, body.ClientID, hash, "move to "+body.Day, now, t0, map[string]int{"upload": 0, "asr": 0, "model": 0}, &movePreset{found: found, notes: notes})
+	s.finishMove(ctx, w, out, body.ClientID, hash, "move to "+body.Day, now, t0, map[string]int{"upload": 0, "asr": 0, "model": 0}, &movePreset{found: found, notes: notes, turn: turn})
 }
 
 // movePreset names the items of a move directly (POST /fuel/move); nil =
@@ -307,4 +338,78 @@ func (s *Service) handleMove(w http.ResponseWriter, r *http.Request) {
 type movePreset struct {
 	found []DayItem
 	notes []string
+	turn  *chatTurn // set for a turn-bound move (spec 22.5)
+}
+
+// turnItems is POST /fuel/items inside a turn (spec 22.5): the items become
+// items of the turn's entry, in one journal line with their rows.
+func (s *Service) turnItems(ctx context.Context, w http.ResponseWriter, t *chatTurn, body itemsBody, out *ModelOutput, date string, eatenAt, now time.Time) {
+	entry, ae := s.turnEntry(t)
+	if ae != nil {
+		writeErr(w, ae)
+		return
+	}
+	if t.newItems+len(out.Items) > 12 {
+		writeErr(w, errf(http.StatusConflict, "turn_items_full", false, "a turn takes at most 12 new items"))
+		return
+	}
+	s.freshen(ctx, date)
+	seen := map[string]bool{}
+	for _, it := range out.Items {
+		n := normName(it.Item)
+		if t.names[n] || seen[n] {
+			writeErr(w, errf(http.StatusConflict, "turn_item_exists", false, "%q was already written in this turn (or is twice in this call). To change it use fix with revised values; nothing was written", strings.TrimSpace(it.Item)))
+			return
+		}
+		seen[n] = true
+		if body.New {
+			continue
+		}
+		if d, dup := s.likelyDuplicate(t, date, it.Item); dup {
+			writeErr(w, errf(http.StatusConflict, "likely_duplicate", false,
+				"%q looks like %s (id %s), logged a few minutes ago. If it is the SAME food, use fix with revised values on that id. If the user's words say it is MORE food, repeat this call with --new. Nothing was written",
+				strings.TrimSpace(it.Item), s.describeDayItem(d), d.RowKey))
+			return
+		}
+	}
+	checks := s.problemsWith(out, implausibleAny)
+	its := s.buildItems(out, Entry{ID: entry.ID, Date: date, EatenAt: eatenAt})
+	photoRef := strings.Join(entry.PhotoIDs, ",")
+	var ops []Op
+	var opIDs, itemIDs, lines []string
+	first := len(entry.ItemIDs) == 0 && len(entry.FixOps) == 0 && len(entry.FixLines) == 0
+	for i := range its {
+		if why := checks[i]; why != "" {
+			its[i].Check = why
+			entry.Checks = append(entry.Checks, "Check this: "+its[i].Name+": "+why+".")
+			lines = append(lines, "check flag on "+its[i].Name+": "+why)
+		}
+		entry.ItemIDs = append(entry.ItemIDs, its[i].ID)
+		itemIDs = append(itemIDs, its[i].ID)
+		opID := newID("op_")
+		opIDs = append(opIDs, opID)
+		ops = append(ops, Op{ID: opID, Kind: "original", EntryID: entry.ID, ItemID: its[i].ID, RowItemID: its[i].ID, Date: date,
+			Data: originalRowData(its[i], opID, photoRef), Macros: its[i].Orig, CreatedAt: now, State: OpPending, Attempts: 1, LastTry: s.o.Now()})
+	}
+	entry.Intent = "log"
+	if first && date != entry.Date {
+		// The reply shows the day of the food (the v4.4 rule).
+		entry.Date, entry.DayLabel = date, dayLabel(date)
+	}
+	t.admit(body.ClientID)
+	s.stateMu.Lock()
+	err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: its, Ops: ops})
+	s.stateMu.Unlock()
+	if err != nil {
+		t.unadmit(body.ClientID)
+		writeErr(w, errf(http.StatusInternalServerError, "internal", true, "could not persist the request; nothing was written"))
+		return
+	}
+	for _, it := range out.Items {
+		t.names[normName(it.Item)] = true
+	}
+	t.newItems += len(its)
+	s.runOps(ctx, ops)
+	log.Printf("fuel: turn items entry=%s items=%d", entry.ID, len(its))
+	s.turnAnswer(ctx, w, t, date, opIDs, itemIDs, lines)
 }

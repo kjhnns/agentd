@@ -157,8 +157,8 @@ func TestQuestionAgentSuccess(t *testing.T) {
 	}
 	r := decode[LogResponse](t, rec)
 	tb := textBlocks(r.Blocks)
-	if r.Intent != "question" || r.Status != StatusDone || len(r.Items) != 0 || len(tb) != 2 ||
-		!strings.HasPrefix(tb[0], "Protein ") || !strings.Contains(tb[1], "174 kcal") || !strings.Contains(tb[1], "A plan logs nothing.") {
+	if r.Intent != "question" || r.Status != StatusDone || len(r.Items) != 0 || len(tb) != 1 ||
+		!strings.Contains(tb[0], "174 kcal") || !strings.Contains(tb[0], "A plan logs nothing.") {
 		t.Fatalf("blocks: %+v", r.Blocks)
 	}
 	if last := r.Blocks[len(r.Blocks)-1]; last.Type != "widget" || last.Widget != "macros_today" {
@@ -226,7 +226,7 @@ func TestQuestionAgentEmptyClassifierAnswer(t *testing.T) {
 	h.model.fn = func(ModelInput) string { return modelEmptyQuestion }
 	r := decode[LogResponse](t, h.logText(cid(), "Are you opus?"))
 	tb := textBlocks(r.Blocks)
-	if len(tb) != 2 || !strings.Contains(tb[1], "Opus 5.5") {
+	if len(tb) != 1 || !strings.Contains(tb[0], "Opus 5.5") {
 		t.Fatalf("blocks: %+v", tb)
 	}
 	if _, turns, _ := fa.counts(); turns != 1 {
@@ -267,7 +267,7 @@ func TestQuestionAgentSessionGone(t *testing.T) {
 	r := decode[LogResponse](t, h.logText(cid(), "q two?"))
 	tb := textBlocks(r.Blocks)
 	c, turns, tried := fa.counts()
-	if c != 2 || turns != 2 || tried != 3 || len(tb) != 2 || !strings.Contains(tb[1], "Opus 5.5") {
+	if c != 2 || turns != 2 || tried != 3 || len(tb) != 1 || !strings.Contains(tb[0], "Opus 5.5") {
 		t.Fatalf("creates %d turns %d tried %d blocks %+v", c, turns, tried, tb)
 	}
 }
@@ -281,7 +281,7 @@ func TestQuestionAgentErrorFallsBack(t *testing.T) {
 	rec := h.logText(id, "what should I eat tonight?")
 	r := decode[LogResponse](t, rec)
 	tb := textBlocks(r.Blocks)
-	if rec.Code != 200 || r.Status != StatusDone || len(tb) != 3 || tb[1] != "Beans and tofu are good sources." || tb[2] != questionFallbackLine {
+	if rec.Code != 200 || r.Status != StatusDone || len(tb) != 2 || tb[0] != "Beans and tofu are good sources." || tb[1] != questionFallbackLine {
 		t.Fatalf("%d blocks %+v", rec.Code, tb)
 	}
 	if c, turns, tried := fa.counts(); c != 1 || turns != 1 || tried != 1 {
@@ -330,7 +330,7 @@ func TestQuestionAgentTimeout(t *testing.T) {
 	fa.delay = 2 * time.Second
 	rec := h.logText(cid(), "slow one?")
 	tb := textBlocks(decode[LogResponse](t, rec).Blocks)
-	if rec.Code != 200 || len(tb) != 3 || tb[2] != questionFallbackLine {
+	if rec.Code != 200 || len(tb) != 2 || tb[1] != questionFallbackLine {
 		t.Fatalf("%d %+v", rec.Code, tb)
 	}
 	waitFor(t, "the interrupt", func() bool { fa.mu.Lock(); defer fa.mu.Unlock(); return fa.interrupt == 1 })
@@ -349,7 +349,7 @@ func TestQuestionAgentPendingThenDone(t *testing.T) {
 	rec := h.logText(id, "long lookup?")
 	r := decode[LogResponse](t, rec)
 	tb := textBlocks(r.Blocks)
-	if rec.Code != 202 || r.Status != StatusPending || r.Intent != "question" || len(tb) != 2 || tb[1] != questionPendingText {
+	if rec.Code != 202 || r.Status != StatusPending || r.Intent != "question" || len(tb) != 1 || tb[0] != questionPendingText {
 		t.Fatalf("%d %+v", rec.Code, r.Blocks)
 	}
 	if e := h.get("/fuel/entry/" + r.EntryID); e.Code != 202 {
@@ -370,7 +370,7 @@ func TestQuestionAgentPendingThenDone(t *testing.T) {
 	waitFor(t, "the feed", func() bool { return strings.Contains(h.get("/fuel/feed").Body.String(), "Opus 5.5") })
 	final := h.logText(id, "long lookup?")
 	ftb := textBlocks(decode[LogResponse](t, final).Blocks)
-	if final.Code != 200 || len(ftb) != 2 || !strings.Contains(ftb[1], "Opus 5.5") {
+	if final.Code != 200 || len(ftb) != 1 || !strings.Contains(ftb[0], "Opus 5.5") {
 		t.Fatalf("final replay: %d %+v", final.Code, ftb)
 	}
 	if feed := h.get("/fuel/feed").Body.String(); strings.Count(feed, "long lookup?") != 1 || strings.Contains(feed, questionPendingText) {
@@ -458,7 +458,7 @@ func TestQuestionAgentOffKeepsModel(t *testing.T) {
 	}
 	rec := h.logText(cid(), "how am I doing?")
 	tb := textBlocks(decode[LogResponse](t, rec).Blocks)
-	if rec.Code != 200 || len(tb) != 2 || tb[1] != "Beans and tofu are good sources." {
+	if rec.Code != 200 || len(tb) != 1 || tb[0] != "Beans and tofu are good sources." {
 		t.Fatalf("kill switch: %d %+v", rec.Code, tb)
 	}
 	if c, _, tried := fa.counts(); c != 0 || tried != 0 {
@@ -479,7 +479,7 @@ func TestQuestionAgentOffKeepsModel(t *testing.T) {
 	})
 	h2.model.fn = func(ModelInput) string { return modelQuestion }
 	tb = textBlocks(decode[LogResponse](t, h2.logText(cid(), "how am I doing?")).Blocks)
-	if len(tb) != 2 || tb[1] != "Beans and tofu are good sources." {
+	if len(tb) != 1 || tb[0] != "Beans and tofu are good sources." {
 		t.Errorf("default backend: %+v", tb)
 	}
 	if c, _, tried := fa2.counts(); c != 0 || tried != 0 {
@@ -540,7 +540,7 @@ func TestQuestionAgentOnlyQuestions(t *testing.T) {
 	h.model.fn = func(ModelInput) string { return modelQuestion }
 	body, ct := multipartBody(t, map[string]string{"client_id": cid(), "text": "is this healthy?"}, []filePart{{"image", "a.jpg", "image/jpeg", testJPEG(300, 200)}})
 	rp := decode[LogResponse](t, h.do("POST", "/fuel/log", body, ct))
-	if tb := textBlocks(rp.Blocks); rp.Intent != "question" || len(tb) != 2 || tb[1] != "Beans and tofu are good sources." {
+	if tb := textBlocks(rp.Blocks); rp.Intent != "question" || len(tb) != 1 || tb[0] != "Beans and tofu are good sources." {
 		t.Fatalf("photo question: %+v", rp.Blocks)
 	}
 	if c, _, tried := fa.counts(); c != 0 || tried != 0 {

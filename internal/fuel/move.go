@@ -2,6 +2,7 @@ package fuel
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -197,6 +198,10 @@ func (s *Service) finishMove(ctx context.Context, w http.ResponseWriter, out *Mo
 	}
 	today := s.today()
 	answer := func(date string, lines []FixLine, stand []Item, items []Item, ops []Op, release func()) {
+		if preset != nil && preset.turn != nil {
+			s.turnMove(ctx, w, preset.turn, clientID, date, lines, stand, items, ops, release)
+			return
+		}
 		entry := Entry{ID: newID("en_"), ClientID: clientID, Date: date, EatenAt: now, CreatedAt: now,
 			Intent: "move", PhotoIDs: []string{}, ReqHash: hash, UserText: userText, FixLines: lines, FixText: joinLines(lines), MoveTo: date, Clinical: out.clinical()}
 		for i := range items {
@@ -530,4 +535,72 @@ func joinAnd(xs []string) string {
 		return xs[0]
 	}
 	return strings.Join(xs[:len(xs)-1], ", ") + " and " + xs[len(xs)-1]
+}
+
+// turnMove is POST /fuel/move inside a turn (spec 22.5): the new rows and the
+// undo ops belong to the entry of the turn. A request that moves nothing
+// writes nothing.
+func (s *Service) turnMove(ctx context.Context, w http.ResponseWriter, t *chatTurn, clientID, date string, lines []FixLine, stand, items []Item, ops []Op, release func()) {
+	entry, ae := s.turnEntry(t)
+	if ae != nil {
+		release()
+		writeErr(w, ae)
+		return
+	}
+	if len(ops) == 0 {
+		release()
+		var texts []string
+		for _, l := range lines {
+			texts = append(texts, l.Text)
+		}
+		writeErr(w, errf(http.StatusConflict, "not_applicable", false, "%s", strings.Join(append(texts, "Nothing was moved."), " ")))
+		return
+	}
+	var opIDs, itemIDs, texts []string
+	for i := range items {
+		items[i].EntryID = entry.ID
+		entry.MovedIDs = append(entry.MovedIDs, items[i].ID)
+		itemIDs = append(itemIDs, items[i].ID)
+	}
+	for i := range ops {
+		if ops[i].Kind == "original" {
+			ops[i].EntryID = entry.ID
+			ops[i].Data["entry_id"] = entry.ID
+		}
+		entry.FixOps = append(entry.FixOps, ops[i].ID)
+		opIDs = append(opIDs, ops[i].ID)
+	}
+	for _, l := range lines {
+		if l.OpID != "" {
+			l.Move = date
+			texts = append(texts, "Moved "+l.Text+" to "+dayLabel(date)+".")
+		} else {
+			texts = append(texts, l.Text)
+		}
+		entry.FixLines = append(entry.FixLines, l)
+	}
+	entry.MoveTo = date
+	entry.FixText = joinLines(entry.FixLines)
+	if entry.Intent == "question" {
+		entry.Intent = "move"
+	}
+	t.admit(clientID)
+	s.stateMu.Lock()
+	err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: append(stand, items...), Ops: ops})
+	s.stateMu.Unlock()
+	release()
+	if err != nil {
+		t.unadmit(clientID)
+		writeErr(w, errf(http.StatusInternalServerError, "internal", true, "could not persist the request; nothing was written"))
+		return
+	}
+	// The pairs are (new row, undo of the old row): the old item took its
+	// move, and the new row carries the old item's history of this turn.
+	for i := 0; i+1 < len(ops); i += 2 {
+		t.mark(ops[i+1].ItemID, "move")
+		t.inherit(ops[i+1].ItemID, ops[i].ItemID)
+	}
+	s.runMoveOps(ctx, ops)
+	log.Printf("fuel: turn move entry=%s items=%d", entry.ID, len(ops)/2)
+	s.turnAnswer(ctx, w, t, t.date, opIDs, itemIDs, texts)
 }

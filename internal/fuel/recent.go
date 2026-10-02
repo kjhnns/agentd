@@ -387,16 +387,24 @@ func (s *Service) handleRelog(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	now := s.o.Now()
 	hash := fmt.Sprintf("relog|%s|%g|%s", body.Key, scale, strings.TrimSpace(body.LocalTime))
-	claim, ce := s.claim(ctx, body.ClientID, "log", hash)
-	if ce != nil {
-		writeErr(w, ce)
-		return
+	turn := turnOf(r)
+	if turn != nil {
+		// A turn-bound relog (spec 22.5): idempotent inside the turn.
+		if turn.replay(w, body.ClientID) {
+			return
+		}
+	} else {
+		claim, ce := s.claim(ctx, body.ClientID, "log", hash)
+		if ce != nil {
+			writeErr(w, ce)
+			return
+		}
+		if claim.replay != nil {
+			s.replayLog(ctx, w, *claim.replay)
+			return
+		}
+		defer claim.release()
 	}
-	if claim.replay != nil {
-		s.replayLog(ctx, w, *claim.replay)
-		return
-	}
-	defer claim.release()
 
 	targets, terr := s.loadTargets()
 	if terr != nil {
@@ -404,6 +412,9 @@ func (s *Service) handleRelog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	eatenAt := now
+	if turn != nil {
+		eatenAt = turn.at // the receipt time of the user's message
+	}
 	if body.LocalTime != "" {
 		t, err := time.Parse(time.RFC3339, body.LocalTime)
 		if err != nil {
@@ -439,6 +450,10 @@ func (s *Service) handleRelog(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "this item has unknown macros and cannot be logged again; describe it instead"))
 			return
 		}
+	}
+	if turn != nil {
+		s.turnRelog(ctx, w, turn, body.ClientID, *src, scale, date, eatenAt, now)
+		return
 	}
 	if e := s.rateCheck(now); e != nil {
 		writeErr(w, e)
@@ -507,4 +522,58 @@ func (s *Service) handleRelog(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_, _ = w.Write(append(b, '\n'))
+}
+
+// turnRelog is POST /fuel/relog inside a turn (spec 22.5): the recent item
+// becomes a new item of the turn's entry.
+func (s *Service) turnRelog(ctx context.Context, w http.ResponseWriter, t *chatTurn, clientID string, src RecentItem, scale float64, date string, eatenAt, now time.Time) {
+	entry, ae := s.turnEntry(t)
+	if ae != nil {
+		writeErr(w, ae)
+		return
+	}
+	n := normName(src.Item)
+	if t.names[n] {
+		writeErr(w, errf(http.StatusConflict, "turn_item_exists", false, "%q was already written in this turn; nothing was written", src.Item))
+		return
+	}
+	if t.newItems >= 12 {
+		writeErr(w, errf(http.StatusConflict, "turn_items_full", false, "a turn takes at most 12 new items"))
+		return
+	}
+	s.freshen(ctx, date)
+	m := src.Macros.Scale(scale)
+	it := Item{ID: newID("it_"), EntryID: entry.ID, Date: date, Name: src.Item, Basis: "repeat", Orig: m, EatenAt: eatenAt, Kind: src.Kind,
+		levers: src.levers.scale(scale), brew: src.brew}
+	if src.VolumeML != nil {
+		m.VolumeML = known(toTenth(*src.VolumeML * scale))
+		it.Orig = m
+	}
+	if src.PortionG != nil {
+		p := round1(*src.PortionG * scale)
+		it.PortionG = &p
+	}
+	first := len(entry.ItemIDs) == 0 && len(entry.FixOps) == 0 && len(entry.FixLines) == 0
+	entry.ItemIDs = append(entry.ItemIDs, it.ID)
+	entry.Intent = "log"
+	if first && date != entry.Date {
+		entry.Date, entry.DayLabel = date, dayLabel(date)
+	}
+	opID := newID("op_")
+	op := Op{ID: opID, Kind: "original", EntryID: entry.ID, ItemID: it.ID, RowItemID: it.ID, Date: date,
+		Data: originalRowData(it, opID, ""), Macros: m, CreatedAt: now, State: OpPending, Attempts: 1, LastTry: s.o.Now()}
+	t.admit(clientID)
+	s.stateMu.Lock()
+	err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: []Item{it}, Ops: []Op{op}})
+	s.stateMu.Unlock()
+	if err != nil {
+		t.unadmit(clientID)
+		writeErr(w, errf(http.StatusInternalServerError, "internal", true, "could not persist the request; nothing was written"))
+		return
+	}
+	t.names[n] = true
+	t.newItems++
+	s.runOps(ctx, []Op{op})
+	log.Printf("fuel: turn relog entry=%s", entry.ID)
+	s.turnAnswer(ctx, w, t, date, []string{opID}, []string{it.ID}, nil)
 }

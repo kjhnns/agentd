@@ -495,11 +495,18 @@ func questionBlocks(e Entry) []Block {
 // with the model text and the fallback line, never an error.
 func (s *Service) finishQuestion(w http.ResponseWriter, e Entry, task string, lat map[string]int, t0 time.Time, release, unclaim func()) {
 	done := s.questionStart(e, task, lat, t0)
+	s.answerAfterWait(w, e, done, s.o.Question.SyncWait, lat, t0, release, unclaim)
+}
+
+// answerAfterWait is the tail of POST /fuel/log for an entry whose agent
+// turn runs in the background (spec 21.7, 22.8): the log slot and the claim
+// are released, the request waits at most d, then answers 200 (final) or 202
+// (pending).
+func (s *Service) answerAfterWait(w http.ResponseWriter, e Entry, done <-chan struct{}, d time.Duration, lat map[string]int, t0 time.Time, release, unclaim func()) {
 	release()
 	// The entry is journaled and reserved: a repeat of the client_id now
 	// replays its state (202 while pending) and does not wait for this request.
 	unclaim()
-	d := s.o.Question.SyncWait
 	if rest := questionRequestCap - time.Since(t0); rest < d {
 		d = rest // the classifier step was slow: the request still ends in time
 	}

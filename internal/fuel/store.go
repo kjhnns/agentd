@@ -65,6 +65,9 @@ type FixLine struct {
 	OpID   string `json:"op_id,omitempty"`
 	ItemID string `json:"item_id,omitempty"`
 	Text   string `json:"text"`
+	// Move is the target date when the line is one item of a move inside an
+	// agent chat entry (spec 22.5); Text is then the item's name.
+	Move string `json:"move,omitempty"`
 }
 
 // KindOr is the item's kind, "food" when unset (items journaled before kinds).
@@ -115,6 +118,13 @@ type Entry struct {
 	// pending | done | fallback. AgentText is the agent's answer (done).
 	Agent     string `json:"agent,omitempty"`
 	AgentText string `json:"agent_text,omitempty"`
+	// Chat is "agent" on an entry of the agent chat broker (spec 22): every
+	// write of the turn is bound to this ONE entry. Agent is then pending |
+	// done | failed, and AgentText is the agent's answer or the failure text.
+	Chat string `json:"chat,omitempty"`
+	// MovedIDs are the new items (on the target day) of the moves of an
+	// agent chat entry. They are not items of the entry's cards.
+	MovedIDs []string `json:"moved_ids,omitempty"`
 }
 
 // Op is one journaled row write.
@@ -788,6 +798,10 @@ type FeedItem struct {
 	NoticeOp string `json:"notice_op,omitempty"`
 	// Key is the client_id of the undo / fraction a reply line belongs to.
 	Key string `json:"key,omitempty"`
+	// WriteLine is the text of the write line of an agent chat reply as it
+	// was stored (spec 22.6); the feed route replaces it with the current one.
+	// Not on the wire.
+	WriteLine string `json:"write_line,omitempty"`
 }
 
 // Feed is the append-only conversation store.

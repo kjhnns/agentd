@@ -58,14 +58,14 @@ func TestT11ChatGuard(t *testing.T) {
 	if strings.Contains(string(jb), "angina") {
 		t.Error("the model text is in the journal")
 	}
-	// clinical_topic true with one food item: the item is logged; the text
-	// blocks are the status line and the fixed line.
+	// clinical_topic true with one food item: the item is logged; the only
+	// text block is the fixed line (no status line, spec 22.12).
 	skyr := `{"item":"skyr","staple_key":null,"portion_g":200,"portion_basis":"stated","kcal":126,"protein_g":22,"carbs_g":8,"net_carbs_g":null,"fat_g":0.4,"sat_fat_g":0.2,"fiber_g":0,"needs_fraction":false}`
 	h.model.fn = func(ModelInput) string { return clinicalOut("log", skyr) }
 	rec := h.logText(cid(), "had 200 g skyr, and my knee hurts")
 	r := decode[LogResponse](t, rec)
 	tb := textBlocks(r.Blocks)
-	if rec.Code != 200 || r.Intent != "log" || len(r.Items) != 1 || len(tb) != 2 || !strings.HasPrefix(tb[0], "Protein ") || tb[1] != clinicalLine {
+	if rec.Code != 200 || r.Intent != "log" || len(r.Items) != 1 || len(tb) != 1 || tb[0] != clinicalLine {
 		t.Fatalf("log with a clinical topic: %d %+v", rec.Code, r.Blocks)
 	}
 	if strings.Contains(rec.Body.String(), "angina") || len(h.vars.rows("var-food")) != 1 {
@@ -89,7 +89,7 @@ func TestT11ChatGuard(t *testing.T) {
 	}
 	rc := decode[LogResponse](t, h.logText(cid(), "that was 100 g, and I feel dizzy"))
 	tb = textBlocks(rc.Blocks)
-	if rc.Intent != "correct" || len(tb) != 3 || !strings.HasPrefix(tb[0], "Corrected skyr to 100 g") || tb[2] != clinicalLine {
+	if rc.Intent != "correct" || len(tb) != 2 || tb[0] != "Corrected skyr to 100 g." || tb[1] != clinicalLine {
 		t.Errorf("correction with a clinical topic: %+v", tb)
 	}
 	// After a restart the stored answers are the same (nothing is rebuilt

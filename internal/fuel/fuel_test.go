@@ -456,12 +456,15 @@ func TestTextLogWritesRowsWithOpIDs(t *testing.T) {
 	if resp.Snapshot.Revision != 2 {
 		t.Fatalf("revision %d", resp.Snapshot.Revision)
 	}
-	// Digits are stripped from the model text; the status sentence leads.
-	if !strings.HasPrefix(resp.Blocks[0].Text, "Protein 32.1 of 160 g") {
-		t.Fatalf("status block %q", resp.Blocks[0].Text)
+	// The model's sentence leads (digits stripped); there is NO fixed status
+	// line block (spec 22.12): the widget carries the numbers.
+	if resp.Blocks[0].Type != "text" || resp.Blocks[0].Text != "Good protein with sources." {
+		t.Fatalf("first block %q", resp.Blocks[0].Text)
 	}
-	if strings.ContainsAny(resp.Blocks[1].Text, "0123456789") {
-		t.Fatalf("digits in model text %q", resp.Blocks[1].Text)
+	for _, b := range resp.Blocks {
+		if b.Type == "text" && strings.HasPrefix(b.Text, "Protein ") {
+			t.Fatalf("a status line block is in the reply: %q", b.Text)
+		}
 	}
 	var sawWidget bool
 	for _, b := range resp.Blocks {

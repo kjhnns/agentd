@@ -66,7 +66,7 @@ func TestLogForYesterdayExactSentence(t *testing.T) {
 	if resp.Snapshot.Date != "2026-09-30" || intake(resp.Snapshot, "alcohol_g").Consumed != 57.6 {
 		t.Fatalf("snapshot %s alcohol %v", resp.Snapshot.Date, intake(resp.Snapshot, "alcohol_g").Consumed)
 	}
-	if !strings.HasPrefix(resp.Blocks[0].Text, "Logged for Wed 30 Sep: champagne, white wine and Negroni sbagliato. Wed 30 Sep: ") {
+	if resp.Blocks[0].Text != "Logged for Wed 30 Sep: champagne, white wine and Negroni sbagliato." {
 		t.Fatalf("text %q", resp.Blocks[0].Text)
 	}
 	for _, b := range resp.Blocks {

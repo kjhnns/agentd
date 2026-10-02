@@ -89,9 +89,6 @@ func TestT20SaturatedFatBudget(t *testing.T) {
 	step(0.1, "on_pace", "near", true) // 18.4 = 80 % of 23
 	step(4.6, "on_pace", "near", true) // 23.0: at the budget is met
 	step(0.1, "over", "over", false)   // 23.1
-	if st := statusSentence(h.snap(t, "")); !strings.Contains(st, "sat fat is over the budget") {
-		t.Errorf("status line: %q", st)
-	}
 	// The week: one training day (23) and six rest days (20) = 143.
 	v := h.week(t, "")
 	w := wb(v, "sat_fat_g")
@@ -106,52 +103,56 @@ func TestT20SaturatedFatBudget(t *testing.T) {
 	}
 }
 
-// The words of 18.14: a code line with the largest sources, never "eat less".
-func TestT20SaturatedFatWords(t *testing.T) {
+// Spec 22.12 (Joe, 2026-10-02): a chat answer has NO status line and NO
+// saturated fat line by code, in any budget state. The budget state stays on
+// the wire (the snapshot) for the card, the dashboard and Today.
+func TestT20NoStatusAndNoSatFatLineInReplies(t *testing.T) {
 	sat := func(name string, g float64) string {
 		return strings.Replace(lItem(name, 100, 300, 10, 1, lv(0, 0, 0, 0, 0, nil), ""), `"sat_fat_g":1`, `"sat_fat_g":`+num(&g), 1)
 	}
 	h := newV7(t, satDoc())
 	h.strava("fresh", "Walk", 600, 0, "2026-10-01T07:00:00", h.clk.Now()) // a rest day: budget 20 g
+	clean := func(what string, blocks []Block) {
+		t.Helper()
+		for _, tb := range textBlocks(blocks) {
+			if strings.HasPrefix(tb, "Protein ") || strings.Contains(tb, "Sat fat") || strings.Contains(tb, "over the budget") || strings.Contains(tb, "Most of it") {
+				t.Errorf("%s: a status or saturated fat line is in the reply: %q", what, tb)
+			}
+		}
+	}
 	r := h.say("cottage cheese", logOf(sat("cottage cheese", 6.2)))
-	if len(textBlocks(r.Blocks)) != 1 {
-		t.Fatalf("on_pace: nothing is added: %v", textBlocks(r.Blocks))
-	}
+	clean("on_pace", r.Blocks)
 	h.say("eggs", logOf(sat("scrambled eggs", 5.1)))
-	h.say("toast", logOf(sat("toast", 0.5)))
-	r = h.say("butter and salami", logOf(sat("butter", 2.6), sat("salami", 2.6)))
-	tb := textBlocks(r.Blocks)
-	// 17 g of 20: near. Ties (2.6 g) go by row key.
-	ids := []string{r.Items[0].ItemID, r.Items[1].ItemID}
-	third := "butter"
-	if ids[1] < ids[0] {
-		third = "salami"
-	}
-	want := "Sat fat 17 of 20 g. Most of it: cottage cheese 6.2 g, scrambled eggs 5.1 g, " + third + " 2.6 g. A swap of the largest one helps most."
-	if len(tb) != 2 || tb[1] != want {
-		t.Fatalf("near:\n got %q\nwant %q", tb, want)
+	r = h.say("butter and salami", logOf(sat("butter", 3.1), sat("salami", 2.6)))
+	clean("near", r.Blocks) // 17 g of 20
+	if b := budget(r.Snapshot, "sat_fat_g"); b.Status != "near" {
+		t.Errorf("the snapshot keeps the state: %+v", b)
 	}
 	r = h.say("cheese", logOf(sat("cheddar", 6)))
-	if tb = textBlocks(r.Blocks); len(tb) != 2 || !strings.HasPrefix(tb[1], "Sat fat 23 of 20 g, over the budget. Most of it: cottage cheese 6.2 g, cheddar 6 g, scrambled eggs 5.1 g.") {
-		t.Fatalf("over: %q", tb)
+	clean("over", r.Blocks)
+	if b := budget(r.Snapshot, "sat_fat_g"); b.Status != "over" {
+		t.Errorf("the snapshot keeps the state: %+v", b)
 	}
-	if !strings.Contains(tb[0], "sat fat is over the budget") {
-		t.Errorf("status line: %q", tb[0])
+	// The reply of a log is the model's sentence and the widget, nothing else.
+	if tb := textBlocks(r.Blocks); len(tb) > 1 || r.Blocks[len(r.Blocks)-1].Widget != "macros_today" || len(r.Blocks) != len(tb)+1 {
+		t.Errorf("log reply blocks: %+v", r.Blocks)
 	}
-	// A correction shows the line after the status line.
+	// A correction: the code summary and the widget.
 	c := h.say("the cheddar was only half", corr(corrForm(r.Items[0].ItemID, `"share":0.5`)))
-	if tb = textBlocks(c.Blocks); len(tb) != 3 || !strings.HasPrefix(tb[2], "Sat fat 20 of 20 g. Most of it:") {
-		t.Fatalf("after a correction: %q", tb)
+	clean("correction", c.Blocks)
+	if tb := textBlocks(c.Blocks); len(tb) != 1 || len(c.Blocks) != 2 {
+		t.Errorf("correction blocks: %+v", c.Blocks)
+	}
+	// A drink and a question: no remark by code.
+	q := h.say("how am I doing", `{"intent":"question","items":[],"text":"You are behind on fibre.","widgets":[],"clinical_topic":false}`)
+	clean("question", q.Blocks)
+	// The button replies carry no status line either.
+	u := h.post("/fuel/undo", map[string]any{"client_id": "c0000000-undo-0001", "item_id": r.Items[0].ItemID})
+	if !strings.Contains(u.Body.String(), `"text":"Removed cheddar."`) {
+		t.Errorf("undo reply: %s", u.Body.String())
 	}
 	feed := h.get("/fuel/feed").Body.String()
-	if strings.Contains(strings.ToLower(feed), "eat less") || strings.Contains(strings.ToLower(feed), "eating less") {
-		t.Error("a reply says to eat less")
-	}
-	// With the cap form nothing is added.
-	h2 := newV7(t, weekDoc())
-	h2.say("cheese", logOf(sat("cheddar", 19)))
-	r2 := h2.say("more cheese", logOf(sat("brie", 5)))
-	if tb := textBlocks(r2.Blocks); len(tb) != 1 || !strings.Contains(tb[0], "sat fat is over the cap") {
-		t.Errorf("cap form: %q", tb)
+	if strings.Contains(feed, "Protein 1") || strings.Contains(feed, "Sat fat ") || strings.Contains(feed, "over the budget") {
+		t.Error("a feed line carries a status or saturated fat line")
 	}
 }

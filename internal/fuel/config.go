@@ -59,6 +59,15 @@ type DaemonConfig struct {
 	QuestionBackend      string // "model" (default) | "agent"
 	QuestionAgentTimeout string // Go duration ("120s")
 	QuestionAgentModel   string // the model named in POST /sessions ("" = the daemon's)
+
+	// The agent chat broker (spec 22).
+	ChatBackend        string // "estimator" (default) | "agent"
+	ChatAgentURL       string
+	ChatAgentToken     string // literal or "env:VAR": the API bearer of the agent daemon
+	ChatAgentWorkspace string
+	ChatAgentModel     string
+	ChatAgentTimeout   string // Go duration ("130s")
+	AgentOpToken       string // literal or "env:VAR": the agent token of the turn-bound routes
 }
 
 // DefaultConfigPath is where fueld looks without -config.
@@ -89,6 +98,12 @@ func DefaultDaemonConfig() DaemonConfig {
 		QuestionBackend:      "model",
 		QuestionAgentTimeout: "120s",
 		QuestionAgentModel:   "claude-opus-5-5",
+
+		ChatBackend:        "estimator",
+		ChatAgentURL:       "http://127.0.0.1:8798",
+		ChatAgentWorkspace: "fuel",
+		ChatAgentModel:     "claude-opus-5-5",
+		ChatAgentTimeout:   "130s",
 	}
 }
 
@@ -169,6 +184,9 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 			"recalibrate_kill_file": &c.RecalibrateKillFile,
 			"question_backend":      &c.QuestionBackend, "question_agent_timeout": &c.QuestionAgentTimeout,
 			"question_agent_model": &c.QuestionAgentModel,
+			"chat_backend":         &c.ChatBackend, "chat_agent_url": &c.ChatAgentURL, "chat_agent_token": &c.ChatAgentToken,
+			"chat_agent_workspace": &c.ChatAgentWorkspace, "chat_agent_model": &c.ChatAgentModel,
+			"chat_agent_timeout": &c.ChatAgentTimeout, "agent_op_token": &c.AgentOpToken,
 		}[key]
 		if dst == nil {
 			return c, fmt.Errorf("line %d: unknown key %q", n, key)
@@ -182,7 +200,8 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 		return c, errors.New("listen is empty")
 	}
 	for k, v := range map[string]string{"recalibrate_timeout": c.RecalibrateTimeout, "recalibrate_min_interval": c.RecalibrateMinInterval,
-		"log_budget": c.LogBudget, "model_timeout": c.ModelTimeout, "question_agent_timeout": c.QuestionAgentTimeout} {
+		"log_budget": c.LogBudget, "model_timeout": c.ModelTimeout, "question_agent_timeout": c.QuestionAgentTimeout,
+		"chat_agent_timeout": c.ChatAgentTimeout} {
 		if d, err := time.ParseDuration(v); err != nil || d <= 0 {
 			return c, fmt.Errorf("%s %q is not a positive duration", k, v)
 		}
@@ -204,6 +223,31 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 		}
 		if c.RecalibrateEnabled && c.RecalibrateAgentdToken == "" {
 			return c, errors.New("recalibrate_enabled needs recalibrate_agentd_token")
+		}
+	}
+	// The agent chat broker (spec 22.1).
+	if c.ChatBackend != "estimator" && c.ChatBackend != "agent" {
+		return c, fmt.Errorf("chat_backend %q is not \"estimator\" or \"agent\"", c.ChatBackend)
+	}
+	if d, _ := time.ParseDuration(c.ChatAgentTimeout); d > 300*time.Second {
+		return c, fmt.Errorf("chat_agent_timeout %q is over 300s", c.ChatAgentTimeout)
+	}
+	if c.AgentOpToken != "" && c.AgentOpToken == c.Token {
+		return c, errors.New("agent_op_token must not be the app token")
+	}
+	if c.ChatBackend == "agent" {
+		if c.ChatAgentToken == "" {
+			return c, errors.New("chat_backend \"agent\" needs chat_agent_token")
+		}
+		if c.AgentOpToken == "" {
+			return c, errors.New("chat_backend \"agent\" needs agent_op_token")
+		}
+		if c.ChatAgentWorkspace == "" || strings.ContainsAny(c.ChatAgentWorkspace, "/: ") {
+			return c, errors.New("chat_agent_workspace must be a plain name")
+		}
+		u, err := url.Parse(c.ChatAgentURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return c, fmt.Errorf("chat_agent_url %q is not an http(s) URL", c.ChatAgentURL)
 		}
 	}
 	if c.ModelProvider != "openai" {

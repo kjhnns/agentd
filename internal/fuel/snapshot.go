@@ -479,52 +479,6 @@ func bodyTrends(body []Value, date string, loc *time.Location) (Weight, BodyFat)
 	return w, bf
 }
 
-// statusSentence is the code-generated first text block (spec 14 [C16]),
-// e.g. "Protein 137 of 160 g, fibre is the gap."
-func statusSentence(s Snapshot) string {
-	var protein *MacroState
-	for i := range s.Macros {
-		if s.Macros[i].Key == "protein_g" {
-			protein = &s.Macros[i]
-		}
-	}
-	var parts []string
-	if protein != nil {
-		if protein.Target != nil {
-			parts = append(parts, fmt.Sprintf("Protein %s of %s g", fmtNum(protein.Consumed), fmtNum(*protein.Target)))
-		} else {
-			parts = append(parts, fmt.Sprintf("Protein %s g", fmtNum(protein.Consumed)))
-		}
-	}
-	// The gap: an over cap first, else the floor furthest behind its pace.
-	gap := ""
-	worst := 0.0
-	for _, m := range s.Macros {
-		if m.Kind == "cap" && m.Status == "over" {
-			gap = strings.ToLower(m.Label) + " is over the cap"
-			if m.Key == "sat_fat_g" && s.satFatBudgetForm() {
-				gap = strings.ToLower(m.Label) + " is over the budget"
-			}
-			break
-		}
-		if m.Kind == "floor" && m.Status == "behind" && m.Target != nil && m.PaceTargetNow != nil && *m.Target > 0 {
-			d := (*m.PaceTargetNow - m.Consumed) / *m.Target
-			if d > worst {
-				worst, gap = d, strings.ToLower(m.Label)+" is the gap"
-			}
-		}
-	}
-	if gap == "" {
-		gap = "on track"
-	}
-	parts = append(parts, gap)
-	out := strings.Join(parts, ", ")
-	if out != "" {
-		out = strings.ToUpper(out[:1]) + out[1:] + "."
-	}
-	return out
-}
-
 func fmtNum(f float64) string {
 	if f == math.Trunc(f) {
 		return fmt.Sprintf("%.0f", f)

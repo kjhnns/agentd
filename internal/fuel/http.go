@@ -117,7 +117,8 @@ func (s *Service) gate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if !s.authed(r) {
+		role := s.tokenRole(r)
+		if role == "" {
 			if engaged, ra := s.fails.note(s.o.Now()); engaged {
 				log.Printf("fuel: auth brake engaged, last from %s", clientIP(r))
 				e := errf(http.StatusTooManyRequests, "rate_limited", true, "too many failed attempts")
@@ -127,6 +128,17 @@ func (s *Service) gate(next http.Handler) http.Handler {
 			}
 			log.Printf("fuel: rejected %s %s from %s", r.Method, r.URL.Path, clientIP(r))
 			writeErr(w, errf(http.StatusUnauthorized, "unauthorized", false, "missing or wrong token"))
+			return
+		}
+		// The agent token (spec 22.5) opens reads and turn-bound writes only;
+		// the app token never carries a turn.
+		if role == "agent" {
+			if e := agentScope(r); e != nil {
+				writeErr(w, e)
+				return
+			}
+		} else if r.Header.Get(turnHeader) != "" {
+			writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "X-Fuel-Turn is for the agent token only"))
 			return
 		}
 		s.mu.Lock()
@@ -151,22 +163,24 @@ func (s *Service) gate(next http.Handler) http.Handler {
 func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /fuel/log", s.handleLog)
-	mux.HandleFunc("POST /fuel/undo", func(w http.ResponseWriter, r *http.Request) { s.handleMutation(w, r, "undo") })
+	mux.HandleFunc("POST /fuel/undo", s.turnBound(func(w http.ResponseWriter, r *http.Request) { s.handleMutation(w, r, "undo") }))
 	mux.HandleFunc("POST /fuel/fraction", func(w http.ResponseWriter, r *http.Request) { s.handleMutation(w, r, "fraction") })
-	mux.HandleFunc("POST /fuel/fix", func(w http.ResponseWriter, r *http.Request) { s.handleMutation(w, r, "fix") })
+	mux.HandleFunc("POST /fuel/fix", s.turnBound(func(w http.ResponseWriter, r *http.Request) { s.handleMutation(w, r, "fix") }))
 	mux.HandleFunc("POST /fuel/recalibration/revert", func(w http.ResponseWriter, r *http.Request) { s.handleMutation(w, r, revertKind) })
 	mux.HandleFunc("GET /fuel/entry/{id}", s.handleEntry)
 	mux.HandleFunc("GET /fuel/feed", s.handleFeed)
 	mux.HandleFunc("GET /fuel/photo/{id}", s.handlePhoto)
 	mux.HandleFunc("GET /fuel/snapshot", s.handleSnapshot)
 	mux.HandleFunc("GET /fuel/recent", s.handleRecent)
-	mux.HandleFunc("POST /fuel/relog", s.handleRelog)
+	mux.HandleFunc("POST /fuel/relog", s.turnBound(s.handleRelog))
 	mux.HandleFunc("GET /fuel/day", s.handleDay)
 	// v7 (spec 18.4, 18.5 and section 19): records, calibration, the week.
 	mux.HandleFunc("GET /fuel/week", s.handleWeek)
 	// Section 20: the write operations of the chat without a model call.
-	mux.HandleFunc("POST /fuel/items", s.handleItems)
-	mux.HandleFunc("POST /fuel/move", s.handleMove)
+	mux.HandleFunc("POST /fuel/items", s.turnBound(s.handleItems))
+	mux.HandleFunc("POST /fuel/move", s.turnBound(s.handleMove))
+	// Section 22: what a list of items would add (no write).
+	mux.HandleFunc("POST /fuel/preview", s.handlePreview)
 	mux.HandleFunc("POST /fuel/record", s.handleRecord)
 	mux.HandleFunc("POST /fuel/record/void", s.handleRecordVoid)
 	mux.HandleFunc("GET /fuel/record/{id}", s.handleRecordGet)
@@ -599,6 +613,13 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if s.chatAgentOn() {
+		// The agent backend (spec 22): no classifier, the agent answers the turn.
+		s.chatAccept(ctx, w, in, foodText, transcript, imgs, hash, date, eatenAt, now, t0,
+			map[string]int{"upload": ms(upload), "asr": ms(asrD), "model": 0}, release, claim.release)
+		return
+	}
+
 	// The model call (one; one retry on invalid output).
 	tModel := time.Now()
 	fresh.Wait() // the model sees the refreshed day (questions answer from it)
@@ -987,8 +1008,8 @@ func (s *Service) journalHas(entryID string) bool {
 	return ok
 }
 
-// correctBlocks renders a chat correction: the code-generated summary with
-// the status line, then macros_today with what the corrections changed.
+// correctBlocks renders a chat correction: the code-generated summary, then
+// macros_today with what the corrections changed (no status line, spec 22.12).
 func correctBlocks(s *Service, e Entry, snap Snapshot) []Block {
 	var ms []Macros
 	for _, id := range e.FixOps {
@@ -998,19 +1019,21 @@ func correctBlocks(s *Service, e Entry, snap Snapshot) []Block {
 		}
 	}
 	// The summary is its own block (re-rendered from the ops' current state
-	// wherever it is shown, the feed included), then the status line.
-	blocks := []Block{textBlock(s.correctSummary(e)), textBlock(statusSentence(snap))}
+	// wherever it is shown, the feed included).
+	blocks := []Block{textBlock(s.correctSummary(e))}
 	if b, ok := widgetBlock("macros_today", snap, addedOf(ms)); ok {
 		blocks = append(blocks, b)
 	}
 	return blocks
 }
 
-// leadText is the code-generated first block of a log reply: the status
-// line; for a log on another day "Logged for Wed 30 Sep: a, b and c." plus
-// that day's status; a refusal note or the no-food text when nothing was
-// written.
-func (s *Service) leadText(e Entry, states []ItemState, snap Snapshot) string {
+// leadText is the code-generated first block of a reply, only where code
+// must say something: a refusal note, the no-food text, the fixed clinical
+// line, or the day of a log for another day ("Logged for Wed 30 Sep: a, b
+// and c."). "" for every other reply: the answer leads and the widget
+// card carry the numbers (spec 22.12: no status line, no budget remark by
+// code).
+func (s *Service) leadText(e Entry, states []ItemState) string {
 	switch {
 	case e.Note != "":
 		return e.Note
@@ -1023,72 +1046,44 @@ func (s *Service) leadText(e Entry, states []ItemState, snap Snapshot) string {
 		for _, st := range states {
 			names = append(names, st.Item)
 		}
-		return "Logged for " + e.DayLabel + ": " + joinAnd(names) + ". " + e.DayLabel + ": " + statusSentence(snap)
+		return "Logged for " + e.DayLabel + ": " + joinAnd(names) + "."
 	}
-	return statusSentence(snap)
+	return ""
 }
 
-// clinicalLine is the fixed reply to a clinical topic in the chat (spec
-// 18.4). Fuel stores records and never interprets them.
-const clinicalLine = "Use the Records tab for that. Fuel does not interpret it."
-
-// noFoodText answers a caption-less photo in which no food was seen.
-const noFoodText = "I could not see any food in that photo. Add a word about what it is."
-
-// buildLogResponse renders an entry's current state: code-generated status
-// sentence first, the model's food commentary, then the widgets.
-func (s *Service) buildLogResponse(e Entry) (LogResponse, string) {
-	s.stateMu.RLock()
-	defer s.stateMu.RUnlock()
-	if cur, ok := s.journal.Entry(e.ID); ok {
-		e = cur
-	}
-	snap, err := s.snapshotFor(e.Date)
-	if err != nil {
-		return LogResponse{renderErr: err}, ""
-	}
-	states := s.itemStates(e)
-	var effs []Macros
-	for _, st := range states {
-		effs = append(effs, st.Effective)
-	}
-	blocks := []Block{textBlock(s.leadText(e, states, snap))}
-	// Saturated fat near or over its budget (spec 18.14): one code line with
-	// the largest sources and a swap hint. Never "eat less".
-	sat := ""
-	if wrote := len(states) > 0 || len(e.FixOps) > 0; wrote {
-		rows, _, _ := s.cache.Rows(snap.Date)
-		sat = satFatLine(snap, rows)
+// entryBlocks are the reply blocks of an entry in its CURRENT state, for
+// POST /fuel/log, GET /fuel/entry and the feed.
+func (s *Service) entryBlocks(e Entry, states []ItemState, snap Snapshot) []Block {
+	if e.Chat == chatAgent {
+		return s.chatBlocks(e, states, snap)
 	}
 	if isChatFix(e) {
-		blocks = correctBlocks(s, e, snap)
-		if sat != "" && len(blocks) >= 2 {
-			// After the status line (summary, status, [sat fat], widgets).
-			blocks = append(blocks[:2:2], append([]Block{textBlock(sat)}, blocks[2:]...)...)
-		}
+		blocks := correctBlocks(s, e, snap)
 		if e.Clinical {
 			blocks = withClinicalLine(blocks)
 		}
-		photos := e.PhotoIDs
-		if photos == nil {
-			photos = []string{}
-		}
-		return LogResponse{Status: s.entryStatus(e), EntryID: e.ID, Intent: e.Intent, Transcript: e.Transcript, PhotoIDs: photos,
-			Items: states, Blocks: blocks, Snapshot: snap}, s.entryStatus(e)
+		return blocks
 	}
-	if sat != "" {
-		blocks = append(blocks, textBlock(sat))
+	var blocks []Block
+	if lead := s.leadText(e, states); lead != "" {
+		blocks = append(blocks, textBlock(lead))
+	}
+	// The answer leads: the agent's text of a question (spec 21), else the
+	// model's sentence.
+	if e.Agent != "" && !e.Clinical {
+		blocks = append(blocks, questionBlocks(e)...)
+	} else if e.ModelText != "" && !e.Clinical {
+		blocks = append(blocks, textBlock(e.ModelText))
 	}
 	if len(e.Checks) > 0 {
 		blocks = append(blocks, textBlock(strings.Join(e.Checks, " ")))
 	}
-	if e.Agent != "" && !e.Clinical {
-		blocks = append(blocks, questionBlocks(e)...) // a question that went to the agent (spec 21)
-	} else if e.ModelText != "" && !e.Clinical {
-		blocks = append(blocks, textBlock(e.ModelText))
-	}
 	if e.Clinical && len(states) > 0 {
 		blocks = append(blocks, textBlock(clinicalLine))
+	}
+	var effs []Macros
+	for _, st := range states {
+		effs = append(effs, st.Effective)
 	}
 	widgets := e.Widgets
 	if e.Intent == "log" || (len(widgets) == 0 && !e.Clinical) {
@@ -1108,6 +1103,30 @@ func (s *Service) buildLogResponse(e Entry) (LogResponse, string) {
 			blocks = append(blocks, b)
 		}
 	}
+	return blocks
+}
+
+// clinicalLine is the fixed reply to a clinical topic in the chat (spec
+// 18.4). Fuel stores records and never interprets them.
+const clinicalLine = "Use the Records tab for that. Fuel does not interpret it."
+
+// noFoodText answers a caption-less photo in which no food was seen.
+const noFoodText = "I could not see any food in that photo. Add a word about what it is."
+
+// buildLogResponse renders an entry's current state: the answer, the code
+// lines, then the widgets (entryBlocks).
+func (s *Service) buildLogResponse(e Entry) (LogResponse, string) {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	if cur, ok := s.journal.Entry(e.ID); ok {
+		e = cur
+	}
+	snap, err := s.snapshotFor(e.Date)
+	if err != nil {
+		return LogResponse{renderErr: err}, ""
+	}
+	states := s.itemStates(e)
+	blocks := s.entryBlocks(e, states, snap)
 	status := s.entryStatus(e)
 	photos := e.PhotoIDs
 	if photos == nil {
@@ -1139,14 +1158,32 @@ func withClinicalLine(blocks []Block) []Block {
 // once (keyed, so a restart can add either line a crash lost).
 func (s *Service) appendEntryFeed(e Entry, blocks []Block) {
 	eid := e.ID
-	if !s.feed.HasKey("u:" + e.ID) {
-		userText := e.UserText
-		if _, err := s.feed.Append(FeedItem{At: e.CreatedAt, Role: "user", Text: &userText, PhotoIDs: e.PhotoIDs, EntryID: &eid, Key: "u:" + e.ID}); err != nil {
+	s.appendUserFeed(e)
+	if !s.feed.HasKey("r:" + e.ID) {
+		wl := ""
+		if e.Chat == chatAgent {
+			// The line about rows that are not saved is re-rendered from
+			// the ops' current state when the feed is read (handleFeed).
+			if cur := s.chatWriteLine(e, e.Agent == agentFailed || e.AgentText == ""); cur != "" {
+				for _, b := range blocks {
+					if b.Type == "text" && b.Text == cur {
+						wl = cur
+					}
+				}
+			}
+		}
+		if _, err := s.feed.Append(FeedItem{At: s.o.Now(), Role: "fuel", EntryID: &eid, Blocks: blocks, ShowItems: e.Intent == "log", Key: "r:" + e.ID, WriteLine: wl}); err != nil {
 			log.Printf("fuel: feed append for %s failed", e.ID)
 		}
 	}
-	if !s.feed.HasKey("r:" + e.ID) {
-		if _, err := s.feed.Append(FeedItem{At: s.o.Now(), Role: "fuel", EntryID: &eid, Blocks: blocks, ShowItems: e.Intent == "log", Key: "r:" + e.ID}); err != nil {
+}
+
+// appendUserFeed writes the user line of an entry, once.
+func (s *Service) appendUserFeed(e Entry) {
+	eid := e.ID
+	if !s.feed.HasKey("u:" + e.ID) {
+		userText := e.UserText
+		if _, err := s.feed.Append(FeedItem{At: e.CreatedAt, Role: "user", Text: &userText, PhotoIDs: e.PhotoIDs, EntryID: &eid, Key: "u:" + e.ID}); err != nil {
 			log.Printf("fuel: feed append for %s failed", e.ID)
 		}
 	}
@@ -1479,16 +1516,28 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 			hash = "fix|" + body.ItemID + "|" + hashOf(form)
 		}
 	}
-	claim, ce := s.claim(ctx, body.ClientID, kind, hash)
-	if ce != nil {
-		writeErr(w, ce)
-		return
+	turn := turnOf(r)
+	if turn != nil {
+		// A turn-bound fix or undo (spec 22.5): idempotent inside the turn.
+		if kind != "fix" && kind != "undo" {
+			writeErr(w, errf(http.StatusForbidden, "agent_scope", false, "a turn takes fix and undo only"))
+			return
+		}
+		if turn.replay(w, body.ClientID) {
+			return
+		}
+	} else {
+		claim, ce := s.claim(ctx, body.ClientID, kind, hash)
+		if ce != nil {
+			writeErr(w, ce)
+			return
+		}
+		if claim.replay != nil {
+			s.replayMutation(ctx, w, *claim.replay)
+			return
+		}
+		defer claim.release()
 	}
-	if claim.replay != nil {
-		s.replayMutation(ctx, w, *claim.replay)
-		return
-	}
-	defer claim.release()
 
 	var it Item
 	var ok bool
@@ -1523,7 +1572,11 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 	}
 	v := s.viewItem(it)
 	var ae *apiError
+	if turn != nil {
+		ae = turn.changed(it.ID, kind)
+	}
 	switch {
+	case ae != nil:
 	case v.pending:
 		ae = errf(http.StatusConflict, "pending", true, "the item is still being saved")
 	case v.failed:
@@ -1625,6 +1678,12 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 			writeErr(w, ae)
 			return
 		}
+		if o == nil && turn != nil {
+			// Already counted at that amount: nothing to write in the turn.
+			l.Unlock()
+			s.turnAnswer(ctx, w, turn, it.Date, nil, []string{it.ID}, []string{describeFix(it, nil)})
+			return
+		}
 		if o == nil {
 			// Already counted at that amount: nothing to write, but the
 			// request identity is journaled so a retry replays this answer
@@ -1688,11 +1747,50 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		op.Attempts, op.LastTry = 1, now
 		rec.Ops = []Op{*op}
 	}
+	turnLine := ""
+	if turn != nil {
+		// The write belongs to the entry of the turn (spec 22.5): a correction
+		// op of that entry, with no request identity and no feed line of its
+		// own. The turn keeps the idempotency of the call.
+		entry, tae := s.turnEntry(turn)
+		if tae != nil || op == nil {
+			l.Unlock()
+			if tae == nil {
+				tae = errf(http.StatusConflict, "not_applicable", false, "nothing to write for this item")
+			}
+			writeErr(w, tae)
+			return
+		}
+		op.ClientID, op.ReqHash = "", ""
+		rec.Ops = []Op{*op}
+		if kind == "undo" {
+			turnLine = "Removed " + it.Name + "."
+			if entry.Intent == "question" {
+				entry.Intent = "undo"
+			}
+		} else {
+			turnLine = describeFix(it, op)
+			if entry.Intent == "question" || entry.Intent == "undo" || entry.Intent == "move" {
+				entry.Intent = "correct"
+			}
+		}
+		if it.Date != entry.Date {
+			turnLine = strings.TrimSuffix(turnLine, ".") + " (logged on " + it.Date + ")."
+		}
+		entry.FixOps = append(entry.FixOps, op.ID)
+		entry.FixLines = append(entry.FixLines, FixLine{OpID: op.ID, ItemID: it.ID, Text: turnLine})
+		entry.FixText = joinLines(entry.FixLines)
+		rec.Entry = &entry
+		turn.admit(body.ClientID)
+	}
 	// Published under the exclusive render lock: a render never sees the
 	// item's new pending op or fraction choice without the rest.
 	s.stateMu.Lock()
 	err = s.journal.AppendCtx(ctx, rec)
 	s.stateMu.Unlock()
+	if err != nil && turn != nil {
+		turn.unadmit(body.ClientID)
+	}
 	if err != nil {
 		l.Unlock()
 		switch {
@@ -1705,6 +1803,14 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		default:
 			writeErr(w, errf(http.StatusInternalServerError, "internal", true, "could not persist the request; nothing was written"))
 		}
+		return
+	}
+	if turn != nil {
+		turn.mark(it.ID, kind)
+		l.Unlock()
+		s.runOps(ctx, []Op{*op})
+		log.Printf("fuel: turn %s entry=%s item=%s", kind, turn.entryID, it.ID)
+		s.turnAnswer(ctx, w, turn, it.Date, []string{op.ID}, []string{it.ID}, []string{turnLine})
 		return
 	}
 	idemBase := idemRec{ClientID: body.ClientID, Hash: hash, Kind: kind, At: now, EntryID: it.EntryID, ItemID: it.ID}
@@ -1775,7 +1881,7 @@ func (s *Service) mutationResponseLocked(it Item, kind string, f float64, op *Op
 	default:
 		lead = fmt.Sprintf("Counted %s of %s.", fractionWords(f), it.Name)
 	}
-	blocks := []Block{textBlock(lead + " " + statusSentence(snap))}
+	blocks := []Block{textBlock(lead)} // no status line (spec 22.12)
 	if b, ok := widgetBlock("macros_today", snap, added); ok {
 		blocks = append(blocks, b)
 	}
@@ -1922,24 +2028,7 @@ func (s *Service) writeEntry(w http.ResponseWriter, e Entry) {
 		return
 	}
 	states := s.itemStates(e)
-	var effs []Macros
-	for _, st := range states {
-		effs = append(effs, st.Effective)
-	}
-	blocks := []Block{textBlock(s.leadText(e, states, snap))}
-	if e.Agent != "" && !e.Clinical {
-		blocks = append(blocks, questionBlocks(e)...) // the agent's answer of a question (spec 21)
-	}
-	if isChatFix(e) {
-		blocks = correctBlocks(s, e, snap)
-		if e.Clinical {
-			blocks = withClinicalLine(blocks)
-		}
-	} else if e.Clinical && len(states) == 0 {
-		// The fixed line alone: no widget on a clinical question.
-	} else if b, ok := widgetBlock("macros_today", snap, addedOf(effs)); ok {
-		blocks = append(blocks, b)
-	}
+	blocks := s.entryBlocks(e, states, snap)
 	status := s.entryStatus(e)
 	recal := s.entryRecal(e)
 	s.stateMu.RUnlock()
@@ -2046,7 +2135,22 @@ func (s *Service) handleFeed(w http.ResponseWriter, r *http.Request) {
 	for _, it := range page {
 		fo := feedOut{ID: it.ID, At: it.At, Role: it.Role, Text: it.Text, PhotoIDs: it.PhotoIDs, EntryID: it.EntryID, Items: []ItemState{}, Blocks: it.Blocks}
 		if it.EntryID != nil && it.Role == "fuel" && len(fo.Blocks) > 0 && fo.Blocks[0].Type == "text" {
-			if e, ok := s.journal.Entry(*it.EntryID); ok && isChatFix(e) && it.Key == "r:"+e.ID {
+			if e, ok := s.journal.Entry(*it.EntryID); ok && e.Chat == chatAgent {
+				// An agent chat reply: its write line shows the ops' CURRENT state.
+				if cur := s.chatWriteLine(e, e.Agent == agentFailed || e.AgentText == ""); it.WriteLine != "" && it.Key == "r:"+e.ID && cur != it.WriteLine {
+					var blocks []Block
+					for _, b := range fo.Blocks {
+						if b.Type == "text" && b.Text == it.WriteLine {
+							if cur == "" {
+								continue
+							}
+							b.Text = cur
+						}
+						blocks = append(blocks, b)
+					}
+					fo.Blocks = blocks
+				}
+			} else if ok && isChatFix(e) && it.Key == "r:"+e.ID {
 				// A correction reply shows its ops' CURRENT state.
 				blocks := append([]Block(nil), fo.Blocks...)
 				blocks[0].Text = s.correctSummary(e)

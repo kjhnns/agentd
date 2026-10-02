@@ -168,7 +168,8 @@ func TestChatCorrections(t *testing.T) {
 	if resp.Intent != "correct" || len(resp.Items) != 1 || resp.Items[0].Effective.VolumeML.float() != 300 {
 		t.Fatalf("correct resp %+v", resp)
 	}
-	if !strings.HasPrefix(resp.Blocks[0].Text, "Corrected Water to 300 ml.") || resp.Blocks[2].Widget != "macros_today" {
+	// The summary, then the widget: no status line block (spec 22.12).
+	if resp.Blocks[0].Text != "Corrected Water to 300 ml." || len(resp.Blocks) != 2 || resp.Blocks[1].Widget != "macros_today" {
 		t.Fatalf("blocks %+v", resp.Blocks)
 	}
 	if intake(resp.Snapshot, "fluids_ml").Consumed != 300 {

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"sort"
 	"strings"
 	"time"
 )
@@ -395,63 +394,6 @@ func (s Snapshot) satFatBudgetForm() bool {
 		}
 	}
 	return false
-}
-
-// satFatLine is the code line of 18.14 for a day whose saturated fat budget
-// is near or over: the sum and the largest sources, from the day's rows.
-// "" when the file has the cap form, the target is null or the state is fine.
-func satFatLine(s Snapshot, rows []Value) string {
-	var b *Budget
-	for i := range s.Budgets {
-		if s.Budgets[i].Key == "sat_fat_g" {
-			b = &s.Budgets[i]
-		}
-	}
-	if b == nil || b.Kind != "budget" || b.Target == nil || (b.Status != "near" && b.Status != "over") {
-		return ""
-	}
-	type src struct {
-		name string
-		g    int64
-		key  string
-	}
-	var top []src
-	for _, g := range groupRows(rows) {
-		if g.orig.Data == nil || g.c.undone {
-			continue
-		}
-		v := g.c.value("sat_fat_g")
-		if !v.OK || v.V < 10 {
-			continue
-		}
-		name, _ := g.orig.Data["item"].(string)
-		if n := baseName(g); n != "" {
-			name = n
-		}
-		top = append(top, src{strings.TrimSpace(name), v.V, rowKeyOf(g)})
-	}
-	sort.SliceStable(top, func(a, b int) bool {
-		if top[a].g != top[b].g {
-			return top[a].g > top[b].g
-		}
-		return top[a].key < top[b].key
-	})
-	if len(top) > 3 {
-		top = top[:3]
-	}
-	line := fmt.Sprintf("Sat fat %s of %s g", fmtNum(b.Consumed), fmtNum(*b.Target))
-	if b.Status == "over" {
-		line += ", over the budget"
-	}
-	line += "."
-	if len(top) > 0 {
-		var parts []string
-		for _, t := range top {
-			parts = append(parts, fmt.Sprintf("%s %s g", t.name, fmtNum(float64(t.g)/10)))
-		}
-		line += " Most of it: " + strings.Join(parts, ", ") + ". A swap of the largest one helps most."
-	}
-	return line
 }
 
 // legacyJSON renders only the v6 keys of a snapshot: what the model sees.

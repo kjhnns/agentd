@@ -135,6 +135,24 @@ func build(cfg fuel.DaemonConfig) (*fuel.Service, error) {
 		// No client timeout: each question turn runs under its own deadline.
 		question.Agent = &fuel.AgentdClient{Base: cfg.RecalibrateAgentdURL, Token: tok, Client: &http.Client{}}
 	}
+	// The agent chat broker (spec 22). The agent token is set whenever the
+	// config names one, so the turn-bound routes exist before the flag.
+	chatOpts := fuel.ChatOptions{Backend: cfg.ChatBackend, Workspace: cfg.ChatAgentWorkspace, Model: cfg.ChatAgentModel,
+		OpToken: fuel.ResolveSecret(cfg.AgentOpToken)}
+	chatOpts.Timeout, _ = time.ParseDuration(cfg.ChatAgentTimeout)
+	if cfg.ChatBackend == "agent" {
+		tok := fuel.ResolveSecret(cfg.ChatAgentToken)
+		switch {
+		case tok == "":
+			return nil, errors.New("chat_agent_token resolves to empty (chat_backend \"agent\")")
+		case chatOpts.OpToken == "":
+			return nil, errors.New("agent_op_token resolves to empty (chat_backend \"agent\")")
+		case chatOpts.OpToken == fuel.ResolveSecret(cfg.Token):
+			return nil, errors.New("agent_op_token must not be the app token")
+		}
+		// No client timeout: each turn runs under its own deadline.
+		chatOpts.Agent = &fuel.AgentdClient{Base: cfg.ChatAgentURL, Token: tok, Client: &http.Client{}}
+	}
 	logBudget, _ := time.ParseDuration(cfg.LogBudget)
 	modelTimeout, _ := time.ParseDuration(cfg.ModelTimeout)
 	var chat fuel.Model
@@ -148,6 +166,7 @@ func build(cfg fuel.DaemonConfig) (*fuel.Service, error) {
 	return fuel.New(fuel.Options{
 		Recal:        recal,
 		Question:     question,
+		Chat:         chatOpts,
 		ChatModel:    chat,
 		Token:        fuel.ResolveSecret(cfg.Token),
 		Vars:         &fuel.VariablesHTTP{Base: cfg.VariablesURL, Key: varsKey, Client: &http.Client{Timeout: 30 * time.Second}},
