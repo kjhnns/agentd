@@ -239,6 +239,20 @@ func calFixture(h *harness, n int, kcal float64) {
 	h.strava("fresh", "Walk", 600, 0, "2026-10-01T07:00:00", h.clk.Now())
 }
 
+// waitCalib waits for the calibration run that a start makes for today.
+func (h *harness) waitCalib() {
+	h.t.Helper()
+	for i := 0; i < 400; i++ {
+		if _, ok := h.svc.calib.result(h.svc.today()); ok {
+			h.svc.calibMu.Lock() // and for the run to release its lock
+			h.svc.calibMu.Unlock()
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	h.t.Fatal("no calibration result after the start")
+}
+
 func TestT7CalibrationRefreshAndStore(t *testing.T) {
 	// min_days 28, max_days 28, max_age_days 14, D = 2026-10-02: a complete
 	// interval 2026-08-25 to 2026-09-21 is read in full and passes G1 and G2.
@@ -252,6 +266,7 @@ func TestT7CalibrationRefreshAndStore(t *testing.T) {
 	h.clk.Set(zurich(t, "2026-10-02 12:00"))
 	h.strava("fresh", "Walk", 600, 0, "2026-10-02T07:00:00", h.clk.Now())
 	h.restart()
+	h.waitCalib() // the run at startup is over: the count below is of one run
 	reads := h.vars.reads.Load()
 	res, ok := h.svc.RunCalibration(context.Background())
 	if !ok || res.State != "candidate" || res.Interval[0] != "2026-08-25" || res.Interval[1] != "2026-09-21" || !res.Gates.G1 || !res.Gates.G2 || res.Days != 28 {
