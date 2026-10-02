@@ -361,7 +361,12 @@ func TestQuestionAgentPendingThenDone(t *testing.T) {
 	if strings.Contains(h.get("/fuel/feed").Body.String(), "long lookup?") {
 		t.Error("the feed has lines of a pending question")
 	}
+	// A second request with the client_id, sent while the first still waits
+	// in its handler, replays the pending state at once (no wait, no 503).
 	waitFor(t, "the entry", func() bool { return h.get("/fuel/entry/"+r.EntryID).Code == 200 })
+	if eb := h.get("/fuel/entry/" + r.EntryID).Body.String(); !strings.Contains(eb, "Opus 5.5") {
+		t.Errorf("the polled entry lacks the answer: %s", eb)
+	}
 	waitFor(t, "the feed", func() bool { return strings.Contains(h.get("/fuel/feed").Body.String(), "Opus 5.5") })
 	final := h.logText(id, "long lookup?")
 	ftb := textBlocks(decode[LogResponse](t, final).Blocks)
@@ -600,5 +605,26 @@ func TestQuestionConfig(t *testing.T) {
 		if _, err := ParseDaemonConfig([]byte(base + bad)); err == nil {
 			t.Errorf("%q was accepted", bad)
 		}
+	}
+}
+
+// A repeat of the client_id while the first request still waits for the
+// agent does not wait for it: it replays the pending state (202).
+func TestQuestionAgentRepeatDuringWait(t *testing.T) {
+	h, fa := newQ(t)
+	fa.delay = 700 * time.Millisecond
+	id := cid()
+	first := make(chan int, 1)
+	go func() { first <- h.logText(id, "slow and repeated?").Code }()
+	waitFor(t, "the turn", func() bool { _, turns, _ := fa.counts(); return turns == 1 })
+	t0 := time.Now()
+	if rec := h.logText(id, "slow and repeated?"); rec.Code != 202 || time.Since(t0) > 400*time.Millisecond {
+		t.Errorf("repeat during the wait: %d after %s", rec.Code, time.Since(t0))
+	}
+	if c := <-first; c != 200 {
+		t.Errorf("first: %d", c)
+	}
+	if _, turns, tried := fa.counts(); turns != 1 || tried != 1 {
+		t.Errorf("turns %d tried %d", turns, tried)
 	}
 }

@@ -493,9 +493,12 @@ func questionBlocks(e Entry) []Block {
 // within SyncWait, else 202 with status pending: the app polls GET
 // /fuel/entry and reads the reply from the feed. An agent failure is a 200
 // with the model text and the fallback line, never an error.
-func (s *Service) finishQuestion(w http.ResponseWriter, e Entry, task string, lat map[string]int, t0 time.Time, release func()) {
+func (s *Service) finishQuestion(w http.ResponseWriter, e Entry, task string, lat map[string]int, t0 time.Time, release, unclaim func()) {
 	done := s.questionStart(e, task, lat, t0)
 	release()
+	// The entry is journaled and reserved: a repeat of the client_id now
+	// replays its state (202 while pending) and does not wait for this request.
+	unclaim()
 	d := s.o.Question.SyncWait
 	if rest := questionRequestCap - time.Since(t0); rest < d {
 		d = rest // the classifier step was slow: the request still ends in time
@@ -512,7 +515,15 @@ func (s *Service) finishQuestion(w http.ResponseWriter, e Entry, task string, la
 		writeStored(w, rec) // final and stored: a replay answers the same bytes
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), s.o.Budget)
+	// The render shares the cap of the request (at least 3 s for it).
+	rd := questionRequestCap + 10*time.Second - time.Since(t0)
+	if rd < 3*time.Second {
+		rd = 3 * time.Second
+	}
+	if rd > s.o.Budget {
+		rd = s.o.Budget
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), rd)
 	defer cancel()
 	ready := s.renderReady(ctx, e.Date)
 	resp, status := s.buildLogResponse(e)
@@ -537,5 +548,7 @@ func (s *Service) finishQuestion(w http.ResponseWriter, e Entry, task string, la
 			return
 		}
 	}
+	// The render was not ready (a day read failed): answered but not
+	// stored, as for every entry (section 14); the recovery stores it later.
 	writeJSON(w, http.StatusOK, resp)
 }

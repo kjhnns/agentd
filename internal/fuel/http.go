@@ -844,7 +844,7 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 		log.Printf("fuel: idem reservation for %s failed (the journal identity still holds)", entry.ID)
 	}
 	if entry.Agent == agentPending {
-		s.finishQuestion(w, entry, questionTask, map[string]int{"upload": ms(upload), "asr": ms(asrD), "model": ms(modelD), "write": ms(time.Since(tWrite))}, t0, release)
+		s.finishQuestion(w, entry, questionTask, map[string]int{"upload": ms(upload), "asr": ms(asrD), "model": ms(modelD), "write": ms(time.Since(tWrite))}, t0, release, claim.release)
 		return
 	}
 	s.recalEnqueue(entry) // a photo log gets a second opinion (spec 16)
@@ -1927,6 +1927,9 @@ func (s *Service) writeEntry(w http.ResponseWriter, e Entry) {
 		effs = append(effs, st.Effective)
 	}
 	blocks := []Block{textBlock(s.leadText(e, states, snap))}
+	if e.Agent != "" && !e.Clinical {
+		blocks = append(blocks, questionBlocks(e)...) // the agent's answer of a question (spec 21)
+	}
 	if isChatFix(e) {
 		blocks = correctBlocks(s, e, snap)
 		if e.Clinical {
