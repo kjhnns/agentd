@@ -30,6 +30,11 @@ type dayPlan struct {
 	CarbsTarget   *float64
 	CarbsBasis    *string
 	CarbsIsSchema bool // a schema 2 file (a carbohydrate budget exists)
+
+	// SatFatTarget is the saturated fat target of the date: the fixed cap,
+	// or with the budget form a share of the day's energy target (18.14).
+	SatFatTarget *float64
+	SatFatBasis  *string
 }
 
 // stravaStale is the section 9 predicate on the files alone.
@@ -132,6 +137,17 @@ func planDay(t *Targets, date, today string, acts []Activity, stravaAt, now time
 			p.RunAdjust = fptr(roundTo(adj, 10))
 			p.EnergyTarget = fptr(roundTo(m.Kcal+adj-*e.DeficitKcal, 10))
 		}
+	}
+
+	// Saturated fat (18.14).
+	if t.SatFat.Kind == "budget" && t.SatFat.EnergyFrac != nil {
+		if p.EnergyTarget != nil {
+			p.SatFatTarget = fptr(math.Round(*t.SatFat.EnergyFrac * *p.EnergyTarget / 9))
+			b := fmt.Sprintf("%s %% of %s kcal", fmtNum(round1(*t.SatFat.EnergyFrac*100)), fmtNum(*p.EnergyTarget))
+			p.SatFatBasis = &b
+		}
+	} else {
+		p.SatFatTarget = t.SatFat.For(p.DayType)
 	}
 	return p
 }

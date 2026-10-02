@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 )
@@ -172,7 +173,7 @@ func (in *snapInput) day(date string) *dayData {
 // budgetChecks are the budget_score checks, by KEY (18.7); a nil entry is a
 // skipped check (target null).
 func budgetChecks(t *Targets, plan dayPlan, tot DayTotals) map[string]*bool {
-	out := dayChecks(t, plan.DayType, tot, plan.EnergyTarget)
+	out := dayChecks(t, plan.DayType, tot, plan.EnergyTarget, plan.SatFatTarget)
 	delete(out, "net_carbs_g")
 	if tg := plan.CarbsTarget; tg != nil {
 		v := float64(tot.Sum["carbs_g"])/10 >= *tg
@@ -237,6 +238,11 @@ func (in *snapInput) fillV7(s *Snapshot, isToday bool, minute, el float64) {
 		if m.Key == "kcal" {
 			b.Provisional = plan.EnergyState == "provisional"
 			b.Basis = plan.EnergyBasis
+		}
+		if m.Key == "sat_fat_g" && t.SatFat.Kind == "budget" {
+			// The budget form (18.14): its own kind and the status "near".
+			b.Kind, b.Basis = "budget", plan.SatFatBasis
+			b.Status = satFatStatus(m.Consumed, m.Target)
 		}
 		s.Budgets = append(s.Budgets, b)
 	}
@@ -360,6 +366,92 @@ func (in *snapInput) fillV7(s *Snapshot, isToday bool, minute, el float64) {
 		s.Info.Base = t.V2.InfoURL
 	}
 	s.WeekBudgets = in.weekCompact()
+}
+
+// satFatStatus is the status of the saturated fat budget: over above the
+// budget, near from 80 % of it, else on_pace (at the budget is "near": the
+// cap comparison counts it as met).
+func satFatStatus(consumed float64, target *float64) string {
+	if target == nil {
+		return "on_pace"
+	}
+	// Integer tenths: 18.4 g is 80 % of 23 g exactly.
+	c, t := toTenth(consumed), toTenth(*target)
+	switch {
+	case c > t:
+		return "over"
+	case c*10 >= t*8:
+		return "near"
+	}
+	return "on_pace"
+}
+
+// satFatBudgetForm reports whether the snapshot's saturated fat budget has
+// the budget form.
+func (s Snapshot) satFatBudgetForm() bool {
+	for _, b := range s.Budgets {
+		if b.Key == "sat_fat_g" {
+			return b.Kind == "budget"
+		}
+	}
+	return false
+}
+
+// satFatLine is the code line of 18.14 for a day whose saturated fat budget
+// is near or over: the sum and the largest sources, from the day's rows.
+// "" when the file has the cap form, the target is null or the state is fine.
+func satFatLine(s Snapshot, rows []Value) string {
+	var b *Budget
+	for i := range s.Budgets {
+		if s.Budgets[i].Key == "sat_fat_g" {
+			b = &s.Budgets[i]
+		}
+	}
+	if b == nil || b.Kind != "budget" || b.Target == nil || (b.Status != "near" && b.Status != "over") {
+		return ""
+	}
+	type src struct {
+		name string
+		g    int64
+		key  string
+	}
+	var top []src
+	for _, g := range groupRows(rows) {
+		if g.orig.Data == nil || g.c.undone {
+			continue
+		}
+		v := g.c.value("sat_fat_g")
+		if !v.OK || v.V < 10 {
+			continue
+		}
+		name, _ := g.orig.Data["item"].(string)
+		if n := baseName(g); n != "" {
+			name = n
+		}
+		top = append(top, src{strings.TrimSpace(name), v.V, rowKeyOf(g)})
+	}
+	sort.SliceStable(top, func(a, b int) bool {
+		if top[a].g != top[b].g {
+			return top[a].g > top[b].g
+		}
+		return top[a].key < top[b].key
+	})
+	if len(top) > 3 {
+		top = top[:3]
+	}
+	line := fmt.Sprintf("Sat fat %s of %s g", fmtNum(b.Consumed), fmtNum(*b.Target))
+	if b.Status == "over" {
+		line += ", over the budget"
+	}
+	line += "."
+	if len(top) > 0 {
+		var parts []string
+		for _, t := range top {
+			parts = append(parts, fmt.Sprintf("%s %s g", t.name, fmtNum(float64(t.g)/10)))
+		}
+		line += " Most of it: " + strings.Join(parts, ", ") + ". A swap of the largest one helps most."
+	}
+	return line
 }
 
 // legacyJSON renders only the v6 keys of a snapshot: what the model sees.

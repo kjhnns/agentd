@@ -865,7 +865,28 @@ Waiting for the clinician (not Joe's to set; the app shows "not set" and no targ
 
 ### 18.13 Change of 2026-10-02 (after the six review rounds)
 
-Joe changed D12 on 2026-10-02. The text above already holds the change. What changed against commit f4bb7e2: (1) the record types `strength_set` and `strength_test`, the json variable "Strength log", the config key `strength_var`, `strength.hard_sets_week` and the result fields of `progress.strength_test` are removed; (2) the targets-file key `strength` and the session rule of 18.6 are new; (3) `strength` on the snapshot has the shape of 18.7; (4) migration step 3 creates two variables and adds two config keys; (5) T9, T17 and T19 follow. Nothing else of section 18 changed.
+Joe changed D12 on 2026-10-02. The text above already holds the change. (18.14 and sections 19 and 20 are also of 2026-10-02 and came after the six review rounds.) What changed against commit f4bb7e2: (1) the record types `strength_set` and `strength_test`, the json variable "Strength log", the config key `strength_var`, `strength.hard_sets_week` and the result fields of `progress.strength_test` are removed; (2) the targets-file key `strength` and the session rule of 18.6 are new; (3) `strength` on the snapshot has the shape of 18.7; (4) migration step 3 creates two variables and adds two config keys; (5) T9, T17 and T19 follow. Nothing else of section 18 changed.
+
+### 18.14 Saturated fat as a share of the day's energy (2026-10-02, Joe, after the review rounds)
+
+Joe (2026-10-02): "I like Olli's rules, can we adopt those too". Source: ~/warehouse/raw-sources/docs/2026-09-30_ollie-health-coach-spec.txt, sections 4 and 5.3 (satfat_budget_g = satfat_energy_frac x effective_kcal / 9, default 0.07; the budget is "steered by food swaps, not by eating less"). Saturated fat is an H value.
+
+File. Every `sat_fat_g` form that is valid today stays valid and keeps its behaviour, in a schema 1 and in a schema 2 file (a `value`, or `rest` and `training`, of kind floor, cap or pace, also with null). A schema 2 file ADDITIONALLY accepts the budget form `{"kind":"budget","energy_frac":0.07}`: exactly these two keys, `energy_frac` 0.01 to 0.2. The kind "budget" and the key `energy_frac` are invalid for every other target and in a file without `schema` (a v6 parser rejects them like every schema 2 file, so the 18.2 order holds). Everything below applies to the budget form only.
+
+Daily target. T(sat_fat_g, d) = energy_frac x E(d) / 9, rounded to the nearest 1 g, where E(d) is the energy target of the same date by 18.5 (the provisional rest or training value, or the formula value: the budget grows on a run day). Null when E(d) is null. The one day function of 19.1 gives it, so the snapshot and the week view cannot differ. A future date uses the default energy target of 19.1.
+
+Exception to 18.1 (the budget form only). The legacy saturated fat target, and the comparisons of `day_score` and `streaks` that use it, take the daily budget of their own date. No legacy enum changes: in `macros` the sat_fat_g entry keeps `kind` "cap" and the v6 statuses ("over" when consumed > target, else "on_pace"). Only the v7 key `budgets` and the week view get the kind "budget", and only `budgets` gets the status "near". This replaces, for the budget form, the saturated fat target rule and the class-dependence rule of 19.1: the budget is class-dependent (`target_estimated` true with a future date), the week `kind` is "budget", and the week `target` is the sum of the daily budgets. The comparison stays the cap comparison (at the budget is met).
+
+`budgets` entry: `kind` "budget", `basis` = "<100 x energy_frac> % of <E(d)> kcal" with the values of that date (for example "7 % of 3000 kcal"; null when E(d) is null), `status` "over" when consumed > target, "near" when consumed >= 0.8 x target and not over, else "on_pace".
+
+Words (the rule of the source: food swaps, never "eat less"). When the sat_fat_g entry of `budgets` in the reply snapshot is "near" or "over", the reply to a turn that wrote something through POST /fuel/log, /fuel/relog, /fuel/items or /fuel/move (a log, a correction, a removal, a move) has one more text block, after the status line. Code writes it; the model has no part in it:
+"Sat fat 19 of 22 g. Most of it: cottage cheese 6.2 g, scrambled eggs 5.1 g, butter 2.6 g. A swap of the largest one helps most." (when over: "Sat fat 24 of 22 g, over the budget. Most of it: ..."). The sources are the active items of the snapshot date with a known saturated fat of at least 1 g, ordered by grams descending, then by row key ascending, at most three. With no such item only the first sentence is written. With a cap form, a null target or the state "on_pace" nothing is added.
+The legacy status line says "sat fat is over the budget" instead of "sat fat is over the cap". No code-generated text says to eat less.
+
+Telegram path. food-log takes the sat_fat_g budget entry from the fueld snapshot under schema 2 (18.9), so it prints the same number ("Sat fat 19 / 22 g budget, near" / "over" / "3 left").
+
+Tests.
+- T20 (saturated fat budget): frac 0.07 with the provisional 2600 / 3000: a rest day = 20 g, a training day = 23 g; state formula with a 4120 kcal day = 32 g; `macros` sat_fat_g has kind "cap", target 23 and status "over" only above 23; `budgets` sat_fat_g has kind "budget", status "on_pace" at 18.3 g, "near" at 18.4 g (80 % of 23), "near" at 23.0 g and "over" at 23.1 g; budget_score and day_score count 23.0 g as met and 23.1 g as not met; a streak day uses the budget of ITS date; the week `target` of a week with one training day and six rest days is 143 with `kind` "budget"; `energy_frac` 0.3, a `value` next to `energy_frac`, kind "budget" on protein_g, and the budget form in a file without `schema` are invalid; the cap fixture `{"kind":"cap","value":20}` keeps 20 g on every day and kind "cap" in `budgets`, in a schema 1 and in a schema 2 file; a rest / training cap keeps its two values. Words: at "near" the reply to a log has the code line with the three largest items in order (ties by row key); at "over" it says "over the budget"; at "on_pace" and with the cap form nothing is added; no code-generated reply text contains "eat less".
 
 ## 19. Weekly view (2026-10-02, Joe): week budget and seven-day performance
 
@@ -1033,3 +1054,42 @@ Unit tests with the fakes of section 2, a fixed clock and fixed fixtures. Fixtur
 - W13 (context): fluids and caffeine sums match the rows; a lever day with one untagged item is null in `last7` and is left out of `week`; no key in `context` is named target, result, status, reference, mean or days_met.
 - W14 (a past reference date; today is Thursday 2026-10-01, R = 2026-09-30): `last7` holds the seven dates 2026-09-24 to 2026-09-30 and no cell of `last7` is "open" or "over". The week is 2026-09-28 to 2026-10-04 with states by the real today: its Thursday cells are today cells (they can be "open", "over" or "met") and Friday to Sunday are "future".
 - W15 (strength, the T17 fixture, today = Thursday 2026-10-01): `strength.week.sessions` is 3 and `strength.sessions_target` is 3, the days Monday to Thursday have `session` true, false, true, true, Wednesday has `strava` true and counts once, the three future dates have sets 0 and `session` false, `strength.week.sets` is 10, `strength.week.reps` is 129 and `by_variable` matches T17. `last7` (2026-09-25 to 2026-10-01) counts the same four dates plus a Saturday 2026-09-26 with 4 sets: `last7.sessions` is 4. With `strength` null the rule is "legacy" and `sets` is null. No key of `strength` is named status, score, hard or clinician. `strength.week.sessions` equals `strength.sessions` of the snapshot of today.
+
+## 20. Deterministic routes for an agent (2026-10-02, Joe)
+
+Joe (2026-10-02): the Fuel chat moves out of fueld into a session on the primary agentd (a separate design). fueld stays the data layer. Every data operation that the chat does must be reachable with NO model call, because an agent calls it. POST /fuel/log (the model path) stays as it is for build 7.
+
+| Operation | Route (bearer token, JSON) | Since |
+|---|---|---|
+| Log items with given values | `POST /fuel/items` | v7 |
+| Fix an amount, add to it, or re-estimate | `POST /fuel/fix {client_id, item_id or row_key, exactly one of: portion_g, volume_ml, share, portion_g_delta, volume_ml_delta, count_delta, revised}` | v4, the last four forms v7 |
+| Remove (undo) | `POST /fuel/undo {client_id, item_id or row_key}` | v3 |
+| Fraction of a photo item | `POST /fuel/fraction {client_id, item_id, fraction}` | v3 |
+| Move to another day | `POST /fuel/move` | v7 |
+| Log a recent item again | `POST /fuel/relog {client_id, key, scale?, local_time?}` with `key` from `GET /fuel/recent` | v4 |
+| Revert a second opinion | `POST /fuel/recalibration/revert {client_id, item_id}` | v5 |
+| The day's items | `GET /fuel/day?date=` | v4.2 |
+| The week | `GET /fuel/week?date=` | v7 |
+| The snapshot | `GET /fuel/snapshot?date=` | v3 |
+| Records | `POST /fuel/record`, `POST /fuel/record/void`, `GET /fuel/record/{id}`, `GET /fuel/records` | v7 |
+
+The Telegram path has the same operations as subcommands of ~/clawd/scripts/food-log (add, fix, undo, today); it writes rows of source "agentd" and is not changed by this section.
+
+`POST /fuel/items {"client_id", "items":[Item x 1..12], "day"?, "time"?, "local_time"?, "note"?}`.
+- Item = the model item of section 8 with the v7 keys: `item` (name), `kcal`, `protein_g`, `carbs_g`, `fat_g`, `sat_fat_g` (numbers, required); optional `portion_g`, `portion_basis` (default "stated" when a portion or a volume is given, else "unspecified"), `net_carbs_g`, `fiber_g` (default null), `kind` (default "food"), `volume_ml`, `caffeine_mg`, `alcohol_g`, `staple_key`, `food_class`, `needs_fraction` (default false), `levers` (18.6). An unknown key, a missing required key or a value outside the bounds of section 8 is 400 `bad_input`; nothing is written.
+- `day` ("today" | "yesterday" | "YYYY-MM-DD") and `time` ("HH:MM") follow the rules of 15.6 (today and the 34 days before it; else 400). `local_time` as on POST /fuel/log. `note` is the text of the user line in the feed (default "log: <names>").
+- The server does what it does after the model step of a chat log: staple values replace the given ones for a known `staple_key`, net carbohydrate is normalized, the lever checks of 18.6 run, an implausible item (17 E) is written with the `check` flag (there is no re-ask), ONE entry of intent "log" is journaled, the rows are written, the feed gets the user line and the reply line, the coach event is written.
+- The log rate limits of section 12 count it.
+- Answer: the shape of POST /fuel/log (200, 202 `pending_reconciliation`, 502). No model call and no transcript.
+
+`POST /fuel/fix`, the v7 forms. They are the correction forms of section 17 B with the values given by the caller: `portion_g_delta`, `volume_ml_delta` (added to the CURRENT amount), `count_delta` (added to the current share), or `revised` = `{item, portion_g, kcal, protein_g, carbs_g, net_carbs_g, fat_g, sat_fat_g, fiber_g, food_class, levers}` (a full re-estimate: the row of reason "revise", the base rules of 17 B and the lever rules of 18.6; it may rename the item and may change only levers or the brew method). The bounds are those of a model correction; outside = 400 `bad_input`. A delta on an item without that amount, or one that leaves nothing, is 409 `not_applicable` with the reason. A `revised` that is implausible by 17 E is refused with 400 and nothing is written (there is no re-ask). `revised` is for Fuel items only (a row of another writer: 400). Idempotent by `client_id`; the answer is the MutationResponse of section 15.2.
+
+Idempotency of the routes of this section (sections 6 and 14): the same `client_id` with the same body never writes again. While the first request is pending, a retry returns the current state; once it is done, a retry returns the stored final answer. Another body with that `client_id` is 409 `idempotency_conflict`.
+
+`POST /fuel/move {"client_id", "day", "item_id" | "row_key" | "items":[id x 1..12]}`.
+- `day` = "today" | "yesterday" | "YYYY-MM-DD" (the target, the 15.6 range). The ids are Fuel item ids or row keys ("v:<value id>") of active items on any day of the cached window.
+- The rules of 15.6 hold: per item a new row on the target day (the current amounts, the lever amounts and the brew method) plus the undo of the old row, one journal transaction, the undo posted only after the new row is done. An id that is not an active item makes the whole request a no-write answer with the line "I cannot find the item <id> in the log. Nothing was moved."
+- Answer: the shape of POST /fuel/log with intent "move".
+
+Tests.
+- T22 (agent routes, the fake model counts calls): POST /fuel/items with two items writes two original rows with `source` "fuel", one entry, the item states and the snapshot, with zero model calls; a repeat with the same client_id writes nothing more and returns the same body; another body = 409; a missing sat_fat_g, an unknown key, kcal 5000 and `day` 40 days back = 400 and no row; `day` "yesterday" writes on yesterday's date and the reply names the day; a staple key gives the label values; lever keys are written and checked; an implausible item carries `check`. POST /fuel/move (today is Thursday 2026-10-01, both items are of today) moves one Fuel item and one Telegram row to yesterday, a date of the same ISO week (two new rows there, two undo rows, the day sums move, the week total of alcohol is unchanged), with zero model calls; an unknown id moves nothing; a repeat is idempotent. POST /fuel/fix: `portion_g_delta` 50 on a 100 g item gives 150 g and scaled macros; `count_delta` 1 doubles a serving; `volume_ml_delta` on an item without a volume is 409; `revised` renames the item, sets the new macros and levers and writes one row of reason "revise"; a `revised` with only another brew method is written; an implausible `revised` and two forms in one body are 400 and write nothing; a repeat of each is idempotent, also after a restart. Fix, undo, relog, day, week and snapshot make no model call. A request whose first answer was 202 returns the done state on a retry (the current state, not the 202).

@@ -189,7 +189,7 @@ func (s *Service) moveTargets(out *ModelOutput) ([]DayItem, []string) {
 // new row is written first; the undo is posted only once the new row is
 // done (PairOp), so a crash or a rejection can leave the item on its old
 // day or on the new one, never on both and never on neither.
-func (s *Service) finishMove(ctx context.Context, w http.ResponseWriter, out *ModelOutput, clientID, hash, userText string, now, t0 time.Time, lat map[string]int) {
+func (s *Service) finishMove(ctx context.Context, w http.ResponseWriter, out *ModelOutput, clientID, hash, userText string, now, t0 time.Time, lat map[string]int, preset *movePreset) {
 	targets, terr := s.loadTargets()
 	if terr != nil {
 		writeErr(w, errf(http.StatusServiceUnavailable, "targets_invalid", false, "targets invalid"))
@@ -227,7 +227,13 @@ func (s *Service) finishMove(ctx context.Context, w http.ResponseWriter, out *Mo
 			return
 		}
 	}
-	found, notes := s.moveTargets(out)
+	var found []DayItem
+	var notes []string
+	if preset != nil {
+		found, notes = preset.found, preset.notes // POST /fuel/move names the items
+	} else {
+		found, notes = s.moveTargets(out)
+	}
 	if len(notes) > 0 || len(found) == 0 {
 		var lines []FixLine
 		for _, n := range notes {

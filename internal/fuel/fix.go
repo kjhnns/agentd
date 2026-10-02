@@ -112,6 +112,20 @@ func describeFix(it Item, op *Op) string {
 	if op == nil {
 		return it.Name + " was already counted at that amount."
 	}
+	if op.Reason == "revise" {
+		if m, ok := recalOfOp(*op); ok {
+			name := it.Name
+			if m.Name != "" && m.Name != it.Name {
+				name += " as " + m.Name
+			}
+			lead := "Re-estimated " + name
+			if m.To.PortionG != nil {
+				lead += ", " + fmtNum(*m.To.PortionG) + " g"
+			}
+			return lead + fmt.Sprintf(": %s kcal, %s g protein.", fmtNum(m.To.Kcal), fmtNum(m.To.Protein))
+		}
+		return "Re-estimated " + it.Name + "."
+	}
 	v, hasV := op.Data["volume_ml_after"].(float64)
 	p, hasP := op.Data["portion_g_after"].(float64)
 	switch {

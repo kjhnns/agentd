@@ -206,7 +206,7 @@ func dayTypeFor(date string, acts []Activity) string {
 
 // dayChecks evaluates the day-score checks for totals; nil entries are
 // skipped checks (target null, or net carbs on a training day).
-func dayChecks(t *Targets, dayType string, tot DayTotals, kcalTarget *float64) map[string]*bool {
+func dayChecks(t *Targets, dayType string, tot DayTotals, kcalTarget, satFatTarget *float64) map[string]*bool {
 	c := func(key string) float64 { return float64(tot.Sum[key]) / 10 }
 	out := map[string]*bool{}
 	b := func(v bool) *bool { return &v }
@@ -216,7 +216,7 @@ func dayChecks(t *Targets, dayType string, tot DayTotals, kcalTarget *float64) m
 	if tg := t.Fiber.For(dayType); tg != nil {
 		out["fiber_g"] = b(c("fiber_g") >= *tg)
 	}
-	if tg := t.SatFat.For(dayType); tg != nil {
+	if tg := satFatTarget; tg != nil {
 		out["sat_fat_g"] = b(c("sat_fat_g") <= *tg)
 	}
 	if tg := kcalTarget; tg != nil {
@@ -265,15 +265,22 @@ func computeSnapshot(in snapInput) Snapshot {
 	for _, d := range macroDefs {
 		tg := d.target(t)
 		target := tg.For(targetDay)
-		if d.key == "kcal" {
+		kind := tg.Kind
+		switch d.key {
+		case "kcal":
 			target = plan.EnergyTarget // the v7 energy target (18.5); the v6 value in states legacy and provisional
+		case "sat_fat_g":
+			target = plan.SatFatTarget // the fixed cap, or the day's budget (18.14)
+			if kind == "budget" {
+				kind = "cap" // no new enum value in a v6 field: the legacy entry stays a cap
+			}
 		}
 		consumed := round1(float64(tot.Sum[d.key]) / 10)
-		ms := MacroState{Key: d.key, Label: d.label, Unit: d.unit, Kind: tg.Kind, Consumed: consumed, UnknownRows: tot.Unknown[d.key], Target: target}
-		if target != nil && tg.Kind != "cap" {
+		ms := MacroState{Key: d.key, Label: d.label, Unit: d.unit, Kind: kind, Consumed: consumed, UnknownRows: tot.Unknown[d.key], Target: target}
+		if target != nil && kind != "cap" {
 			ms.PaceTargetNow = fptr(round1(*target * el))
 		}
-		ms.Status = statusFor(tg.Kind, consumed, target, ms.PaceTargetNow)
+		ms.Status = statusFor(kind, consumed, target, ms.PaceTargetNow)
 		s.Macros = append(s.Macros, ms)
 	}
 
@@ -312,7 +319,7 @@ func computeSnapshot(in snapInput) Snapshot {
 	}
 
 	// Day score.
-	checks := dayChecks(t, targetDay, tot, plan.EnergyTarget)
+	checks := dayChecks(t, targetDay, tot, plan.EnergyTarget, plan.SatFatTarget)
 	for _, v := range checks {
 		s.DayScore.Of++
 		if *v {
@@ -328,8 +335,10 @@ func computeSnapshot(in snapInput) Snapshot {
 		if !ok || len(dedupeRows(r)) == 0 {
 			return false
 		}
-		dt := dayTypeFor(date, in.acts)
-		ch := dayChecks(t, dt, totalsFromRows(r), t.Kcal.For(dt))[key]
+		// The targets of THAT date (its day type, and with the budget form its
+		// own saturated fat budget).
+		dp := in.day(date).plan
+		ch := dayChecks(t, dp.DayType, totalsFromRows(r), dp.EnergyTarget, dp.SatFatTarget)[key]
 		return ch != nil && *ch
 	}
 	streak := func(key string) int {
@@ -493,6 +502,9 @@ func statusSentence(s Snapshot) string {
 	for _, m := range s.Macros {
 		if m.Kind == "cap" && m.Status == "over" {
 			gap = strings.ToLower(m.Label) + " is over the cap"
+			if m.Key == "sat_fat_g" && s.satFatBudgetForm() {
+				gap = strings.ToLower(m.Label) + " is over the budget"
+			}
 			break
 		}
 		if m.Kind == "floor" && m.Status == "behind" && m.Target != nil && m.PaceTargetNow != nil && *m.Target > 0 {

@@ -14,12 +14,16 @@ import (
 // Target is one macro's target: a kind and either one value or a rest and a
 // training value. A nil value means "no target" (the check is skipped).
 type Target struct {
-	Kind     string   `json:"kind"` // floor | cap | pace
+	Kind     string   `json:"kind"` // floor | cap | pace | budget (sat_fat_g in a schema 2 file, spec 18.14)
 	Value    *float64 `json:"value,omitempty"`
 	Rest     *float64 `json:"rest,omitempty"`
 	Training *float64 `json:"training,omitempty"`
-	hasValue bool
-	hasSplit bool
+	// EnergyFrac (kind "budget"): the target of a day is this share of the
+	// day's energy target, in grams of fat (9 kcal per g).
+	EnergyFrac *float64 `json:"energy_frac,omitempty"`
+	hasValue   bool
+	hasSplit   bool
+	hasFrac    bool
 }
 
 func (t *Target) UnmarshalJSON(b []byte) error {
@@ -29,7 +33,7 @@ func (t *Target) UnmarshalJSON(b []byte) error {
 	}
 	for k := range raw {
 		switch k {
-		case "kind", "value", "rest", "training":
+		case "kind", "value", "rest", "training", "energy_frac":
 		default:
 			return fmt.Errorf("unknown key %q", k)
 		}
@@ -41,6 +45,7 @@ func (t *Target) UnmarshalJSON(b []byte) error {
 	}
 	*t = Target(p)
 	_, t.hasValue = raw["value"]
+	_, t.hasFrac = raw["energy_frac"]
 	_, hasRest := raw["rest"]
 	_, hasTrain := raw["training"]
 	t.hasSplit = hasRest && hasTrain
@@ -178,6 +183,15 @@ func ParseTargets(b []byte) (*Targets, error) {
 		}
 	}
 	for name, tg := range all {
+		if tg.Kind == "budget" || tg.hasFrac {
+			// Saturated fat as a share of the day's energy (spec 18.14): only
+			// sat_fat_g, only in a schema 2 file, exactly kind and energy_frac.
+			if name != "sat_fat_g" || !schema2 || tg.Kind != "budget" || tg.hasValue || tg.hasSplit || tg.Rest != nil || tg.Training != nil ||
+				tg.EnergyFrac == nil || !(*tg.EnergyFrac >= 0.01 && *tg.EnergyFrac <= 0.2) {
+				return nil, fmt.Errorf(`targets: %s: the budget form is {"kind":"budget","energy_frac":0.01 to 0.2}, for sat_fat_g in a schema 2 file only`, name)
+			}
+			continue
+		}
 		switch tg.Kind {
 		case "floor", "cap", "pace":
 		default:

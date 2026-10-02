@@ -229,7 +229,7 @@ func (in *snapInput) weekKind(key string) string {
 	case "protein_g":
 		return t.Protein.Kind
 	case "sat_fat_g":
-		return t.SatFat.Kind
+		return t.SatFat.Kind // "budget" with the budget form (18.14)
 	case "fiber_g":
 		return t.Fiber.Kind
 	case "kcal":
@@ -249,7 +249,7 @@ func (in *snapInput) classDependent(key string) bool {
 	case "protein_g":
 		return t.Protein.hasSplit
 	case "sat_fat_g":
-		return t.SatFat.hasSplit
+		return t.SatFat.hasSplit || t.SatFat.Kind == "budget" // a share of the day's energy
 	case "fiber_g":
 		return t.Fiber.hasSplit
 	}
@@ -263,7 +263,7 @@ func (in *snapInput) dayTarget(key string, dd *dayData) *float64 {
 	case "protein_g":
 		return t.Protein.For(dd.plan.DayType)
 	case "sat_fat_g":
-		return t.SatFat.For(dd.plan.DayType)
+		return dd.plan.SatFatTarget
 	case "fiber_g":
 		return t.Fiber.For(dd.plan.DayType)
 	case "kcal":

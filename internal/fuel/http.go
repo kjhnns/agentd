@@ -164,6 +164,9 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("GET /fuel/day", s.handleDay)
 	// v7 (spec 18.4, 18.5 and section 19): records, calibration, the week.
 	mux.HandleFunc("GET /fuel/week", s.handleWeek)
+	// Section 20: the write operations of the chat without a model call.
+	mux.HandleFunc("POST /fuel/items", s.handleItems)
+	mux.HandleFunc("POST /fuel/move", s.handleMove)
 	mux.HandleFunc("POST /fuel/record", s.handleRecord)
 	mux.HandleFunc("POST /fuel/record/void", s.handleRecordVoid)
 	mux.HandleFunc("GET /fuel/record/{id}", s.handleRecordGet)
@@ -195,6 +198,9 @@ func (s *Service) lookupIdem(clientID string) (idemRec, bool) {
 		return rec, true
 	}
 	if id, ok := s.journal.Ident(clientID); ok && now.Sub(id.At) <= idemRetention {
+		if id.Kind == "revise" {
+			id.Kind = "fix" // a re-estimate through POST /fuel/fix
+		}
 		return idemRec{ClientID: clientID, Hash: id.Hash, Kind: id.Kind, At: id.At, EntryID: id.EntryID, ItemID: id.ItemID}, true
 	}
 	return idemRec{}, false
@@ -717,7 +723,7 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 	}
 	if out.Intent == "move" {
 		s.finishMove(ctx, w, out, in.ClientID, hash, foodText, now, t0,
-			map[string]int{"upload": ms(upload), "asr": ms(asrD), "model": ms(modelD)})
+			map[string]int{"upload": ms(upload), "asr": ms(asrD), "model": ms(modelD)}, nil)
 		return
 	}
 	// The day the food was consumed, when the user states one (spec 15.6).
@@ -1025,8 +1031,19 @@ func (s *Service) buildLogResponse(e Entry) (LogResponse, string) {
 		effs = append(effs, st.Effective)
 	}
 	blocks := []Block{textBlock(s.leadText(e, states, snap))}
+	// Saturated fat near or over its budget (spec 18.14): one code line with
+	// the largest sources and a swap hint. Never "eat less".
+	sat := ""
+	if wrote := len(states) > 0 || len(e.FixOps) > 0; wrote {
+		rows, _, _ := s.cache.Rows(snap.Date)
+		sat = satFatLine(snap, rows)
+	}
 	if isChatFix(e) {
 		blocks = correctBlocks(s, e, snap)
+		if sat != "" && len(blocks) >= 2 {
+			// After the status line (summary, status, [sat fat], widgets).
+			blocks = append(blocks[:2:2], append([]Block{textBlock(sat)}, blocks[2:]...)...)
+		}
 		if e.Clinical {
 			blocks = withClinicalLine(blocks)
 		}
@@ -1036,6 +1053,9 @@ func (s *Service) buildLogResponse(e Entry) (LogResponse, string) {
 		}
 		return LogResponse{Status: s.entryStatus(e), EntryID: e.ID, Intent: e.Intent, Transcript: e.Transcript, PhotoIDs: photos,
 			Items: states, Blocks: blocks, Snapshot: snap}, s.entryStatus(e)
+	}
+	if sat != "" {
+		blocks = append(blocks, textBlock(sat))
 	}
 	if len(e.Checks) > 0 {
 		blocks = append(blocks, textBlock(strings.Join(e.Checks, " ")))
@@ -1327,7 +1347,7 @@ var allowedFractions = []float64{0.25, 0.5, 0.75, 1}
 func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind string) {
 	rc := http.NewResponseController(w)
 	_ = rc.SetReadDeadline(time.Now().Add(s.o.ReadDeadline))
-	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	var body struct {
 		ClientID string   `json:"client_id"`
 		ItemID   string   `json:"item_id"`
@@ -1336,6 +1356,12 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		PortionG *float64 `json:"portion_g"`
 		VolumeML *float64 `json:"volume_ml"`
 		Share    *float64 `json:"share"`
+		// Section 20: the other correction forms of the chat (17 B), given
+		// by the caller, with no model call.
+		PortionGDelta *float64      `json:"portion_g_delta"`
+		VolumeMLDelta *float64      `json:"volume_ml_delta"`
+		CountDelta    *float64      `json:"count_delta"`
+		Revised       *ModelRevised `json:"revised"`
 	}
 	err := decodeStrict(r.Body, &body)
 	_ = rc.SetReadDeadline(time.Time{})
@@ -1385,7 +1411,27 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		return
 	}
 	fixTgt := FixTarget{Share: body.Share, PortionG: body.PortionG, VolumeML: body.VolumeML}
-	if kind == "fix" {
+	// The correction as the chat knows it: one of the seven forms of 17 B.
+	form := ModelCorrection{Ref: "item", PortionG: body.PortionG, VolumeML: body.VolumeML, Share: body.Share,
+		PortionGDelta: body.PortionGDelta, VolumeMLDelta: body.VolumeMLDelta, CountDelta: body.CountDelta, Revised: body.Revised}
+	extended := body.PortionGDelta != nil || body.VolumeMLDelta != nil || body.CountDelta != nil || body.Revised != nil
+	if extended && kind != "fix" {
+		writeErr(w, errf(http.StatusBadRequest, "bad_input", false, kind+" takes no amount"))
+		return
+	}
+	if kind == "fix" && extended {
+		// The bounds of a model correction (exactly one form).
+		fb, _ := json.Marshal(form)
+		synth := `{"intent":"correct","items":[],"corrections":[` + string(fb) + `],"targets":[],"text":"","widgets":[],"clinical_topic":false}`
+		if _, verr := validateOutput(json.RawMessage(synth)); verr != nil {
+			writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "give exactly one of portion_g, volume_ml, share, portion_g_delta, volume_ml_delta, count_delta or revised, inside the bounds"))
+			return
+		}
+		if external && body.Revised != nil {
+			writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "a re-estimate is for Fuel items; fix the amount of this row instead"))
+			return
+		}
+	} else if kind == "fix" {
 		if fixTgt.count() != 1 {
 			writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "give exactly one of portion_g, volume_ml or share"))
 			return
@@ -1405,6 +1451,9 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 	hash := fmt.Sprintf("%s|%s|%g", kind, body.ItemID, f)
 	if kind == "fix" {
 		hash = fmt.Sprintf("fix|%s|%s", body.ItemID, fixTgtString(fixTgt))
+		if extended {
+			hash = "fix|" + body.ItemID + "|" + hashOf(form)
+		}
 	}
 	claim, ce := s.claim(ctx, body.ClientID, kind, hash)
 	if ce != nil {
@@ -1522,7 +1571,31 @@ func (s *Service) handleMutation(w http.ResponseWriter, r *http.Request, kind st
 		}
 		op = &o
 	case "fix":
-		o, ae := s.absoluteCorrection(it, dayRows, fixTgt, "fix", nil)
+		var o *Op
+		var ae *apiError
+		switch g := itemGroup(dayRows, it.ID); {
+		case !extended:
+			o, ae = s.absoluteCorrection(it, dayRows, fixTgt, "fix", nil)
+		case g == nil || g.orig.Data == nil:
+			ae = errf(http.StatusNotFound, "not_found", false, "the original row of this item was deleted")
+		case body.Revised != nil:
+			// A re-estimate with the caller's values (17 B, 18.6). What does
+			// not add up is refused, never written (the final rule of 17 E).
+			if why := revisedIssue(it, g, *body.Revised); why != "" {
+				ae = errf(http.StatusBadRequest, "bad_input", false, "the revised values are implausible: %s", why)
+			} else {
+				o, _ = s.reviseOp(it, g, *body.Revised)
+			}
+		default:
+			// An additive change: the delta is added to the CURRENT amount.
+			tgt, _, note := formTarget(it, g, form)
+			if note != "" {
+				ae = errf(http.StatusConflict, "not_applicable", false, "%s", note)
+			} else {
+				fixTgt = tgt
+				o, ae = s.absoluteCorrection(it, dayRows, tgt, "fix", nil)
+			}
+		}
 		if ae != nil {
 			l.Unlock()
 			writeErr(w, ae)
@@ -1779,7 +1852,11 @@ func (s *Service) rebuildMutation(clientID string) (MutationResponse, bool) {
 	} else if v, ok := s.journal.Fraction(it.ID); ok && id.Kind == "fraction" {
 		f = v
 	}
-	resp := s.mutationResponse(it, id.Kind, f, op)
+	kind := id.Kind
+	if kind == "revise" {
+		kind = "fix" // a re-estimate through POST /fuel/fix
+	}
+	resp := s.mutationResponse(it, kind, f, op)
 	return resp, true // the caller checks resp.renderErr
 }
 
