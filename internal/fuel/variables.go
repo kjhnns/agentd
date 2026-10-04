@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -108,10 +109,72 @@ func (v *VariablesHTTP) ListVariables(ctx context.Context) ([]VarInfo, error) {
 	return out, nil
 }
 
+// withTitle returns data with a `title` key. Variables requires a non-empty
+// string title on every json value (its one-line label in the web and iOS
+// lists). A title the caller set is kept; data itself is never changed.
+func withTitle(data map[string]any) map[string]any {
+	if t, _ := data["title"].(string); strings.TrimSpace(t) != "" {
+		return data
+	}
+	out := make(map[string]any, len(data)+1)
+	for k, v := range data {
+		out[k] = v
+	}
+	out["title"] = valueTitle(data)
+	return out
+}
+
+// valueTitle derives the title of a value from its data: the food name, the
+// reading of a record, the weight of a weigh-in. The same rule backfilled the
+// old values (variables migration 009_json_title.sql).
+func valueTitle(d map[string]any) string {
+	str := func(k string) string {
+		s, _ := d[k].(string)
+		return strings.TrimSpace(s)
+	}
+	num := func(k string) (string, bool) {
+		f, ok := numFrom(d[k])
+		if !ok {
+			return "", false
+		}
+		return strconv.FormatFloat(f, 'f', -1, 64), true
+	}
+	typ := strings.ReplaceAll(str("type"), "_", " ")
+	if s := str("item"); s != "" {
+		return s
+	}
+	if str("voids") != "" && typ != "" {
+		return "Voided " + typ
+	}
+	if sys, ok := num("systolic_mmhg"); ok {
+		if dia, ok := num("diastolic_mmhg"); ok {
+			return sys + "/" + dia + " mmHg"
+		}
+	}
+	if s := str("category"); s != "" {
+		return strings.ReplaceAll(s, "_", " ")
+	}
+	if w, ok := num("waist_cm"); ok {
+		return w + " cm waist"
+	}
+	if kg, ok := num("weight_kg"); ok {
+		if fat, ok := num("fat_pct"); ok {
+			return kg + " kg, " + fat + " % fat"
+		}
+		return kg + " kg"
+	}
+	for _, s := range []string{str("note"), typ, str("method")} {
+		if s != "" {
+			return s
+		}
+	}
+	return "Entry"
+}
+
 // Post writes one json value. 201 returns the value id. A 4xx other than
 // 408/429 is a *PostError (definitive); every other failure is uncertain.
 func (v *VariablesHTTP) Post(ctx context.Context, variableID string, data map[string]any, recordDate string) (string, error) {
-	enc, err := json.Marshal(data)
+	enc, err := json.Marshal(withTitle(data))
 	if err != nil {
 		return "", &PostError{Status: 0, Body: err.Error()}
 	}
