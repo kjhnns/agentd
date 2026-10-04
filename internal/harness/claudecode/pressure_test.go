@@ -146,12 +146,12 @@ func TestPermissionModeArgs(t *testing.T) {
 		return false
 	}
 	// prompt mode strips the skip flag even when SkipPermissions=true.
-	args := buildArgs(harness.SessionConfig{SessionID: "s", SkipPermissions: true, PermissionMode: harness.PermissionPrompt})
+	args := buildArgs(harness.SessionConfig{SessionID: "s", SkipPermissions: true, PermissionMode: harness.PermissionPrompt}, "")
 	if has(args, "--dangerously-skip-permissions") {
 		t.Fatalf("prompt mode must not pass --dangerously-skip-permissions: %v", args)
 	}
 	// skip mode adds it even when SkipPermissions=false.
-	args = buildArgs(harness.SessionConfig{SessionID: "s", SkipPermissions: false, PermissionMode: harness.PermissionSkip})
+	args = buildArgs(harness.SessionConfig{SessionID: "s", SkipPermissions: false, PermissionMode: harness.PermissionSkip}, "")
 	if !has(args, "--dangerously-skip-permissions") {
 		t.Fatalf("skip mode must pass --dangerously-skip-permissions: %v", args)
 	}

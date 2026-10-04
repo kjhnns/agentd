@@ -35,6 +35,7 @@ type Harness struct {
 	Model           string // per-session default model (optional)
 	Cwd             string // default working dir for sessions
 	SkipPermissions bool   // bypass the harness's own tool-approval prompts
+	PromptDir       string // claude-code: pass the system prompt through a 0600 file in this dir, not argv
 }
 
 // Workspace is the [workspace] table: where agent workspaces live and which
@@ -442,6 +443,8 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 			h.Model = s
 		case "cwd":
 			h.Cwd = s
+		case "prompt_dir":
+			h.PromptDir = s
 		default:
 			return fmt.Errorf("unknown [[harness]] key %q", key)
 		}

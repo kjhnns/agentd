@@ -94,6 +94,10 @@ cwd   = ""                       # optional default working dir for sessions
 # Claude's prompts. Codex: true bypasses approvals and sandbox; false runs
 # read-only with approvals disabled (exec cannot answer interactive prompts).
 skip_permissions = true
+# prompt_dir (claude-code only): write the composed system prompt to a 0600 file
+# in this directory and pass --append-system-prompt-file. Without it the prompt
+# is in argv, which every local user can read through /proc. Use an absolute path.
+# prompt_dir = "/home/me/.agentd/state/prompts"
 
 # One channel entry. Token is read from the environment (never inlined).
 [[channel]]

@@ -27,6 +27,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +54,7 @@ var modelWindows = map[string]int{
 type Adapter struct {
 	bin           string // path/name of the claude binary
 	contextWindow int    // default context window for real pressure (0 => DefaultContextWindow)
+	promptDir     string // when set, the system prompt goes through a 0600 file here, not argv
 }
 
 // New returns an adapter using the given binary name (default "claude").
@@ -61,6 +63,31 @@ func New(bin string) *Adapter {
 		bin = "claude"
 	}
 	return &Adapter{bin: bin, contextWindow: DefaultContextWindow}
+}
+
+// WithPromptDir makes Start write SessionConfig.SystemPrompt to a private file
+// in dir and pass --append-system-prompt-file. Argv is readable by every local
+// user through /proc, and the composed prompt can carry conversation history
+// after a reset, so an instance that holds private content sets this.
+func (a *Adapter) WithPromptDir(dir string) *Adapter {
+	a.promptDir = dir
+	return a
+}
+
+// writePromptFile stores the prompt for one session, owner-only.
+func writePromptFile(dir, sessionID, prompt string) (string, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, filepath.Base(sessionID)+".prompt")
+	if err := os.WriteFile(path, []byte(prompt), 0o600); err != nil {
+		return "", err
+	}
+	// WriteFile keeps the mode of an existing file.
+	if err := os.Chmod(path, 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // WithContextWindow overrides the default context window (tokens) used to
@@ -141,7 +168,16 @@ func (a *Adapter) Start(ctx context.Context, cfg harness.SessionConfig) (harness
 	if cfg.SessionID == "" {
 		return nil, fmt.Errorf("claudecode: SessionConfig.SessionID required")
 	}
-	args := buildArgs(cfg)
+	promptFile := ""
+	if a.promptDir != "" && cfg.SystemPrompt != "" {
+		p, err := writePromptFile(a.promptDir, cfg.SessionID, cfg.SystemPrompt)
+		if err != nil {
+			// No argv fallback: the caller asked for the prompt to stay out of argv.
+			return nil, fmt.Errorf("claudecode: prompt file: %w", err)
+		}
+		promptFile = p
+	}
+	args := buildArgs(cfg, promptFile)
 
 	procCtx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(procCtx, a.bin, args...)
@@ -181,14 +217,21 @@ func (a *Adapter) Start(ctx context.Context, cfg harness.SessionConfig) (harness
 		startedAt:     time.Now(),
 	}
 	go h.readLoop()
+	if promptFile != "" {
+		go func() {
+			<-h.done
+			os.Remove(promptFile)
+		}()
+	}
 	return h, nil
 }
 
 // buildArgs assembles the CLI arguments for a persistent streaming session.
 // SessionConfig.SystemPrompt (the workspace injection composed by the Session
 // Manager: instructions + memory index + handoff) maps to
-// --append-system-prompt, the server-owned context hook (design 3.5).
-func buildArgs(cfg harness.SessionConfig) []string {
+// --append-system-prompt, the server-owned context hook (design 3.5). With a
+// promptFile the prompt is read from that file and never appears in argv.
+func buildArgs(cfg harness.SessionConfig, promptFile string) []string {
 	args := []string{"-p",
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
@@ -211,7 +254,9 @@ func buildArgs(cfg harness.SessionConfig) []string {
 	if cfg.Model != "" {
 		args = append(args, "--model", cfg.Model)
 	}
-	if cfg.SystemPrompt != "" {
+	if promptFile != "" {
+		args = append(args, "--append-system-prompt-file", promptFile)
+	} else if cfg.SystemPrompt != "" {
 		args = append(args, "--append-system-prompt", cfg.SystemPrompt)
 	}
 	return args
@@ -559,8 +604,8 @@ func (a *Adapter) Teardown(h harness.Handle) error {
 // is a CLI diagnostic string and never carries token material.
 var authErrorMarkers = []string{
 	"OAuth session expired and could not be refreshed", // -p mode, OAuthRefreshDeadError
-	"Not logged in",                                    // no usable credential in the store
-	"Please run /login",                                // interactive-mode phrasing of the same
+	"Not logged in",     // no usable credential in the store
+	"Please run /login", // interactive-mode phrasing of the same
 	"OAuth token has expired",
 }
 

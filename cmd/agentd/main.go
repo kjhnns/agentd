@@ -888,8 +888,12 @@ func configuredHarness(cfg *config.Config) (harness.Adapter, error) {
 	}
 	switch h.Kind {
 	case "", "claude-code":
-		return claudecode.New(h.Bin).WithContextWindow(cfg.Session.ContextWindow), nil
+		return claudecode.New(h.Bin).WithContextWindow(cfg.Session.ContextWindow).WithPromptDir(h.PromptDir), nil
 	case "codex":
+		if h.PromptDir != "" {
+			// The codex adapter passes developer_instructions in argv.
+			return nil, fmt.Errorf("prompt_dir is set but the codex harness cannot keep the prompt out of argv")
+		}
 		return codex.New(h.Bin), nil
 	default:
 		return nil, fmt.Errorf("unsupported harness kind %q (use claude-code or codex)", h.Kind)
