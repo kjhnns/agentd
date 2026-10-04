@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -248,5 +249,112 @@ func TestRelogSharesTheLogSlots(t *testing.T) {
 	<-h.svc.slots
 	if r.Code != 503 || r.Header().Get("Retry-After") == "" {
 		t.Fatalf("%d", r.Code)
+	}
+}
+
+// GET /fuel/frequent: variants of one food and of one combination take ONE
+// slot (Joe, 2026-10-04), the slot shows the most frequent form, and the
+// items of a combination are the items of a meal.
+func TestFrequentMergesVariantsAndKeepsCombinations(t *testing.T) {
+	names := func(m FrequentMeal) string {
+		var n []string
+		for _, it := range m.Items {
+			n = append(n, it.Item)
+		}
+		sort.Strings(n)
+		return strings.Join(n, "+")
+	}
+	at := time.Date(2026, 10, 4, 8, 0, 0, 0, time.UTC)
+	var items []RecentItem
+	var meals []mealOcc
+	add := func(mins int, foods ...string) {
+		m := mealOcc{at: at.Add(time.Duration(mins) * time.Minute)}
+		for _, f := range foods {
+			k := recentKey("food", f, nil, nil)
+			m.keys = append(m.keys, k)
+			m.names = append(m.names, f)
+			found := false
+			for _, it := range items {
+				found = found || it.Key == k
+			}
+			if !found {
+				items = append(items, RecentItem{Key: k, Item: f})
+			}
+		}
+		meals = append(meals, m)
+	}
+	// Water with lime: the combination 3 times (three names of the juice are
+	// ONE form), sparkling water 3 times, the can once = 7 logs, one slot.
+	// Equal counts: the form logged last wins the slot.
+	add(1, "water", "lime juice, half a lime squeezed")
+	add(2, "water", "lime juice, freshly squeezed")
+	add(3, "sparkling water")
+	add(4, "sparkling water")
+	add(5, "sparkling water")
+	add(6, "water", "Lime juice, fresh")
+	add(7, "lime sparkling water (can)")
+	// Coffee in two forms: 2 + 1.
+	add(8, "Bialetti moka coffee, black")
+	add(9, "Bialetti moka coffee, black")
+	add(10, "filter coffee, black")
+	// Two other foods, once each; juice alone is no family word.
+	add(11, "orange juice")
+	add(12, "Migros cottage cheese nature")
+
+	got := frequentMeals(items, meals, 5)
+	var lines []string
+	for _, m := range got {
+		lines = append(lines, fmt.Sprintf("%s x%d", names(m), m.Times))
+	}
+	want := []string{"Lime juice, fresh+water x7", "Bialetti moka coffee, black x3", "Migros cottage cheese nature x1", "orange juice x1"}
+	if strings.Join(lines, "; ") != strings.Join(want, "; ") {
+		t.Fatalf("frequent:\n got %v\nwant %v", lines, want)
+	}
+	// With the combination as the most frequent form, the slot holds both items.
+	add(13, "water", "lime juice, half a lime squeezed")
+	add(14, "water", "lime juice, half a lime squeezed")
+	got = frequentMeals(items, meals, 5)
+	if n := names(got[0]); n != "lime juice, half a lime squeezed+water" || got[0].Times != 9 || len(got[0].Items) != 2 {
+		t.Fatalf("first slot %q x%d", n, got[0].Times)
+	}
+	if got[0].Key == "" || got[0].Key == got[1].Key {
+		t.Fatalf("keys %q %q", got[0].Key, got[1].Key)
+	}
+	if len(frequentMeals(items, meals, 2)) != 2 {
+		t.Fatal("limit")
+	}
+}
+
+func TestFrequentRouteGroupsARepeatedMeal(t *testing.T) {
+	h := newHarness(t)
+	two := `{"intent":"log","items":[{"item":"Water","staple_key":null,"portion_g":500,"portion_basis":"stated","kcal":0,"protein_g":0,"carbs_g":0,"net_carbs_g":null,"fat_g":0,"sat_fat_g":0,"fiber_g":null,"needs_fraction":false},{"item":"Lime juice, fresh","staple_key":null,"portion_g":20,"portion_basis":"stated","kcal":5,"protein_g":0,"carbs_g":1,"net_carbs_g":null,"fat_g":0,"sat_fat_g":0,"fiber_g":null,"needs_fraction":false}],"text":"","widgets":[]}`
+	h.model.fn = func(ModelInput) string { return two }
+	h.clk.Add(time.Minute)
+	decode[LogResponse](t, h.logText("c0000001-0001", "water with lime"))
+	h.model.fn = func(ModelInput) string { return oneItem("Skyr", 250, 160, 27, false) }
+	h.clk.Add(time.Minute)
+	decode[LogResponse](t, h.logText("c0000001-0002", "skyr"))
+	// "Repeat meal": one re-log per item, both with ONE local_time.
+	h.clk.Add(time.Minute)
+	stamp := h.clk.Now().Format(time.RFC3339)
+	for i, it := range h.recent("").Items {
+		if it.Item == "Skyr" {
+			continue
+		}
+		body := fmt.Sprintf(`{"client_id":"c0000001-01%02d","key":%q,"local_time":%q}`, i, it.Key, stamp)
+		if rec := h.do("POST", "/fuel/relog", strings.NewReader(body), "application/json"); rec.Code != 200 {
+			t.Fatalf("relog %s: %d %s", it.Item, rec.Code, rec.Body.String())
+		}
+	}
+	h.clk.Add(2 * time.Minute)
+	type resp struct {
+		Items []FrequentMeal `json:"items"`
+	}
+	got := decode[resp](t, h.do("GET", "/fuel/frequent", nil, ""))
+	if len(got.Items) != 2 || got.Items[0].Times != 2 || len(got.Items[0].Items) != 2 || got.Items[1].Items[0].Item != "Skyr" {
+		t.Fatalf("frequent %+v", got.Items)
+	}
+	if rec := h.do("GET", "/fuel/frequent?limit=11", nil, ""); rec.Code != 400 {
+		t.Fatalf("limit 11: %d", rec.Code)
 	}
 }

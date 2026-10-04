@@ -184,6 +184,7 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("GET /fuel/photo/{id}", s.handlePhoto)
 	mux.HandleFunc("GET /fuel/snapshot", s.handleSnapshot)
 	mux.HandleFunc("GET /fuel/recent", s.handleRecent)
+	mux.HandleFunc("GET /fuel/frequent", s.handleFrequent)
 	mux.HandleFunc("POST /fuel/relog", s.turnBound(s.handleRelog))
 	mux.HandleFunc("GET /fuel/day", s.handleDay)
 	// v7 (spec 18.4, 18.5 and section 19): records, calibration, the week.
