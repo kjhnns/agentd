@@ -122,6 +122,9 @@ type Entry struct {
 	// write of the turn is bound to this ONE entry. Agent is then pending |
 	// done | failed, and AgentText is the agent's answer or the failure text.
 	Chat string `json:"chat,omitempty"`
+	// IntentHint is what the user marked at the input (spec 22.13): "log",
+	// "ask" (a question: the turn can write nothing) or "" (not marked).
+	IntentHint string `json:"intent_hint,omitempty"`
 	// MovedIDs are the new items (on the target day) of the moves of an
 	// agent chat entry. They are not items of the entry's cards.
 	MovedIDs []string `json:"moved_ids,omitempty"`
@@ -793,6 +796,8 @@ type FeedItem struct {
 	PhotoIDs []string  `json:"photo_ids"`
 	EntryID  *string   `json:"entry_id"`
 	Blocks   []Block   `json:"blocks"`
+	// IntentHint of a user line: what the user marked ("log" | "ask").
+	IntentHint string `json:"intent_hint,omitempty"`
 	// ShowItems marks the fuel reply that carries the entry's item cards.
 	ShowItems bool `json:"show_items,omitempty"`
 	// NoticeOp is the failed op a "could not save" line reports (once per op).

@@ -1218,3 +1218,19 @@ Double writes: every user action makes one `client_id` and one request body, and
 Known limit: the open requests live in the memory of the page. A reload while a request is open forgets it; the feed and the table then show what the server has. Recovery across a reload needs the lookup and cancel routes of the plan (17.7), not built.
 
 Not in release 1: Trends, Records, export, the review of second opinions, PWA, offline, voice, reload recovery of an unanswered photo send (plan 17.7).
+
+
+### 22.13 The intent the user marks (2026-10-04)
+
+Joe (2026-10-04): 83 to 85 % of his 137 chat messages of four days are a log or the question what to eat; he wants two buttons at the input. Analysis and design: wiki page fuel-composer-intent-proposal-2026-10.
+
+- `POST /fuel/log` takes the optional `intent_hint` = `log` | `ask`, as a multipart part or a JSON key. Another value: 400 bad_input. Absent = not marked; nothing changes for such a request.
+- Request hash: the hint is hashed only when present (`\x00intent\x00<value>` after the image hashes). The hash of an unmarked request is unchanged, so every stored idempotency record stays valid. The same client_id with another hint is 409.
+- The hint is stored with the journal entry (`intent_hint`) and on the user line of the feed; GET /fuel/feed returns it on user lines (omitted when empty).
+- `ask` writes NOTHING, on both backends:
+  - agent: the turn is closed for writes before the message is sent, the header has no capability and no write instruction and says "Joe marked this message as a QUESTION ... every write is refused". A write with any capability answers turn_closed. Reads and POST /fuel/preview stay open.
+  - estimator: the model gets the line "QUESTION of the user ... Log nothing"; the photo-only rule (a photo with no caption is a log) does not apply; an answer with a write intent (log, correct, undo, move) is replaced by a question answer with its text, or by a fixed line when it has none.
+  - The promise is "no Fuel write in this turn". It is not a sandbox of the agent session (section 22.3 holds).
+- `log` adds one header line for the agent ("Joe marked this message as a LOG ..."). It forces nothing: a question typed with Log selected is answered as a question. On the estimator it has no effect.
+- A deploy puts the server first: a server before this section refuses the unknown multipart part with 400.
+- Tests: TestIntentHintHashAndValidation, TestIntentAskWritesNothingOnTheEstimator, TestIntentAskTurnOfTheAgentHasNoCapability.

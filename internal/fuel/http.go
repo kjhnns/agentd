@@ -351,7 +351,14 @@ type logInput struct {
 	LocalTime string
 	Audio     []byte
 	Images    [][]byte
+	// Intent is the optional intent_hint (spec 22.13): "log" | "ask" | "".
+	Intent string
 }
+
+const (
+	intentLog = "log"
+	intentAsk = "ask"
+)
 
 func (in logInput) hash() string {
 	h := sha256.New()
@@ -364,6 +371,11 @@ func (in logInput) hash() string {
 	for _, im := range in.Images {
 		x := sha256.Sum256(im)
 		h.Write(x[:])
+	}
+	// Only a marked request: the hash of a request with no hint stays what
+	// it was before the hint existed.
+	if in.Intent != "" {
+		fmt.Fprintf(h, "\x00intent\x00%s", in.Intent)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -413,7 +425,7 @@ func (s *Service) readLogInput(w http.ResponseWriter, r *http.Request) (logInput
 				return b, nil
 			}
 			switch name {
-			case "client_id", "text", "local_time":
+			case "client_id", "text", "local_time", "intent_hint":
 				b, e := readCap(16 << 10)
 				if e != nil {
 					if name == "text" {
@@ -428,6 +440,8 @@ func (s *Service) readLogInput(w http.ResponseWriter, r *http.Request) (logInput
 					in.Text = string(b)
 				case "local_time":
 					in.LocalTime = strings.TrimSpace(string(b))
+				case "intent_hint":
+					in.Intent = strings.TrimSpace(string(b))
 				}
 			case "audio":
 				if in.Audio != nil {
@@ -457,6 +471,7 @@ func (s *Service) readLogInput(w http.ResponseWriter, r *http.Request) (logInput
 			ClientID  string `json:"client_id"`
 			Text      string `json:"text"`
 			LocalTime string `json:"local_time"`
+			Intent    string `json:"intent_hint"`
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 		if err := decodeStrict(r.Body, &body); err != nil {
@@ -466,6 +481,7 @@ func (s *Service) readLogInput(w http.ResponseWriter, r *http.Request) (logInput
 			return in, errf(http.StatusBadRequest, "bad_input", false, "bad JSON body (one object; text-only logs; use multipart for audio or images)")
 		}
 		in.ClientID, in.Text, in.LocalTime = strings.TrimSpace(body.ClientID), body.Text, strings.TrimSpace(body.LocalTime)
+		in.Intent = strings.TrimSpace(body.Intent)
 	default:
 		return in, errf(http.StatusUnsupportedMediaType, "unsupported_media", false, "use multipart/form-data or application/json")
 	}
@@ -473,6 +489,9 @@ func (s *Service) readLogInput(w http.ResponseWriter, r *http.Request) (logInput
 	in.Text = strings.TrimSpace(in.Text)
 	if !clientIDRe.MatchString(in.ClientID) {
 		return in, errf(http.StatusBadRequest, "bad_input", false, "client_id (a uuid) is required")
+	}
+	if in.Intent != "" && in.Intent != intentLog && in.Intent != intentAsk {
+		return in, errf(http.StatusBadRequest, "bad_input", false, "intent_hint must be log or ask")
 	}
 	if utf8.RuneCountInString(in.Text) > maxTextChars {
 		return in, errf(http.StatusRequestEntityTooLarge, "too_large", false, "text over %d characters", maxTextChars)
@@ -657,7 +676,11 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 	for _, p := range imgs {
 		mi.Images = append(mi.Images, p.Model)
 	}
-	mi.PhotoOnly = len(imgs) > 0 && in.Text == "" && (transcript == nil || strings.TrimSpace(*transcript) == "")
+	mi.PhotoOnly = in.Intent != intentAsk && len(imgs) > 0 && in.Text == "" && (transcript == nil || strings.TrimSpace(*transcript) == "")
+	if in.Intent == intentAsk {
+		// The user marked the message as a question (spec 22.13).
+		mi.Text = "QUESTION of the user. Nothing in this message was eaten or drunk yet. Log nothing, change nothing, answer the question.\n" + foodText
+	}
 	out, e := s.callModel(ctx, mi)
 	noFood := false
 	if e == nil && mi.PhotoOnly && (out.RawIntent == "question" || len(out.Items) == 0) {
@@ -750,6 +773,17 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errf(http.StatusGatewayTimeout, "timeout", true, "took too long; nothing was written, retry"))
 		return
 	}
+	if in.Intent == intentAsk && out.Intent != "question" {
+		// A marked question writes NOTHING (spec 22.13), whatever the model
+		// made of it: no log, no correction, no removal, no move.
+		log.Printf("fuel: a marked question came back as %s; nothing is written", out.Intent)
+		txt := strings.TrimSpace(out.Text)
+		if txt == "" {
+			txt = "You sent this as a question, so nothing was logged or changed. I have no answer to it; ask again in other words."
+		}
+		out = &ModelOutput{Intent: "question", RawIntent: "question", Text: txt, ClinicalTopic: out.ClinicalTopic}
+		checks, scaleNotes, badRevised, ask = nil, nil, nil, ""
+	}
 	// The chat guard (spec 18.4): on a clinical topic the model's text is
 	// dropped and never stored or shown; food in the same message is processed
 	// normally and the reply ends with the fixed line.
@@ -800,7 +834,7 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	entry := Entry{ID: newID("en_"), ClientID: in.ClientID, Date: date, EatenAt: eatenAt, CreatedAt: now,
+	entry := Entry{ID: newID("en_"), ClientID: in.ClientID, Date: date, EatenAt: eatenAt, CreatedAt: now, IntentHint: in.Intent,
 		Intent: out.Intent, Transcript: transcript, PhotoIDs: []string{}, ReqHash: hash, Note: note, Clinical: clinical}
 	if out.Intent == "log" && (date != now.In(targets.loc).Format("2006-01-02") || date != requestDate) {
 		entry.DayLabel = dayLabel(date)
@@ -1208,7 +1242,7 @@ func (s *Service) appendUserFeed(e Entry) {
 	eid := e.ID
 	if !s.feed.HasKey("u:" + e.ID) {
 		userText := e.UserText
-		if _, err := s.feed.Append(FeedItem{At: e.CreatedAt, Role: "user", Text: &userText, PhotoIDs: e.PhotoIDs, EntryID: &eid, Key: "u:" + e.ID}); err != nil {
+		if _, err := s.feed.Append(FeedItem{At: e.CreatedAt, Role: "user", Text: &userText, PhotoIDs: e.PhotoIDs, EntryID: &eid, Key: "u:" + e.ID, IntentHint: e.IntentHint}); err != nil {
 			log.Printf("fuel: feed append for %s failed", e.ID)
 		}
 	}
@@ -2121,6 +2155,8 @@ type feedOut struct {
 	EntryID  *string     `json:"entry_id"`
 	Items    []ItemState `json:"items"`
 	Blocks   []Block     `json:"blocks"`
+	// IntentHint of a user line: what the user marked ("log" | "ask", spec 22.13).
+	IntentHint string `json:"intent_hint,omitempty"`
 }
 
 func (s *Service) handleFeed(w http.ResponseWriter, r *http.Request) {
@@ -2171,7 +2207,7 @@ func (s *Service) handleFeed(w http.ResponseWriter, r *http.Request) {
 	s.stateMu.RLock()
 	out := make([]feedOut, 0, len(page))
 	for _, it := range page {
-		fo := feedOut{ID: it.ID, At: it.At, Role: it.Role, Text: it.Text, PhotoIDs: it.PhotoIDs, EntryID: it.EntryID, Items: []ItemState{}, Blocks: it.Blocks}
+		fo := feedOut{ID: it.ID, At: it.At, Role: it.Role, Text: it.Text, PhotoIDs: it.PhotoIDs, EntryID: it.EntryID, Items: []ItemState{}, Blocks: it.Blocks, IntentHint: it.IntentHint}
 		if it.EntryID != nil && it.Role == "fuel" && len(fo.Blocks) > 0 && fo.Blocks[0].Type == "text" {
 			if e, ok := s.journal.Entry(*it.EntryID); ok && e.Chat == chatAgent {
 				// An agent chat reply: its write line shows the ops' CURRENT state.

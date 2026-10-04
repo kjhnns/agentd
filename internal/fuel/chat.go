@@ -163,6 +163,17 @@ Capability of this turn, for every write: %s
 End your answer with this line, alone, as the last line: FUEL-END %s
 Received: %s. Log date of this turn: %s. Now: %s.`
 
+// chatHeaderAsk is the header of a turn the user marked as a question (spec
+// 22.13). It carries NO capability: the turn is closed for writes before
+// the agent sees it, so nothing can be logged or changed.
+const chatHeaderAsk = `FUEL TURN
+Follow the instructions of your workspace (Fuel chat agent). This message is built by fueld, the Fuel server.
+Joe marked this message as a QUESTION. Nothing in it was eaten or drunk yet.
+This turn has NO capability: every write is refused. Log nothing and change nothing; do not try. Reads are open.
+Answer the question (for example what to eat next, or which of the photographed options to take).
+End your answer with this line, alone, as the last line: FUEL-END %s
+Received: %s. Log date of this turn: %s. Now: %s.`
+
 type chatBudget struct {
 	Key      string   `json:"key"`
 	Unit     string   `json:"unit"`
@@ -216,8 +227,16 @@ func chatItemLine(d DayItem, loc *time.Location) string {
 // clinician text and no token is in it.
 func (s *Service) chatMessage(e Entry, capability, mark string, paths []string, now time.Time, loc *time.Location) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, chatHeader, capability, capability, mark,
-		e.EatenAt.In(loc).Format("Mon 2006-01-02 15:04"), e.Date, now.In(loc).Format("Mon 2006-01-02 15:04 MST"))
+	if e.IntentHint == intentAsk {
+		fmt.Fprintf(&b, chatHeaderAsk, mark,
+			e.EatenAt.In(loc).Format("Mon 2006-01-02 15:04"), e.Date, now.In(loc).Format("Mon 2006-01-02 15:04 MST"))
+	} else {
+		fmt.Fprintf(&b, chatHeader, capability, capability, mark,
+			e.EatenAt.In(loc).Format("Mon 2006-01-02 15:04"), e.Date, now.In(loc).Format("Mon 2006-01-02 15:04 MST"))
+		if e.IntentHint == intentLog {
+			b.WriteString("\nJoe marked this message as a LOG: he ate or drank what the message and the photos show.")
+		}
+	}
 	if len(paths) > 0 {
 		fmt.Fprintf(&b, "\nPhotos of this turn (%d). Look at EVERY path with the Read tool before you answer:", len(paths))
 		for _, p := range paths {
@@ -422,6 +441,11 @@ func (s *Service) chatRun(ctx context.Context, e Entry, photos [][]byte) chatRes
 
 	t := s.turnOpen(e, e.CreatedAt)
 	defer s.turnClose(t)
+	if e.IntentHint == intentAsk {
+		// A marked question: the turn is closed for writes from the start
+		// and its capability is never sent (spec 22.13).
+		s.turnClose(t)
+	}
 	mark := strings.ToUpper(randHex(3))
 	ag := s.o.Chat.Agent
 	res := chatResult{photos: len(photos)}
@@ -898,7 +922,7 @@ func (s *Service) chatAccept(ctx context.Context, w http.ResponseWriter, in logI
 		}
 	}
 	entry := Entry{ID: newID("en_"), ClientID: in.ClientID, Date: date, EatenAt: eatenAt, CreatedAt: now, Intent: "question",
-		Transcript: transcript, PhotoIDs: []string{}, ReqHash: hash, UserText: text, Chat: chatAgent, Agent: agentPending}
+		Transcript: transcript, PhotoIDs: []string{}, ReqHash: hash, UserText: text, Chat: chatAgent, Agent: agentPending, IntentHint: in.Intent}
 	if clinical {
 		// The clinical guard wins (22.2): not sent, nothing written.
 		entry.Clinical, entry.Agent = true, agentDone
