@@ -12,6 +12,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -217,12 +218,14 @@ func (a *Adapter) echo(text string, silent bool) {
 //	GET  /watch/messages?after=N&limit=M&wait=S   incremental, long-polled
 //	GET  /watch/messages?before=<id>&limit=M  one page of OLDER messages
 //	POST /watch/messages   JSON {text}  |  multipart file (+text)  -> 202 {message}
+//	POST /watch/transcribe multipart audio file -> 200 {text}; no message, no turn
 //	GET  /watch/ui[?token=]                   the desktop web UI
 func (a *Adapter) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/watch/ping", a.handlePing)
 	mux.HandleFunc("/watch/usage", a.handleUsage)
 	mux.HandleFunc("/watch/messages", a.handleMessages)
+	mux.HandleFunc("/watch/transcribe", a.handleTranscribe)
 	gated := a.auth(mux)
 
 	// The UI route runs BEFORE the gate: it owns the sign-in flow (it turns a
@@ -388,6 +391,63 @@ func (a *Adapter) handleMessages(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// handleTranscribe is dictation: one audio file in, its transcript out. It
+// stores no message and starts no turn, so the client can put the text into
+// its composer, where it is edited and sent like typed text (the same shape as
+// tix's /api/v1/transcribe). The audio is never kept, also not when the
+// transcription fails: a dictation that did not work is simply spoken again.
+func (a *Adapter) handleTranscribe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.media == nil {
+		writeErr(w, http.StatusServiceUnavailable, "media not configured")
+		return
+	}
+	cap := int64(20 << 20)
+	if a.media.MaxBytes > 0 {
+		cap = a.media.MaxBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, cap+(1<<20))
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad multipart body: "+err.Error())
+		return
+	}
+	file, hdr, err := r.FormFile("file")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "no audio: give a file field")
+		return
+	}
+	defer file.Close()
+	if kind, ok := media.KindFor(hdr.Filename, hdr.Header.Get("Content-Type")); !ok || kind != media.KindAudio {
+		writeErr(w, http.StatusUnsupportedMediaType, "only audio can be transcribed")
+		return
+	}
+	art, ierr := a.media.Ingest(r.Context(), media.Request{
+		Reader:    io.LimitReader(file, cap+1),
+		Filename:  hdr.Filename,
+		Mime:      hdr.Header.Get("Content-Type"),
+		Source:    "watch-dictate",
+		ChatLabel: a.userID,
+	})
+	if art.Path != "" {
+		_ = os.Remove(art.Path)
+	}
+	if ierr != nil {
+		switch {
+		case errors.Is(ierr, media.ErrTooLarge):
+			writeErr(w, http.StatusRequestEntityTooLarge, ierr.Error())
+		case errors.Is(ierr, media.ErrTranscribe):
+			writeErr(w, http.StatusBadGateway, "transcription failed, please try again")
+		default:
+			writeErr(w, http.StatusInternalServerError, ierr.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"text": strings.TrimSpace(art.Transcript), "duration_s": art.DurationS})
 }
 
 // handleFetch serves the three read shapes a paging client needs: the newest

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -223,6 +224,94 @@ func TestVoiceUploadCarriesTranscriptAndMedia(t *testing.T) {
 	_ = mw2.Close()
 	if rec := do(t, noMedia, http.MethodPost, "/watch/messages", "wt", &buf2, mw2.FormDataContentType()); rec.Code != 503 {
 		t.Fatalf("no media: %d", rec.Code)
+	}
+}
+
+type failingTranscriber struct{}
+
+func (failingTranscriber) Transcribe(ctx context.Context, path string) (media.Transcript, error) {
+	return media.Transcript{}, errors.New("upstream down")
+}
+
+func audioForm(filename, ctype string) (*bytes.Buffer, string) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	part, _ := mw.CreatePart(map[string][]string{
+		"Content-Disposition": {`form-data; name="file"; filename="` + filename + `"`},
+		"Content-Type":        {ctype},
+	})
+	_, _ = part.Write([]byte("AACDATA"))
+	_ = mw.Close()
+	return &buf, mw.FormDataContentType()
+}
+
+func filesUnder(t *testing.T, dir string) int {
+	t.Helper()
+	n := 0
+	_ = filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			n++
+		}
+		return nil
+	})
+	return n
+}
+
+// Dictation: the transcript comes back, and NOTHING else happens: no stored
+// message, no inbound turn, no audio left on disk (also after a failure).
+func TestTranscribeReturnsTextAndStartsNothing(t *testing.T) {
+	st, _ := OpenStore("")
+	dir := t.TempDir()
+	a := New("wt", st).WithMedia(&media.Service{Dir: dir, Transcriber: stubTranscriber{" book the train to bern "}})
+	h := a.Handler()
+
+	buf, ct := audioForm("memo.m4a", "audio/mp4")
+	rec := do(t, h, http.MethodPost, "/watch/transcribe", "wt", buf, ct)
+	if rec.Code != 200 {
+		t.Fatalf("transcribe: %d %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Text string `json:"text"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if out.Text != "book the train to bern" {
+		t.Fatalf("text = %q", out.Text)
+	}
+	if msgs, _, _ := st.Tail(10); len(msgs) != 0 {
+		t.Fatalf("dictation stored a message: %+v", msgs)
+	}
+	select {
+	case in := <-a.Inbound():
+		t.Fatalf("dictation started a turn: %+v", in)
+	default:
+	}
+	if n := filesUnder(t, dir); n != 0 {
+		t.Fatalf("%d audio file(s) left after a dictation", n)
+	}
+
+	// The gate applies; a photo is refused; GET is not a way in.
+	buf, ct = audioForm("memo.m4a", "audio/mp4")
+	if rec := do(t, h, http.MethodPost, "/watch/transcribe", "", buf, ct); rec.Code != 401 {
+		t.Fatalf("no token: %d", rec.Code)
+	}
+	buf, ct = audioForm("p.jpg", "image/jpeg")
+	if rec := do(t, h, http.MethodPost, "/watch/transcribe", "wt", buf, ct); rec.Code != 415 {
+		t.Fatalf("photo: %d", rec.Code)
+	}
+	if rec := do(t, h, http.MethodGet, "/watch/transcribe", "wt", nil, ""); rec.Code != 405 {
+		t.Fatalf("GET: %d", rec.Code)
+	}
+
+	// A failed transcription is a 502 and keeps no audio.
+	dir2 := t.TempDir()
+	st2, _ := OpenStore("")
+	bad := New("wt", st2).WithMedia(&media.Service{Dir: dir2, Transcriber: failingTranscriber{}}).Handler()
+	buf, ct = audioForm("memo.m4a", "audio/mp4")
+	if rec := do(t, bad, http.MethodPost, "/watch/transcribe", "wt", buf, ct); rec.Code != 502 {
+		t.Fatalf("failing transcriber: %d", rec.Code)
+	}
+	if n := filesUnder(t, dir2); n != 0 {
+		t.Fatalf("%d audio file(s) kept after a failed dictation", n)
 	}
 }
 
