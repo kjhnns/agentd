@@ -397,32 +397,6 @@ func familyTokens(names []string) map[string]bool {
 	return out
 }
 
-// headWords are the last food words of the items of a small candidate
-// ("bialetti moka coffee" and "filter coffee" are both coffee; "water" and
-// "lime juice + sparkling water" both have water). A meal of more than two
-// items has none: a breakfast with a coffee is not the coffee family.
-func headWords(names []string) map[string]bool {
-	out := map[string]bool{}
-	if len(names) > 2 {
-		return out
-	}
-	for _, n := range names {
-		if w := familyWords(n); len(w) > 0 {
-			out[w[len(w)-1]] = true
-		}
-	}
-	return out
-}
-
-func intersects(a, b map[string]bool) bool {
-	for w := range a {
-		if b[w] {
-			return true
-		}
-	}
-	return false
-}
-
 func subset(a, b map[string]bool) bool {
 	for w := range a {
 		if !b[w] {
@@ -433,17 +407,19 @@ func subset(a, b map[string]bool) bool {
 }
 
 // frequentMeals ranks what was logged most often, with NO near-duplicates
-// (Joe, 2026-10-04: water with lime in every variant filled the top five).
+// (Joe, 2026-10-04: water with lime in every variant filled the top five),
+// but two different foods never share a slot (Joe, 2026-10-07: moka coffee
+// and filter coffee were one slot, and only the newest could be tapped).
 //  1. Every meal has a signature: the family names of its items, sorted.
 //     Meals with the same signature are one candidate; its form is the
 //     newest of its meals.
 //  2. Candidates are taken by count (then by the newest meal). A candidate
-//     is the same family as one already taken when the food words of one
-//     are all among the words of the other ("water" and "sparkling water",
-//     with or without lime juice), or when both have at most two items and
-//     share the last word of an item ("moka coffee", "filter coffee"; "water
-//     + lime juice", "sparkling water"). Its count goes to that
-//     family and it gets no slot of its own.
+//     is the same family as one already taken when both have the same
+//     number of items and the food words of one are all among the words of
+//     the other ("water" and "sparkling water"). Its count goes to that
+//     family and it gets no slot of its own. A shared last word is not
+//     enough ("moka coffee", "filter coffee"), and a food alone is never
+//     the family of a combination with it ("water", "water + lime juice").
 //  3. The families are ordered by their total count.
 func frequentMeals(items []RecentItem, meals []mealOcc, limit int) []FrequentMeal {
 	byKey := map[string]RecentItem{}
@@ -492,17 +468,20 @@ func frequentMeals(items []RecentItem, meals []mealOcc, limit int) []FrequentMea
 	type family struct {
 		FrequentMeal
 		tokens map[string]bool
-		heads  map[string]bool
+		n      int
 	}
 	var fams []family
 next:
 	for _, c := range cands {
-		tokens, heads := familyTokens(c.fams), headWords(c.fams)
+		tokens := familyTokens(c.fams)
 		for i := range fams {
 			if len(tokens) == 0 {
 				break
 			}
-			if subset(tokens, fams[i].tokens) || subset(fams[i].tokens, tokens) || intersects(heads, fams[i].heads) {
+			if len(c.fams) != fams[i].n {
+				continue
+			}
+			if subset(tokens, fams[i].tokens) || subset(fams[i].tokens, tokens) {
 				fams[i].Times += c.times
 				if c.newest.at.After(fams[i].LastEatenAt) {
 					fams[i].LastEatenAt = c.newest.at
@@ -523,7 +502,7 @@ next:
 		}
 		h := sha256.Sum256([]byte("frequent|" + c.sig))
 		fm.Key = hex.EncodeToString(h[:8])
-		fams = append(fams, family{FrequentMeal: fm, tokens: tokens, heads: heads})
+		fams = append(fams, family{FrequentMeal: fm, tokens: tokens, n: len(c.fams)})
 	}
 	sort.SliceStable(fams, func(a, b int) bool { return fams[a].Times > fams[b].Times })
 	out := make([]FrequentMeal, 0, limit)

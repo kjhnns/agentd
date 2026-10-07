@@ -253,7 +253,8 @@ func TestRelogSharesTheLogSlots(t *testing.T) {
 }
 
 // GET /fuel/frequent: variants of one food and of one combination take ONE
-// slot (Joe, 2026-10-04), the slot shows the most frequent form, and the
+// slot (Joe, 2026-10-04), two different foods never share one (Joe,
+// 2026-10-07: moka coffee and filter coffee), and the
 // items of a combination are the items of a meal.
 func TestFrequentMergesVariantsAndKeepsCombinations(t *testing.T) {
 	names := func(m FrequentMeal) string {
@@ -284,8 +285,8 @@ func TestFrequentMergesVariantsAndKeepsCombinations(t *testing.T) {
 		meals = append(meals, m)
 	}
 	// Water with lime: the combination 3 times (three names of the juice are
-	// ONE form), sparkling water 3 times, the can once = 7 logs, one slot.
-	// Equal counts: the form logged last wins the slot.
+	// ONE form) is one slot. Sparkling water 3 times and the can once = 4
+	// logs, one slot of its own.
 	add(1, "water", "lime juice, half a lime squeezed")
 	add(2, "water", "lime juice, freshly squeezed")
 	add(3, "sparkling water")
@@ -293,7 +294,7 @@ func TestFrequentMergesVariantsAndKeepsCombinations(t *testing.T) {
 	add(5, "sparkling water")
 	add(6, "water", "Lime juice, fresh")
 	add(7, "lime sparkling water (can)")
-	// Coffee in two forms: 2 + 1.
+	// Two coffees are two slots: 2 and 1.
 	add(8, "Bialetti moka coffee, black")
 	add(9, "Bialetti moka coffee, black")
 	add(10, "filter coffee, black")
@@ -306,15 +307,23 @@ func TestFrequentMergesVariantsAndKeepsCombinations(t *testing.T) {
 	for _, m := range got {
 		lines = append(lines, fmt.Sprintf("%s x%d", names(m), m.Times))
 	}
-	want := []string{"Lime juice, fresh+water x7", "Bialetti moka coffee, black x3", "Migros cottage cheese nature x1", "orange juice x1"}
+	want := []string{"sparkling water x4", "Lime juice, fresh+water x3", "Bialetti moka coffee, black x2", "Migros cottage cheese nature x1", "orange juice x1"}
 	if strings.Join(lines, "; ") != strings.Join(want, "; ") {
 		t.Fatalf("frequent:\n got %v\nwant %v", lines, want)
+	}
+	// The second coffee has its own slot, with its own count.
+	coffee := map[string]int{}
+	for _, m := range frequentMeals(items, meals, 10) {
+		coffee[names(m)] = m.Times
+	}
+	if coffee["Bialetti moka coffee, black"] != 2 || coffee["filter coffee, black"] != 1 {
+		t.Fatalf("coffee slots %v", coffee)
 	}
 	// With the combination as the most frequent form, the slot holds both items.
 	add(13, "water", "lime juice, half a lime squeezed")
 	add(14, "water", "lime juice, half a lime squeezed")
 	got = frequentMeals(items, meals, 5)
-	if n := names(got[0]); n != "lime juice, half a lime squeezed+water" || got[0].Times != 9 || len(got[0].Items) != 2 {
+	if n := names(got[0]); n != "lime juice, half a lime squeezed+water" || got[0].Times != 5 || len(got[0].Items) != 2 {
 		t.Fatalf("first slot %q x%d", n, got[0].Times)
 	}
 	if got[0].Key == "" || got[0].Key == got[1].Key {
