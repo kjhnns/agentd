@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -344,6 +345,178 @@ func TestPhotoUploadCarriesCaptionAndImage(t *testing.T) {
 	if len(in.Media) != 1 || in.Media[0].Kind != media.KindImage || in.Media[0].Path == "" || in.Text != "what is this?" {
 		t.Fatalf("inbound = %+v", in)
 	}
+}
+
+// photoPost builds a multipart delegation with the given "file" parts.
+func photoPost(text string, parts ...[3]string) (*bytes.Buffer, string) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	if text != "" {
+		_ = mw.WriteField("text", text)
+	}
+	for i, p := range parts {
+		part, _ := mw.CreatePart(map[string][]string{
+			"Content-Disposition": {fmt.Sprintf(`form-data; name="file"; filename="f%d%s"`, i, p[1])},
+			"Content-Type":        {p[0]},
+		})
+		// p[2], when set, is the content; else JPEG bytes.
+		content := "\xff\xd8\xff\xe0JPEGDATA" + strconv.Itoa(i)
+		if p[2] != "" {
+			content = p[2]
+		}
+		_, _ = part.Write([]byte(content))
+	}
+	_ = mw.Close()
+	return &buf, mw.FormDataContentType()
+}
+
+func TestSeveralPhotosAreOneDelegation(t *testing.T) {
+	a, st := newAdapter(t)
+	jpg := [3]string{"image/jpeg", ".jpg", ""}
+	body, ct := photoPost("compare these", jpg, jpg, jpg)
+	rec := do(t, a.Handler(), http.MethodPost, "/watch/messages", "wt", body, ct)
+	if rec.Code != 202 {
+		t.Fatalf("three photos: %d %s", rec.Code, rec.Body.String())
+	}
+	var posted struct {
+		Message Message `json:"message"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &posted)
+	if posted.Message.Kind != KindText || posted.Message.Text != "compare these\n[3 photos]" {
+		t.Fatalf("receipt = %+v", posted.Message)
+	}
+	// ONE inbound message with all three files, each its own path.
+	in := <-a.Inbound()
+	if len(in.Media) != 3 || in.Text != "compare these" {
+		t.Fatalf("inbound = %+v", in)
+	}
+	seen := map[string]bool{}
+	for _, m := range in.Media {
+		if m.Kind != media.KindImage || m.Path == "" || seen[m.Path] {
+			t.Fatalf("media = %+v", in.Media)
+		}
+		seen[m.Path] = true
+	}
+	select {
+	case extra := <-a.Inbound():
+		t.Fatalf("a second inbound message: %+v", extra)
+	default:
+	}
+	if msgs, _, _ := st.Tail(100); len(msgs) != 1 {
+		n := len(msgs)
+		t.Fatalf("stored messages = %d, want 1", n)
+	}
+
+	// The ping tells a client the limit.
+	ping := do(t, a.Handler(), http.MethodGet, "/watch/ping", "wt", nil, "")
+	var p struct {
+		MaxFiles int `json:"max_files"`
+	}
+	_ = json.Unmarshal(ping.Body.Bytes(), &p)
+	if p.MaxFiles != maxPostFiles {
+		t.Fatalf("ping max_files = %d", p.MaxFiles)
+	}
+}
+
+func TestSeveralFilesMustAllBePhotosAndAtMostTheLimit(t *testing.T) {
+	a, st := newAdapter(t)
+	jpg := [3]string{"image/jpeg", ".jpg", ""}
+	// A voice file next to a photo: refused before anything is stored.
+	// The content decides, not the label: MP4 audio bytes labelled as a
+	// JPEG are refused, and a real JPEG labelled as a generic file is a photo.
+	m4a := "\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00M4A mp42isom"
+	body, ct := photoPost("", jpg, [3]string{"audio/mp4", ".m4a", m4a})
+	if rec := do(t, a.Handler(), http.MethodPost, "/watch/messages", "wt", body, ct); rec.Code != 400 {
+		t.Fatalf("photo + voice: %d %s", rec.Code, rec.Body.String())
+	}
+	body, ct = photoPost("", jpg, [3]string{"image/jpeg", ".jpg", m4a})
+	if rec := do(t, a.Handler(), http.MethodPost, "/watch/messages", "wt", body, ct); rec.Code != 400 {
+		t.Fatalf("audio labelled as a photo: %d %s", rec.Code, rec.Body.String())
+	}
+	many := make([][3]string, maxPostFiles+1)
+	for i := range many {
+		many[i] = jpg
+	}
+	body, ct = photoPost("", many...)
+	if rec := do(t, a.Handler(), http.MethodPost, "/watch/messages", "wt", body, ct); rec.Code != 400 {
+		t.Fatalf("too many: %d %s", rec.Code, rec.Body.String())
+	}
+	if msgs, _, _ := st.Tail(100); len(msgs) != 0 {
+		n := len(msgs)
+		t.Fatalf("a refused message was stored: %d", n)
+	}
+	select {
+	case in := <-a.Inbound():
+		t.Fatalf("a refused message started a turn: %+v", in)
+	default:
+	}
+}
+
+func TestPhotosWithAGenericLabelAreStillPhotos(t *testing.T) {
+	a, _ := newAdapter(t)
+	raw := [3]string{"application/octet-stream", ".jpg", ""}
+	body, ct := photoPost("two", raw, raw)
+	rec := do(t, a.Handler(), http.MethodPost, "/watch/messages", "wt", body, ct)
+	if rec.Code != 202 {
+		t.Fatalf("two unlabelled JPEGs: %d %s", rec.Code, rec.Body.String())
+	}
+	in := <-a.Inbound()
+	if len(in.Media) != 2 || in.Media[0].Kind != media.KindImage || in.Media[1].Kind != media.KindImage {
+		t.Fatalf("inbound = %+v", in)
+	}
+	// Each stored file holds its own bytes, in the order of the parts.
+	for i, m := range in.Media {
+		got, err := os.ReadFile(m.Path)
+		if err != nil || !bytes.HasSuffix(got, []byte("JPEGDATA"+strconv.Itoa(i))) {
+			t.Fatalf("file %d: %q %v", i, got, err)
+		}
+	}
+}
+
+func TestAFullQueueLeavesNoPhotoOnDisk(t *testing.T) {
+	a, _ := newAdapter(t)
+	jpg := [3]string{"image/jpeg", ".jpg", ""}
+	// Fill the inbound queue (nobody reads it), then send photos.
+	for i := 0; i < cap(a.inbound)+1; i++ {
+		do(t, a.Handler(), http.MethodPost, "/watch/messages", "wt", bytes.NewBufferString(`{"text":"fill"}`), "application/json")
+	}
+	var kept []string
+drain:
+	for {
+		select {
+		case in := <-a.Inbound():
+			for _, m := range in.Media {
+				kept = append(kept, m.Path)
+			}
+		default:
+			break drain
+		}
+	}
+	for i := 0; i < cap(a.inbound); i++ {
+		do(t, a.Handler(), http.MethodPost, "/watch/messages", "wt", bytes.NewBufferString(`{"text":"fill"}`), "application/json")
+	}
+	before := imageFiles(t, a)
+	body, ct := photoPost("late", jpg, jpg)
+	rec := do(t, a.Handler(), http.MethodPost, "/watch/messages", "wt", body, ct)
+	if rec.Code != 503 {
+		t.Fatalf("full queue: %d %s", rec.Code, rec.Body.String())
+	}
+	if after := imageFiles(t, a); after != before {
+		t.Fatalf("photos of a refused message stayed on disk: %d before, %d after", before, after)
+	}
+}
+
+// imageFiles counts the .jpg files under the adapter's media directory.
+func imageFiles(t *testing.T, a *Adapter) int {
+	t.Helper()
+	n := 0
+	_ = filepath.WalkDir(a.media.Dir, func(p string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(p, ".jpg") {
+			n++
+		}
+		return nil
+	})
+	return n
 }
 
 func TestEmptyAndBadPosts(t *testing.T) {

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"os"
@@ -377,8 +378,12 @@ func (a *Adapter) handlePing(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// max_files tells a client how many photos one delegation takes. A
+	// server from before it took only the first file part and dropped the
+	// rest without a word, so a client sends several only when it reads this.
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "title": a.title, "pending": a.store.Pending(), "server_time": a.now(),
+		"max_files": maxPostFiles,
 	})
 }
 
@@ -583,14 +588,20 @@ func isHTTPS(r *http.Request) bool {
 	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
+// maxPostFiles is how many "file" parts one delegation takes. More than one
+// is allowed for photos only: several angles or pages for ONE question.
+const maxPostFiles = 6
+
 // handlePost accepts one delegation: JSON {"text"} or multipart with a "file"
 // (voice, transcribed synchronously so the receipt already carries the text)
-// and an optional "text" field. It answers 202 with the stored user message
-// as soon as the turn is QUEUED; the reply arrives later through fetch.
+// and an optional "text" field. The "file" part can repeat, up to
+// maxPostFiles times, when every part is an image; all of them go to the
+// SAME turn. It answers 202 with the stored user message as soon as the turn
+// is QUEUED; the reply arrives later through fetch.
 func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 	var (
 		text string
-		art  *media.Artifact
+		arts []media.Artifact
 	)
 	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	switch {
@@ -609,24 +620,53 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusRequestEntityTooLarge, "text too long")
 			return
 		}
-		file, hdr, err := r.FormFile("file")
-		if err == nil {
-			defer file.Close()
-			if a.media == nil {
-				writeErr(w, http.StatusServiceUnavailable, "media not configured")
-				return
+		var headers []*multipart.FileHeader
+		if r.MultipartForm != nil {
+			headers = r.MultipartForm.File["file"]
+		}
+		if len(headers) > maxPostFiles {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("too many files: at most %d photos in one message", maxPostFiles))
+			return
+		}
+		// Several files must all be photos, by their CONTENT (the part's
+		// Content-Type is the client's word: an audio file labelled image/jpeg
+		// would skip transcription and reach the agent as a picture). Checked
+		// BEFORE anything is ingested: a voice file among them would be
+		// transcribed and kept for a message that is refused.
+		sniffed := make([]string, len(headers))
+		if len(headers) > 1 {
+			for i, hdr := range headers {
+				kind, err := sniffPart(hdr)
+				if err != nil {
+					writeErr(w, http.StatusBadRequest, "bad file field: "+err.Error())
+					return
+				}
+				if !strings.HasPrefix(kind, "image/") {
+					writeErr(w, http.StatusBadRequest, "several files in one message must all be photos (JPEG, PNG, GIF or WebP)")
+					return
+				}
+				sniffed[i] = kind
 			}
-			dur, _ := strconv.Atoi(r.FormValue("duration_s"))
-			got, ierr := a.media.Ingest(r.Context(), media.Request{
-				Reader:    io.LimitReader(file, cap+1),
-				Filename:  hdr.Filename,
-				Mime:      hdr.Header.Get("Content-Type"),
-				Source:    "watch",
-				ChatLabel: a.userID,
-				DurationS: dur,
-			})
+		}
+		if len(headers) > 0 && a.media == nil {
+			writeErr(w, http.StatusServiceUnavailable, "media not configured")
+			return
+		}
+		dur, _ := strconv.Atoi(r.FormValue("duration_s"))
+		for i, hdr := range headers {
+			got, ierr := a.ingestPart(r, hdr, sniffed[i], cap, dur)
+			if ierr == nil && len(headers) > 1 && got.Kind != media.KindImage {
+				// The content is an image and the pipeline says otherwise.
+				removeImages([]media.Artifact{got})
+				ierr = media.ErrUnsupported
+			}
 			if ierr != nil {
+				// Photos of this message that were stored before the failure
+				// belong to no turn: remove them now.
+				removeImages(arts)
 				switch {
+				case errors.Is(ierr, errBadFilePart):
+					writeErr(w, http.StatusBadRequest, "bad file field: "+ierr.Error())
 				case errors.Is(ierr, media.ErrTooLarge):
 					writeErr(w, http.StatusRequestEntityTooLarge, ierr.Error())
 				case errors.Is(ierr, media.ErrUnsupported):
@@ -638,10 +678,7 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
-			art = &got
-		} else if !errors.Is(err, http.ErrMissingFile) {
-			writeErr(w, http.StatusBadRequest, "bad file field: "+err.Error())
-			return
+			arts = append(arts, got)
 		}
 	default:
 		var body struct {
@@ -658,7 +695,7 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if text == "" && art == nil {
+	if text == "" && len(arts) == 0 {
 		writeErr(w, http.StatusBadRequest, "nothing to send: give text or a file")
 		return
 	}
@@ -666,7 +703,11 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 	// The stored user message is the RECEIPT of the delegation: what was
 	// understood (the transcript for voice), shown on the wrist at once.
 	msg := Message{Role: RoleUser, Kind: KindText, Text: text, Status: StatusQueued}
-	if art != nil {
+	if len(arts) > 1 {
+		// Several files are always photos (checked above).
+		msg.Text = joinText(text, fmt.Sprintf("[%d photos]", len(arts)))
+	} else if len(arts) == 1 {
+		art := arts[0]
 		msg.DurationS = art.DurationS
 		switch art.Kind {
 		case media.KindAudio:
@@ -688,18 +729,71 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 		TS:      a.now().Unix(),
 		Text:    text,
 	}
-	if art != nil {
-		in.Media = []media.Artifact{*art}
-	}
+	in.Media = arts
 	select {
 	case a.inbound <- in:
 	default:
 		a.store.Update(stored.ID, func(m *Message) bool { m.Status = StatusFailed; return true })
+		// The photos of a message that starts no turn would stay on disk
+		// until the retention sweep, one more copy for every retry.
+		removeImages(arts)
 		writeErr(w, http.StatusServiceUnavailable, "inbound queue full, try again")
 		return
 	}
 	a.echo("⌚ You: "+stored.Text, false)
 	writeJSON(w, http.StatusAccepted, map[string]any{"message": stored, "pending": a.store.Pending()})
+}
+
+// errBadFilePart marks an uploaded part that could not be opened (the 400 of
+// the one-file path before several files were allowed).
+var errBadFilePart = errors.New("the uploaded file could not be read")
+
+// sniffPart answers the content type of an uploaded part from its first
+// bytes (http.DetectContentType: JPEG, PNG, GIF, WebP and BMP are images).
+func sniffPart(hdr *multipart.FileHeader) (string, error) {
+	file, err := hdr.Open()
+	if err != nil {
+		return "", errBadFilePart
+	}
+	defer file.Close()
+	head := make([]byte, 512)
+	n, err := io.ReadFull(file, head)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return "", errBadFilePart
+	}
+	return http.DetectContentType(head[:n]), nil
+}
+
+// removeImages deletes the stored files of images that belong to no turn.
+func removeImages(arts []media.Artifact) {
+	for _, a := range arts {
+		if a.Kind == media.KindImage && a.Path != "" {
+			_ = os.Remove(a.Path)
+		}
+	}
+}
+
+// ingestPart stores one uploaded "file" part through the media pipeline.
+// sniffed, when set, is the content type read from the bytes and replaces
+// the client's header (several photos in one message).
+func (a *Adapter) ingestPart(r *http.Request, hdr *multipart.FileHeader, sniffed string, cap int64, dur int) (media.Artifact, error) {
+	file, err := hdr.Open()
+	if err != nil {
+		return media.Artifact{}, errBadFilePart
+	}
+	defer file.Close()
+	mimeType := hdr.Header.Get("Content-Type")
+	if sniffed != "" {
+		mimeType = sniffed
+	}
+	return a.media.Ingest(r.Context(), media.Request{
+		Reader:    io.LimitReader(file, cap+1),
+		Filename:  hdr.Filename,
+		Mime:      mimeType,
+		Source:    "watch",
+		ChatLabel: a.userID,
+		DurationS: dur,
+	})
 }
 
 func joinText(a, b string) string {
