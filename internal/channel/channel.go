@@ -55,6 +55,11 @@ type OutboundMsg struct {
 	// conversation can label it ("summary of the message above") instead of
 	// letting it read as a complete, self-contained answer.
 	Summary bool `json:"summary,omitempty"`
+	// Replies are short answers the agent proposes for this message (a watch
+	// shows them as a menu). They ride on the LAST message of a reply only. A
+	// channel that has no use for them ignores the field; they are never part
+	// of Text.
+	Replies []string `json:"replies,omitempty"`
 }
 
 // SendReceipt carries a real provider id, the acceptance artifact for a send.

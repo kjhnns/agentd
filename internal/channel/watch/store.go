@@ -36,6 +36,9 @@ type Message struct {
 	Status    string    `json:"status,omitempty"` // user only: queued | working | needs_input | done | failed
 	ReplyTo   string    `json:"reply_to,omitempty"`
 	DurationS int       `json:"duration_s,omitempty"`
+	// Replies are the agent's proposed short answers to this message (agent
+	// role, last message of a reply only). Old rows load without it.
+	Replies   []string  `json:"replies,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 

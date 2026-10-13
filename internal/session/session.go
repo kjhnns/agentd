@@ -767,6 +767,39 @@ func ReplyFormatInstruction(budget int) string {
 		budget, budget, SummaryMarker, budget)
 }
 
+// RepliesMarker opens the optional trailer of proposed replies: short answers
+// the user can send back with one pick on a watch menu.
+const RepliesMarker = "---REPLIES---"
+
+// Limits of the trailer. A reply is a menu label on a 240 pixel display.
+const (
+	MaxProposedReplies   = 3
+	MaxProposedReplyLen  = 24
+	repliesSourceChannel = "watch"
+)
+
+// proposesReplies reports whether turns from this channel carry the
+// proposed-replies instruction and have the trailer taken off their answer.
+// It is the watch channel ONLY: RenderTurn also serves the API media path
+// (Fuel photo uploads), and a trailer there would end up in a stored answer.
+// A budget of 0 switches it off together with the summary mechanism.
+func (m *Manager) proposesReplies(in channel.InboundMsg) bool {
+	return m.Reply.SummaryBudget > 0 && in.Channel == repliesSourceChannel
+}
+
+// RepliesInstruction is the per-turn instruction for proposed replies.
+func RepliesInstruction() string {
+	return fmt.Sprintf(
+		"[Proposed replies: the reader can answer with one pick from a menu. When "+
+			"your answer ends with a question or a choice for the user, add after the "+
+			"answer a line containing exactly %s, then up to %d replies, one per "+
+			"line, each at most %d characters, worded as the user would say them. "+
+			"This is separate from the summary rule; when you also write a summary, "+
+			"the %s line and its summary come after the replies. Leave the "+
+			"whole block out when no short reply makes sense.]",
+		RepliesMarker, MaxProposedReplies, MaxProposedReplyLen, SummaryMarker)
+}
+
 // RenderTurn is RenderInbound plus this manager's reply-format instruction.
 func (m *Manager) RenderTurn(in channel.InboundMsg) string {
 	text := RenderInbound(in)
@@ -774,7 +807,59 @@ func (m *Manager) RenderTurn(in channel.InboundMsg) string {
 	if instr == "" || strings.TrimSpace(text) == "" {
 		return text
 	}
+	if m.proposesReplies(in) {
+		instr += "\n" + RepliesInstruction()
+	}
 	return text + "\n\n" + instr
+}
+
+// ExtractReplies takes the proposed-replies trailer off a reply. It returns
+// the reply without the trailer and the replies. The trailer starts at the
+// LAST line that is exactly the marker and ends at the summary marker line or
+// at the end of the text, so it is found in either order with the summary. It
+// must run BEFORE SplitReply: otherwise the trailer ends up inside the summary
+// or the body. Without a marker line the reply is returned untouched.
+//
+// A line that is empty, repeats an earlier one or is longer than the limit is
+// dropped (a cut reply could say something else than the agent meant), and
+// only the first MaxProposedReplies are kept.
+func ExtractReplies(reply string) (clean string, replies []string) {
+	lines := strings.Split(reply, "\n")
+	start := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) == RepliesMarker {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return reply, nil
+	}
+	end := len(lines)
+	for i := start + 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == SummaryMarker {
+			end = i
+			break
+		}
+	}
+	seen := map[string]bool{}
+	for _, ln := range lines[start+1 : end] {
+		r := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(ln), "-*\u2022"))
+		key := strings.ToLower(r)
+		if r == "" || seen[key] || len([]rune(r)) > MaxProposedReplyLen || len(replies) >= MaxProposedReplies {
+			continue
+		}
+		seen[key] = true
+		replies = append(replies, r)
+	}
+	kept := append(append([]string{}, lines[:start]...), lines[end:]...)
+	clean = strings.TrimSpace(strings.Join(kept, "\n"))
+	if clean == "" {
+		// A trailer with no answer in front of it is not an answer: deliver
+		// the text as it came rather than an empty message.
+		return reply, nil
+	}
+	return clean, replies
 }
 
 // SplitReply divides a reply on the summary marker into the long body and the
@@ -1118,9 +1203,19 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	// A long answer goes out as TWO messages: the full text first and silent,
 	// then the summary, which therefore lands last (the bottom of the chat and
 	// the one notification the user actually gets).
+	// The proposed replies come off first, so they are in neither half, and
+	// they ride on the LAST message: the one the watch shows.
+	var replies []string
+	if m.proposesReplies(in) {
+		result, replies = ExtractReplies(result)
+	}
 	body, summary := SplitReply(result, m.Reply.SummaryBudget)
 	send := func(text string, silent, summary bool) error {
-		rcpt, serr := ch.Send(ctx, channel.OutboundMsg{ChatID: in.UserID, Text: text, Silent: silent, Summary: summary})
+		out := channel.OutboundMsg{ChatID: in.UserID, Text: text, Silent: silent, Summary: summary}
+		if !silent {
+			out.Replies = replies
+		}
+		rcpt, serr := ch.Send(ctx, out)
 		if serr != nil {
 			return serr
 		}

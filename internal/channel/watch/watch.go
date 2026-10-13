@@ -147,6 +147,9 @@ func (a *Adapter) Send(ctx context.Context, m channel.OutboundMsg) (channel.Send
 			msg.Kind = KindFailure
 		}
 	}
+	if msg.Kind != KindFailure && len(m.Replies) > 0 {
+		msg.Replies = append([]string{}, m.Replies...)
+	}
 	stored := a.store.Append(msg)
 	// Silence carries into the mirror too: the long half of a split reply must
 	// not raise a Telegram push either, or the user gets the truncated one.

@@ -238,3 +238,152 @@ func TestRouteInboundWithTheFeatureOffIsUnchanged(t *testing.T) {
 		t.Error("budget 0 must not instruct the agent about summaries")
 	}
 }
+
+// ---- proposed replies (the ---REPLIES--- trailer) ----
+
+func TestExtractRepliesTakesTheTrailerOff(t *testing.T) {
+	clean, replies := ExtractReplies("Shall I book the 9:04?\n" + RepliesMarker + "\nBook the 9:04\nShow later trains\n")
+	if clean != "Shall I book the 9:04?" {
+		t.Errorf("clean = %q", clean)
+	}
+	if strings.Join(replies, "|") != "Book the 9:04|Show later trains" {
+		t.Errorf("replies = %q", replies)
+	}
+	// No marker line: untouched, also when the marker is only mentioned in prose.
+	for _, s := range []string{"Two meetings today.", "The marker is " + RepliesMarker + " on a line."} {
+		if clean, replies := ExtractReplies(s); clean != s || replies != nil {
+			t.Errorf("no trailer must change nothing: %q -> %q %q", s, clean, replies)
+		}
+	}
+	// A trailer with no answer in front of it is delivered as it came.
+	bare := RepliesMarker + "\nYes\nNo"
+	if clean, replies := ExtractReplies(bare); clean != bare || replies != nil {
+		t.Errorf("bare trailer = %q %q", clean, replies)
+	}
+}
+
+func TestExtractRepliesEnforcesTheLimits(t *testing.T) {
+	trailer := strings.Join([]string{
+		"Question?", RepliesMarker,
+		"- Yes", "", "yes", // a bullet, an empty line, a duplicate
+		"This reply is far too long for a watch menu label",
+		"No", "Later", "A fourth one",
+	}, "\n")
+	clean, replies := ExtractReplies(trailer)
+	if clean != "Question?" {
+		t.Errorf("clean = %q", clean)
+	}
+	if strings.Join(replies, "|") != "Yes|No|Later" {
+		t.Errorf("replies = %q", replies)
+	}
+	for _, r := range replies {
+		if len([]rune(r)) > MaxProposedReplyLen {
+			t.Errorf("%q is over the limit", r)
+		}
+	}
+}
+
+// The trailer must come off BEFORE the summary split, in either order with
+// the summary, and leave both halves clean.
+func TestExtractRepliesKeepsTheSummaryIntact(t *testing.T) {
+	long := strings.Repeat("Detail. ", 60)
+	for name, reply := range map[string]string{
+		"replies first": long + "\n" + RepliesMarker + "\nYes\nNo\n" + SummaryMarker + "\nBooked, pay now?",
+		"summary first": long + "\n" + SummaryMarker + "\nBooked, pay now?\n" + RepliesMarker + "\nYes\nNo",
+	} {
+		clean, replies := ExtractReplies(reply)
+		if strings.Join(replies, "|") != "Yes|No" {
+			t.Errorf("%s: replies = %q", name, replies)
+		}
+		body, summary := SplitReply(clean, 200)
+		if summary != "Booked, pay now?" || !strings.HasPrefix(body, "Detail.") {
+			t.Errorf("%s: body %.20q summary %q", name, body, summary)
+		}
+		if strings.Contains(body+summary, RepliesMarker) || strings.Contains(body+summary, "Yes") {
+			t.Errorf("%s: the trailer leaked into a half", name)
+		}
+	}
+}
+
+// The instruction is for watch turns only. The API media path (Fuel photo
+// uploads) renders its turn with Channel "web" and must stay as it was.
+func TestRepliesInstructionIsScopedToWatchTurns(t *testing.T) {
+	m := &Manager{Reply: ReplyPolicy{SummaryBudget: 200}}
+	if got := m.RenderTurn(channel.InboundMsg{Channel: "watch", Text: "q"}); !strings.Contains(got, RepliesMarker) {
+		t.Errorf("a watch turn must carry the replies instruction: %q", got)
+	}
+	for _, ch := range []string{"web", "telegram", "whatsapp", ""} {
+		got := m.RenderTurn(channel.InboundMsg{Channel: ch, Text: "q"})
+		if strings.Contains(got, RepliesMarker) || strings.Contains(got, "Proposed replies") {
+			t.Errorf("channel %q must not carry the replies instruction: %q", ch, got)
+		}
+		if got != "q\n\n"+ReplyFormatInstruction(200) {
+			t.Errorf("channel %q: the turn text changed: %q", ch, got)
+		}
+	}
+	off := &Manager{Reply: ReplyPolicy{SummaryBudget: 0}}
+	if got := off.RenderTurn(channel.InboundMsg{Channel: "watch", Text: "q"}); got != "q" {
+		t.Errorf("budget 0 must switch the replies off too: %q", got)
+	}
+}
+
+// routeOn is routeWithReply for a chosen source channel.
+func routeOn(t *testing.T, source string, budget int, reply string) []channel.OutboundMsg {
+	t.Helper()
+	bus := eventbus.New()
+	fa := &fakeAdapter{}
+	mgr := NewManager(fa, bus, nil)
+	mgr.Policy = Policy{TurnTimeout: 5 * time.Second, TurnCeiling: 10 * time.Second}
+	mgr.Reply = ReplyPolicy{SummaryBudget: budget}
+	sess, err := mgr.Create(context.Background(), "", t.TempDir(), "", "reply-test")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	fa.mu.Lock()
+	fa.onSend = func(string) {
+		bus.Publish(eventbus.Event{SessionID: sess.ID, Kind: eventbus.KindResult, Text: reply})
+	}
+	fa.mu.Unlock()
+	ch := &recordingChannel{}
+	in := channel.InboundMsg{Channel: source, UserID: "chat1", MsgID: "m1", Text: "q"}
+	if err := mgr.RouteInbound(context.Background(), ch, in, map[string]string{"chat1": sess.ID}, t.TempDir(), ""); err != nil {
+		t.Fatalf("RouteInbound: %v", err)
+	}
+	return ch.messages()
+}
+
+func TestRouteInboundCarriesRepliesOnTheLastMessage(t *testing.T) {
+	// Short answer: one message, the replies on it, the text clean.
+	sent := routeOn(t, "watch", 200, "Book the 9:04?\n"+RepliesMarker+"\nBook it\nLater trains")
+	if len(sent) != 1 || sent[0].Text != "Book the 9:04?" || strings.Join(sent[0].Replies, "|") != "Book it|Later trains" {
+		t.Fatalf("short answer = %+v", sent)
+	}
+	// Long answer: the body has none, the summary (delivered last) has them.
+	long := strings.Repeat("Detail about the trip. ", 40)
+	sent = routeOn(t, "watch", 200, long+"\n"+RepliesMarker+"\nYes\nNo\n"+SummaryMarker+"\nPay now?")
+	if len(sent) != 2 {
+		t.Fatalf("want body then summary, got %+v", sent)
+	}
+	if len(sent[0].Replies) != 0 || strings.Join(sent[1].Replies, "|") != "Yes|No" || sent[1].Text != "Pay now?" {
+		t.Errorf("replies must ride on the summary only: %+v / %+v", sent[0].Replies, sent[1])
+	}
+	for _, m := range sent {
+		if strings.Contains(m.Text, RepliesMarker) || strings.Contains(m.Text, SummaryMarker) {
+			t.Errorf("a marker leaked into a delivered message: %q", m.Text)
+		}
+	}
+}
+
+// A turn from another channel is not parsed: the text is delivered as it was.
+func TestRouteInboundLeavesOtherChannelsAndTheOffSwitchAlone(t *testing.T) {
+	reply := "Answer.\n" + RepliesMarker + "\nYes\nNo"
+	for _, c := range []struct {
+		source string
+		budget int
+	}{{"telegram", 200}, {"web", 200}, {"watch", 0}} {
+		sent := routeOn(t, c.source, c.budget, reply)
+		if len(sent) != 1 || sent[0].Text != reply || len(sent[0].Replies) != 0 {
+			t.Errorf("%s budget %d: %+v", c.source, c.budget, sent)
+		}
+	}
+}

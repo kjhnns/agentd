@@ -1084,3 +1084,76 @@ func TestMirrorCarriesSilenceOfTheLongHalf(t *testing.T) {
 		t.Errorf("summary must be mirrored with a notification, got %+v", got[1])
 	}
 }
+
+// Proposed replies are stored on the agent message, served on the wire, kept
+// across a replay, and never reach the Telegram mirror.
+func TestProposedRepliesAreStoredServedAndKeptOutOfTheMirror(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "w.jsonl")
+	st, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A row written by an older binary has no replies key and must still load.
+	u := st.Append(Message{Role: RoleUser, Kind: KindText, Text: "q", Status: StatusWorking})
+	a := New("wt", st)
+	var mu sync.Mutex
+	var mirrored []string
+	a.WithMirror(func(text string, silent bool) {
+		mu.Lock()
+		mirrored = append(mirrored, text)
+		mu.Unlock()
+	})
+	_, _ = a.Send(context.Background(), channel.OutboundMsg{ChatID: "u", Text: "Book the 9:04?", Replies: []string{"Book it", "Later trains"}})
+
+	tail := fetch(t, a.Handler(), "")
+	last := tail.Messages[len(tail.Messages)-1]
+	if last.ReplyTo != u.ID || strings.Join(last.Replies, "|") != "Book it|Later trains" {
+		t.Fatalf("served message = %+v", last)
+	}
+	raw := do(t, a.Handler(), http.MethodGet, "/watch/messages", "wt", nil, "").Body.String()
+	if !strings.Contains(raw, `"replies":["Book it","Later trains"]`) || strings.Count(raw, `"replies"`) != 1 {
+		t.Errorf("wire form: %s", raw)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := len(mirrored)
+		mu.Unlock()
+		if n >= 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	mu.Lock()
+	if len(mirrored) != 1 || strings.Contains(mirrored[0], "Book it") || !strings.Contains(mirrored[0], "Book the 9:04?") {
+		t.Errorf("mirror = %q", mirrored)
+	}
+	mu.Unlock()
+
+	_ = st.Close()
+	st2, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	msgs, _, _ := st2.Since(0, 50)
+	if len(msgs) != 2 || len(msgs[0].Replies) != 0 || strings.Join(msgs[1].Replies, "|") != "Book it|Later trains" {
+		t.Fatalf("replayed = %+v", msgs)
+	}
+}
+
+// A failure notice is not a question: it carries no replies.
+func TestFailureNoticeCarriesNoReplies(t *testing.T) {
+	a, _ := newAdapter(t)
+	h := a.Handler()
+	do(t, h, http.MethodPost, "/watch/messages", "wt", bytes.NewBufferString(`{"text":"q"}`), "application/json")
+	in := <-a.Inbound()
+	_ = a.Ack(in.UserID, in.MsgID, channel.ReactionError)
+	_, _ = a.Send(context.Background(), channel.OutboundMsg{ChatID: in.UserID, Text: "it failed", Replies: []string{"Yes"}})
+	tail := fetch(t, h, "")
+	last := tail.Messages[len(tail.Messages)-1]
+	if last.Kind != KindFailure || len(last.Replies) != 0 {
+		t.Fatalf("failure message = %+v", last)
+	}
+}
