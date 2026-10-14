@@ -22,13 +22,13 @@ func provisionalActivityDoc() string {
 func stepsInput(steps map[string]int, strength ...string) *activityInput {
 	return &activityInput{
 		steps: func(d string) (int, bool) { n, ok := steps[d]; return n, ok },
-		session: func(d string) bool {
+		session: func(d string) (bool, bool) {
 			for _, s := range strength {
 				if s == d {
-					return true
+					return true, true
 				}
 			}
-			return false
+			return false, true
 		},
 	}
 }
@@ -85,6 +85,11 @@ func TestActivityProvisionalTarget(t *testing.T) {
 	if p := planDay(tg, "2026-10-03", "2026-10-02", nil, fresh, now, stepsInput(baselineSteps())); num(p.EnergyTarget) != "2600" || p.Activity != nil {
 		t.Errorf("future: %s %v", num(p.EnergyTarget), p.Activity)
 	}
+	// Without a run cost factor the activity is off: no default for it.
+	noK := parseT(t, v2("reference_mass_kg", 80, "energy.activity", activityOn()))
+	if p := planDay(noK, "2026-10-01", "2026-10-02", []Activity{run(15, 75, 0)}, fresh, now, nil); num(p.EnergyTarget) != "3000" || p.Activity != nil {
+		t.Errorf("no run cost: %s", num(p.EnergyTarget))
+	}
 	// Without energy.activity the provisional switch stays (18.5).
 	plain := parseT(t, v2("reference_mass_kg", 80, "energy.run_cost_kcal_per_kg_km", 1.0))
 	if p := planDay(plain, "2026-10-01", "2026-10-02", []Activity{run(15, 75, 0)}, fresh, now, nil); num(p.EnergyTarget) != "3000" || p.Activity != nil {
@@ -110,6 +115,24 @@ func TestActivityFormulaIsRelative(t *testing.T) {
 	}
 	if p := planDay(tg, "2026-10-01", "2026-10-02", every, fresh, now, nil); num(p.EnergyTarget) != "2520" {
 		t.Errorf("daily ride: %s, want 2520", num(p.EnergyTarget))
+	}
+}
+
+// The strength average counts only the dates whose data were read.
+func TestActivityStrengthAverageOverKnownDates(t *testing.T) {
+	now := time.Date(2026, 10, 2, 10, 0, 0, 0, time.UTC)
+	maint := map[string]any{"kcal": 3000, "mass_kg": 80, "avg_run_km_per_day": 0, "window": []any{"2026-09-01", "2026-09-14"}, "adopted_on": "2026-09-15", "result_id": nil}
+	tg := parseT(t, v2("energy.maintenance", maint, "energy.deficit_kcal", 0, "energy.run_cost_kcal_per_kg_km", 1.0, "energy.activity", activityOn()))
+	// A session on every one of the 7 known dates before; the other 21 are unknown.
+	ax := &activityInput{session: func(d string) (bool, bool) {
+		if d >= "2026-09-24" {
+			return true, true
+		}
+		return false, false
+	}}
+	// Average 200 per day, a session today: +0. Unknown dates counted as none would give +150.
+	if p := planDay(tg, "2026-10-01", "2026-10-02", nil, now.Add(-time.Hour), now, ax); num(p.EnergyTarget) != "3000" {
+		t.Errorf("strength average: %s, want 3000", num(p.EnergyTarget))
 	}
 }
 
@@ -145,7 +168,7 @@ func TestStepsRouteFeedsTheSnapshot(t *testing.T) {
 		t.Fatalf("steps: %d %s", rec.Code, rec.Body)
 	}
 	for _, bad := range []map[string]any{
-		{"days": []any{map[string]any{"date": "2026-10-02", "steps": 1}}},
+		{"days": []any{map[string]any{"date": "2026-10-03", "steps": 1}}},
 		{"days": []any{map[string]any{"date": "2026-10-01", "steps": -1}}},
 		{"days": []any{map[string]any{"date": "2026-10-01"}}},
 		{"days": []any{}},

@@ -1508,6 +1508,12 @@ func (s *Service) snapInputFor(date string) (snapInput, error) {
 		for i := 0; i <= 31; i++ {
 			take(dateAdd(date, -i))
 		}
+		// The strength average of 18.15 looks back baseline_days (at most
+		// 60) from each date of the week; dates outside the cache are not
+		// known and are left out of it.
+		for i := 32; i <= 66; i++ {
+			take(dateAdd(date, -i))
+		}
 		// The week of the date up to the real today (the week view).
 		today := asOf.In(t.loc).Format("2006-01-02")
 		mon := mondayOf(date)
@@ -1539,7 +1545,12 @@ func (s *Service) snapInputFor(date string) (snapInput, error) {
 	steps := s.steps.Snapshot()
 	in.ax = &activityInput{
 		steps:   func(d string) (int, bool) { n, ok := steps[d]; return n, ok },
-		session: func(d string) bool { return si.day(d).Session },
+		session: func(d string) (bool, bool) {
+			if !have[d] {
+				return false, false
+			}
+			return si.day(d).Session, true
+		},
 	}
 	in.calib, in.drift = s.calibFor(t, asOf.In(t.loc).Format("2006-01-02"))
 	return in, nil

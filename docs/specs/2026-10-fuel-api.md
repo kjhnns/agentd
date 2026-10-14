@@ -1254,12 +1254,12 @@ Parts of a past date or today d (a future date keeps the 18.5 value and has no a
 - strength: `strength_session_kcal` when d is a strength session by 19.6.
 - steps: walk(d) = max(0, steps(d) - run steps(d)); run steps = moving minutes x cadence (Strava `average_cadence`, doubled when below 120 because Garmin reports per leg; `run_cadence_spm` without one). average = the mean walk over the dates with steps among the baseline_days dates before d; null below min_baseline_days dates (then the part is 0). steps part = `walk_cost x mass x step_length_m / 1000 x (walk(d) - average)`. On today the part is never below 0 (the count is partial).
 
-Mass: reference_mass_kg in state provisional (null: activity off), maintenance.mass_kg in state formula.
+Mass: reference_mass_kg in state provisional (null: activity off; a null run_cost_kcal_per_kg_km also turns it off, there is no default), maintenance.mass_kg in state formula. The strength average is over the dates whose data the snapshot read (the cache holds 35 days); the other averages are over all baseline_days dates.
 
 Target:
 - provisional: `kcal.rest + run + other + strength + steps`, rounded to 10. Basis: "Provisional. 2600 rest + 400 run + 180 steps (14000, average 8000)"; parts that round to 0 are left out. `provisional` stays true.
 - formula: the 18.5 target plus `(other - its baseline_days mean) + (strength - its mean) + steps`: maintenance holds the average of these, so only the difference is added (the same reason as the run). The calibration interval and the trailing window are not the same days; the difference is accepted.
 
-Steps input: `POST /fuel/steps` `{"days":[{"date":"YYYY-MM-DD","steps":int}]}`, 1 to 60 dates, each within the last 90 days and not after today (targets.tz), steps 0 to 150000. A date sent again replaces its count. Stored in `state_dir/steps.json` (written and synced before the answer, dates older than 90 days dropped). Answer `{"stored":n,"dates":[...]}`. The iOS app sends the Apple Health step count per local date.
+Steps input: `POST /fuel/steps` `{"days":[{"date":"YYYY-MM-DD","steps":int}]}`, 1 to 60 dates, each within the last 90 days and not after tomorrow (targets.tz; a phone in a zone ahead of it, such as Beijing, is on the next date for some hours), steps 0 to 150000. A date sent again replaces its count. Stored in `state_dir/steps.json` (written and synced before the answer, dates older than 90 days dropped). Answer `{"stored":n,"dates":[...]}`. The iOS app sends the Apple Health step count per local date.
 
 Snapshot: `energy.activity` = `{"run_kcal","other_sport_kcal","strength_kcal","steps_kcal","steps":int|null,"steps_average":number|null}` (kcal rounded to 10, the average to 100), null when the key is off or the date is future. The week view and the budgets use the same day plan.

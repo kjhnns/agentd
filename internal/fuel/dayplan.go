@@ -119,7 +119,7 @@ func planDay(t *Targets, date, today string, acts []Activity, stravaAt, now time
 			p.EnergyState = "provisional"
 			b := "Provisional. Maintenance is not calibrated yet."
 			p.EnergyBasis = &b
-			if e.Activity != nil && v2.ReferenceMassKg != nil {
+			if e.Activity != nil && v2.ReferenceMassKg != nil && e.RunCost != nil {
 				p.provisionalActivity(t, acts, ax, *v2.ReferenceMassKg)
 			}
 		} else {
@@ -178,10 +178,7 @@ func (p *dayPlan) provisionalActivity(t *Targets, acts []Activity, ax *activityI
 		return
 	}
 	cfg := t.V2.Energy.Activity
-	k := 1.0
-	if t.V2.Energy.RunCost != nil {
-		k = *t.V2.Energy.RunCost
-	}
+	k := *t.V2.Energy.RunCost
 	a := activityEnergy(ax, acts, cfg, p.Date, p.State == "today", false, mass)
 	if p.RunKnown {
 		a.Run = k * mass * p.RunKm

@@ -141,7 +141,16 @@ func runSteps(acts []Activity, date string, defSpm float64) float64 {
 // activityInput is what the day plan needs beyond the Strava activities.
 type activityInput struct {
 	steps   func(date string) (int, bool)
-	session func(date string) bool // a strength session (19.6)
+	// session: a strength session (19.6); known is false for a date whose
+	// data the snapshot did not read (it is left out of the average).
+	session func(date string) (session, known bool)
+}
+
+func (ax *activityInput) sessionOf(date string) (bool, bool) {
+	if ax == nil || ax.session == nil {
+		return false, false
+	}
+	return ax.session(date)
 }
 
 // activityParts are the parts of the energy target from activity.
@@ -165,9 +174,10 @@ func walkSteps(ax *activityInput, acts []Activity, cfg *ActivityCfg, date string
 
 // baselines are the means over the BaselineDays dates before date: walking
 // steps (over the dates with data, nil below MinBaselineDays), other sport
-// kcal and strength kcal (over all dates).
+// kcal (over all dates: Strava has them all) and strength kcal (over the
+// dates whose data were read).
 func baselines(ax *activityInput, acts []Activity, cfg *ActivityCfg, date string, mass float64) (steps *float64, other, strength float64) {
-	sum, n := 0.0, 0
+	sum, n, known := 0.0, 0, 0
 	for i := 1; i <= cfg.BaselineDays; i++ {
 		d := dateAdd(date, -i)
 		if w, ok := walkSteps(ax, acts, cfg, d); ok {
@@ -175,12 +185,17 @@ func baselines(ax *activityInput, acts []Activity, cfg *ActivityCfg, date string
 			n++
 		}
 		other += otherSportKcal(acts, d, mass)
-		if ax != nil && ax.session != nil && ax.session(d) {
-			strength += cfg.StrengthSessionKcal
+		if s, ok := ax.sessionOf(d); ok {
+			known++
+			if s {
+				strength += cfg.StrengthSessionKcal
+			}
 		}
 	}
 	other /= float64(cfg.BaselineDays)
-	strength /= float64(cfg.BaselineDays)
+	if known > 0 {
+		strength /= float64(known)
+	}
 	if n >= cfg.MinBaselineDays && n > 0 {
 		steps = fptr(sum / float64(n))
 	}
@@ -198,7 +213,7 @@ func activityEnergy(ax *activityInput, acts []Activity, cfg *ActivityCfg, date s
 	var p activityParts
 	bSteps, bOther, bStrength := baselines(ax, acts, cfg, date, mass)
 	p.Other = otherSportKcal(acts, date, mass)
-	if ax != nil && ax.session != nil && ax.session(date) {
+	if s, _ := ax.sessionOf(date); s {
 		p.Strength = cfg.StrengthSessionKcal
 	}
 	if relative {
@@ -308,12 +323,23 @@ func (s *stepsStore) Put(days map[string]int, now time.Time, today string) error
 	if err := os.Rename(tmp, s.path); err != nil {
 		return err
 	}
+	// The rename is durable only with the directory synced.
+	if d, err := os.Open(filepath.Dir(s.path)); err == nil {
+		err = d.Sync()
+		d.Close()
+		if err != nil {
+			return err
+		}
+	} else {
+		return err
+	}
 	s.days = next
 	return nil
 }
 
 // handleSteps is POST /fuel/steps: {"days":[{"date":"YYYY-MM-DD","steps":int}]}
-// (at most 60 dates, none after today in targets.tz). The phone sends the
+// (at most 60 dates, none after tomorrow in targets.tz: a phone in a zone
+// ahead of it is on the next date for some hours). The phone sends the
 // step count of Apple Health per local date; a date sent again replaces
 // its count. Answer: {"stored":n,"dates":[...]}.
 func (s *Service) handleSteps(w http.ResponseWriter, r *http.Request) {
@@ -339,8 +365,8 @@ func (s *Service) handleSteps(w http.ResponseWriter, r *http.Request) {
 	today := now.In(t.loc).Format("2006-01-02")
 	days := map[string]int{}
 	for _, d := range body.Days {
-		if !validDate(d.Date) || d.Date > today || d.Date < dateAdd(today, -stepsKeepDays) {
-			writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "date %q: a date of the last %d days, not after today", d.Date, stepsKeepDays))
+		if !validDate(d.Date) || d.Date > dateAdd(today, 1) || d.Date < dateAdd(today, -stepsKeepDays) {
+			writeErr(w, errf(http.StatusBadRequest, "bad_input", false, "date %q: a date of the last %d days, not after tomorrow", d.Date, stepsKeepDays))
 			return
 		}
 		if d.Steps == nil || *d.Steps < 0 || *d.Steps > 150000 {
