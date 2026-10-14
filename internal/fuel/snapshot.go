@@ -143,6 +143,7 @@ type snapInput struct {
 	body     []Value
 	acts     []Activity
 	stravaAt time.Time
+	ax       *activityInput // 18.15 (nil: no steps, no strength sessions)
 
 	// v7 inputs.
 	fetched func(date string) time.Time // last server read of a date

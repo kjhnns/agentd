@@ -195,34 +195,34 @@ func TestT5CarbohydrateByDayClass(t *testing.T) {
 		target string
 		class  string
 	}{{0, "240", "low"}, {44, "240", "low"}, {45, "400", "moderate"}, {89, "400", "moderate"}, {90, "480", "long"}} {
-		p := planDay(tg, "2026-10-01", "2026-10-01", act(c.min), fresh, now)
+		p := planDay(tg, "2026-10-01", "2026-10-01", act(c.min), fresh, now, nil)
 		if num(p.CarbsTarget) != c.target || p.DayClass != c.class {
 			t.Errorf("%g min: %s %s, want %s %s", c.min, num(p.CarbsTarget), p.DayClass, c.target, c.class)
 		}
 	}
 	// Two activities add up: 30 + 30 min = moderate.
 	two := []Activity{{SportType: "Run", MovingS: 1800, LocalDate: "2026-10-01"}, {SportType: "Swim", MovingS: 1800, LocalDate: "2026-10-01"}}
-	if p := planDay(tg, "2026-10-01", "2026-10-01", two, fresh, now); p.DayClass != "moderate" {
+	if p := planDay(tg, "2026-10-01", "2026-10-01", two, fresh, now, nil); p.DayClass != "moderate" {
 		t.Errorf("two activities: %s", p.DayClass)
 	}
 	// Stale Strava: unknown, the low value, strava_stale.
 	stale := now.Add(-40 * time.Hour)
-	if p := planDay(tg, "2026-10-01", "2026-10-01", nil, stale, now); num(p.CarbsTarget) != "240" || p.DayClass != "unknown" || !p.Stale {
+	if p := planDay(tg, "2026-10-01", "2026-10-01", nil, stale, now, nil); num(p.CarbsTarget) != "240" || p.DayClass != "unknown" || !p.Stale {
 		t.Errorf("stale: %+v", p)
 	}
 	// A past date is never stale.
 	old := []Activity{{SportType: "Ride", MovingS: 6000, LocalDate: "2026-09-29"}}
-	if p := planDay(tg, "2026-09-29", "2026-10-01", old, stale, now); p.DayClass != "long" || p.Stale {
+	if p := planDay(tg, "2026-09-29", "2026-10-01", old, stale, now, nil); p.DayClass != "long" || p.Stale {
 		t.Errorf("past date under stale files: %+v", p)
 	}
 	// class_minutes null with low 3: 240 on every day, unknown.
 	unset := parseT(t, v2("reference_mass_kg", 80, "carbs_g.g_per_kg", map[string]any{"low": 3, "moderate": nil, "long": nil}))
-	if p := planDay(unset, "2026-10-01", "2026-10-01", act(120), fresh, now); num(p.CarbsTarget) != "240" || p.DayClass != "unknown" || !p.ClassUnset {
+	if p := planDay(unset, "2026-10-01", "2026-10-01", act(120), fresh, now, nil); num(p.CarbsTarget) != "240" || p.DayClass != "unknown" || !p.ClassUnset {
 		t.Errorf("class unset: %+v", p)
 	}
 	// low null, or the reference mass null: the target is null.
 	for _, doc := range []string{v2("reference_mass_kg", 80), v2("carbs_g.g_per_kg", map[string]any{"low": 3, "moderate": nil, "long": nil})} {
-		if p := planDay(parseT(t, doc), "2026-10-01", "2026-10-01", nil, fresh, now); p.CarbsTarget != nil {
+		if p := planDay(parseT(t, doc), "2026-10-01", "2026-10-01", nil, fresh, now, nil); p.CarbsTarget != nil {
 			t.Errorf("target must be null: %s", num(p.CarbsTarget))
 		}
 	}
@@ -275,7 +275,7 @@ func TestT8EnergyFormula(t *testing.T) {
 		if c.km > 0 {
 			acts = []Activity{run("2026-10-01", c.km)}
 		}
-		p := planDay(tg, "2026-10-01", "2026-10-01", acts, fresh, now)
+		p := planDay(tg, "2026-10-01", "2026-10-01", acts, fresh, now, nil)
 		if p.EnergyState != "formula" || num(p.EnergyTarget) != c.want {
 			t.Errorf("%g km: %s %s, want %s", c.km, p.EnergyState, num(p.EnergyTarget), c.want)
 		}
@@ -289,24 +289,24 @@ func TestT8EnergyFormula(t *testing.T) {
 		if km > 0 {
 			acts = append(acts, run(d, km))
 		}
-		sum += *planDay(tg, d, "2026-10-01", acts, fresh, now).EnergyTarget
+		sum += *planDay(tg, d, "2026-10-01", acts, fresh, now, nil).EnergyTarget
 	}
 	if sum != 21000 {
 		t.Errorf("week sum %g, want 21000", sum)
 	}
 	// A deficit of 300 lowers each by 300.
-	if p := planDay(parseT(t, doc(300)), "2026-10-01", "2026-10-01", nil, fresh, now); num(p.EnergyTarget) != "2220" {
+	if p := planDay(parseT(t, doc(300)), "2026-10-01", "2026-10-01", nil, fresh, now, nil); num(p.EnergyTarget) != "2220" {
 		t.Errorf("deficit: %s", num(p.EnergyTarget))
 	}
 	// Any of the three inputs null: provisional, the v6 rest / training value.
 	for _, d := range []string{doc(nil), v2("energy.maintenance", maint, "energy.deficit_kcal", 0), v2("energy.deficit_kcal", 0, "energy.run_cost_kcal_per_kg_km", 1.0)} {
-		p := planDay(parseT(t, d), "2026-10-01", "2026-10-01", []Activity{{SportType: "Run", MovingS: 3000, DistanceM: 10000, LocalDate: "2026-10-01"}}, fresh, now)
+		p := planDay(parseT(t, d), "2026-10-01", "2026-10-01", []Activity{{SportType: "Run", MovingS: 3000, DistanceM: 10000, LocalDate: "2026-10-01"}}, fresh, now, nil)
 		if p.EnergyState != "provisional" || num(p.EnergyTarget) != "3000" {
 			t.Errorf("provisional: %s %s", p.EnergyState, num(p.EnergyTarget))
 		}
 	}
 	// Stale Strava: the average distance (adjustment 0) and the basis says so.
-	p := planDay(tg, "2026-10-01", "2026-10-01", nil, now.Add(-40*time.Hour), now)
+	p := planDay(tg, "2026-10-01", "2026-10-01", nil, now.Add(-40*time.Hour), now, nil)
 	if num(p.EnergyTarget) != "3000" || p.EnergyBasis == nil || !strings.Contains(*p.EnergyBasis, "run distance unknown") {
 		t.Errorf("stale: %s %v", num(p.EnergyTarget), p.EnergyBasis)
 	}

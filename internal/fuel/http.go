@@ -200,6 +200,7 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("GET /fuel/records", s.handleRecords)
 	mux.HandleFunc("POST /fuel/calibration/run", s.handleCalibrationRun)
 	mux.HandleFunc("POST /fuel/calibration/accept", s.handleCalibrationAccept)
+	mux.HandleFunc("POST /fuel/steps", s.handleSteps)
 	mux.HandleFunc("/fuel/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errf(http.StatusNotFound, "not_found", false, "no such route"))
 	})

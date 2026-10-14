@@ -16,17 +16,17 @@ func TestT20SaturatedFatBudget(t *testing.T) {
 	fresh := now.Add(-time.Hour)
 	tg := parseT(t, satDoc())
 	// 7 % of 2600 / 9 = 20.2 = 20 g; of 3000 = 23.3 = 23 g.
-	if p := planDay(tg, "2026-10-01", "2026-10-01", nil, fresh, now); num(p.SatFatTarget) != "20" || *p.SatFatBasis != "7 % of 2600 kcal" {
+	if p := planDay(tg, "2026-10-01", "2026-10-01", nil, fresh, now, nil); num(p.SatFatTarget) != "20" || *p.SatFatBasis != "7 % of 2600 kcal" {
 		t.Errorf("rest day: %s %v", num(p.SatFatTarget), p.SatFatBasis)
 	}
 	run := []Activity{{SportType: "Run", MovingS: 3000, DistanceM: 20000, LocalDate: "2026-10-01"}}
-	if p := planDay(tg, "2026-10-01", "2026-10-01", run, fresh, now); num(p.SatFatTarget) != "23" {
+	if p := planDay(tg, "2026-10-01", "2026-10-01", run, fresh, now, nil); num(p.SatFatTarget) != "23" {
 		t.Errorf("training day: %s", num(p.SatFatTarget))
 	}
 	// State formula with a 4120 kcal day = 32 g.
 	maint := map[string]any{"kcal": 3000, "mass_kg": 80, "avg_run_km_per_day": 6, "window": []any{"2026-09-01", "2026-09-14"}, "adopted_on": "2026-09-15", "result_id": nil}
 	f := parseT(t, satDoc("energy.maintenance", maint, "energy.deficit_kcal", 0, "energy.run_cost_kcal_per_kg_km", 1.0))
-	if p := planDay(f, "2026-10-01", "2026-10-01", run, fresh, now); num(p.EnergyTarget) != "4120" || num(p.SatFatTarget) != "32" {
+	if p := planDay(f, "2026-10-01", "2026-10-01", run, fresh, now, nil); num(p.EnergyTarget) != "4120" || num(p.SatFatTarget) != "32" {
 		t.Errorf("formula: %s %s", num(p.EnergyTarget), num(p.SatFatTarget))
 	}
 	// Invalid forms.
@@ -46,13 +46,13 @@ func TestT20SaturatedFatBudget(t *testing.T) {
 	for _, doc := range []string{goldenTargetsV1, v2()} {
 		c := parseT(t, doc)
 		for _, acts := range [][]Activity{nil, run} {
-			if p := planDay(c, "2026-10-01", "2026-10-01", acts, fresh, now); num(p.SatFatTarget) != "20" {
+			if p := planDay(c, "2026-10-01", "2026-10-01", acts, fresh, now, nil); num(p.SatFatTarget) != "20" {
 				t.Errorf("fixed cap: %s", num(p.SatFatTarget))
 			}
 		}
 	}
 	split := parseT(t, v2("sat_fat_g", map[string]any{"kind": "cap", "rest": 18, "training": 24}))
-	if a, b := planDay(split, "2026-10-01", "2026-10-01", nil, fresh, now), planDay(split, "2026-10-01", "2026-10-01", run, fresh, now); num(a.SatFatTarget) != "18" || num(b.SatFatTarget) != "24" {
+	if a, b := planDay(split, "2026-10-01", "2026-10-01", nil, fresh, now, nil), planDay(split, "2026-10-01", "2026-10-01", run, fresh, now, nil); num(a.SatFatTarget) != "18" || num(b.SatFatTarget) != "24" {
 		t.Errorf("rest / training cap: %s %s", num(a.SatFatTarget), num(b.SatFatTarget))
 	}
 	if s := newV7(t, v2()).snap(t, ""); budget(s, "sat_fat_g").Kind != "cap" || budget(s, "sat_fat_g").Basis != nil {

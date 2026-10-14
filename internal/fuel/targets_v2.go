@@ -89,6 +89,7 @@ type EnergyCfg struct {
 	RunCost       *float64 // kcal per kg per km
 	EnergyDensity *float64 // kcal per kg of body mass change
 	Calibration   *CalibrationCfg
+	Activity      *ActivityCfg // 18.15; nil: the 18.5 target only
 }
 
 // EstimatorCfg are the lever estimator factors.
@@ -358,11 +359,14 @@ func parseV2(raw map[string]json.RawMessage) (*V2, error) {
 	}
 
 	// energy
-	em, err := obj("energy", raw["energy"], []string{"maintenance", "deficit_kcal", "run_cost_kcal_per_kg_km", "energy_density_kcal_per_kg", "calibration"})
+	em, err := obj("energy", raw["energy"], []string{"maintenance", "deficit_kcal", "run_cost_kcal_per_kg_km", "energy_density_kcal_per_kg", "calibration"}, "activity")
 	if err != nil {
 		return nil, err
 	}
 	e := &v.Energy
+	if e.Activity, err = parseActivityCfg(em["activity"]); err != nil {
+		return nil, err
+	}
 	if e.DeficitKcal, err = numOrNil("energy.deficit_kcal", em["deficit_kcal"]); err != nil {
 		return nil, err
 	}

@@ -31,6 +31,9 @@ type dayPlan struct {
 	CarbsBasis    *string
 	CarbsIsSchema bool // a schema 2 file (a carbohydrate budget exists)
 
+	// Activity (18.15): set when energy.activity is set.
+	Activity *activityParts
+
 	// SatFatTarget is the saturated fat target of the date: the fixed cap,
 	// or with the budget form a share of the day's energy target (18.14).
 	SatFatTarget *float64
@@ -45,7 +48,7 @@ func stravaStale(now, stravaAt time.Time) bool {
 func roundTo(f, step float64) float64 { return math.Round(f/step) * step }
 
 // planDay computes the plan of a local date. today is the real current date.
-func planDay(t *Targets, date, today string, acts []Activity, stravaAt, now time.Time) dayPlan {
+func planDay(t *Targets, date, today string, acts []Activity, stravaAt, now time.Time, ax *activityInput) dayPlan {
 	p := dayPlan{Date: date, State: "past", EnergyState: "legacy", CarbsIsSchema: t.V2 != nil}
 	switch {
 	case date == today:
@@ -107,7 +110,7 @@ func planDay(t *Targets, date, today string, acts []Activity, stravaAt, now time
 		}
 	}
 
-	// Energy target (18.5).
+	// Energy target (18.5, with activity 18.15).
 	legacy := t.Kcal.For(p.DayType)
 	p.EnergyTarget = legacy
 	if v2 := t.V2; v2 != nil {
@@ -116,6 +119,9 @@ func planDay(t *Targets, date, today string, acts []Activity, stravaAt, now time
 			p.EnergyState = "provisional"
 			b := "Provisional. Maintenance is not calibrated yet."
 			p.EnergyBasis = &b
+			if e.Activity != nil && v2.ReferenceMassKg != nil {
+				p.provisionalActivity(t, acts, ax, *v2.ReferenceMassKg)
+			}
 		} else {
 			p.EnergyState = "formula"
 			m := e.Maintenance
@@ -135,7 +141,16 @@ func planDay(t *Targets, date, today string, acts []Activity, stravaAt, now time
 			}
 			p.EnergyBasis = &b
 			p.RunAdjust = fptr(roundTo(adj, 10))
-			p.EnergyTarget = fptr(roundTo(m.Kcal+adj-*e.DeficitKcal, 10))
+			target := m.Kcal + adj - *e.DeficitKcal
+			if e.Activity != nil && p.State != "future" {
+				a := activityEnergy(ax, acts, e.Activity, date, p.State == "today", true, m.MassKg)
+				a.Run = adj
+				p.Activity = &a
+				target += a.Other + a.Strength + a.Steps
+				b += activityBasis(a, true)
+				p.EnergyBasis = &b
+			}
+			p.EnergyTarget = fptr(roundTo(target, 10))
 		}
 	}
 
@@ -150,6 +165,59 @@ func planDay(t *Targets, date, today string, acts []Activity, stravaAt, now time
 		p.SatFatTarget = t.SatFat.For(p.DayType)
 	}
 	return p
+}
+
+// provisionalActivity replaces the provisional rest / training switch by
+// the rest value plus the day's activity (18.15): the run by its distance
+// (k x reference mass x km), the other sports and a strength session in
+// full (the rest value holds none of them), the steps against the average.
+// A future date and a stale today keep the rest value.
+func (p *dayPlan) provisionalActivity(t *Targets, acts []Activity, ax *activityInput, mass float64) {
+	rest := t.Kcal.For("rest")
+	if rest == nil || p.State == "future" {
+		return
+	}
+	cfg := t.V2.Energy.Activity
+	k := 1.0
+	if t.V2.Energy.RunCost != nil {
+		k = *t.V2.Energy.RunCost
+	}
+	a := activityEnergy(ax, acts, cfg, p.Date, p.State == "today", false, mass)
+	if p.RunKnown {
+		a.Run = k * mass * p.RunKm
+	}
+	p.Activity = &a
+	p.EnergyTarget = fptr(roundTo(*rest+a.Run+a.Other+a.Strength+a.Steps, 10))
+	b := "Provisional. " + fmtNum(*rest) + " rest" + activityBasis(a, false)
+	if !p.RunKnown {
+		b += ", run distance unknown"
+	}
+	p.EnergyBasis = &b
+}
+
+// activityBasis names the non-zero activity parts: " + 400 run (5 km) + 120 steps".
+func activityBasis(a activityParts, relative bool) string {
+	var out string
+	part := func(v float64, what string) {
+		r := roundTo(v, 10)
+		if r == 0 {
+			return
+		}
+		sign := "+"
+		if r < 0 {
+			sign = "-"
+		}
+		out += fmt.Sprintf(" %s %s %s", sign, fmtNum(math.Abs(r)), what)
+	}
+	if !relative {
+		part(a.Run, "run")
+	}
+	part(a.Other, "other sport")
+	part(a.Strength, "strength")
+	if a.StepCount != nil && a.StepBaseline != nil {
+		part(a.Steps, fmt.Sprintf("steps (%s, average %s)", fmtNum(float64(*a.StepCount)), fmtNum(roundTo(*a.StepBaseline, 100))))
+	}
+	return out
 }
 
 // info builds an 18.8 link ("" when info_url is absent).

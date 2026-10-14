@@ -69,6 +69,21 @@ type EnergyState struct {
 	Calibration       CalibResult `json:"calibration"`
 	Info              string      `json:"info"`
 	CalibrationInfo   string      `json:"calibration_info"`
+	// 18.15: null when energy.activity is not set or the date is future.
+	Activity *EnergyActivity `json:"activity"`
+}
+
+// EnergyActivity is `energy.activity` (18.15): the kcal each part adds to
+// the target (in state formula: against the trailing average, the run as
+// run_adjust_kcal), the step count of the date and the average it is
+// compared with (null until enough dates have steps).
+type EnergyActivity struct {
+	RunKcal      float64  `json:"run_kcal"`
+	OtherKcal    float64  `json:"other_sport_kcal"`
+	StrengthKcal float64  `json:"strength_kcal"`
+	StepsKcal    float64  `json:"steps_kcal"`
+	Steps        *int     `json:"steps"`
+	StepsAverage *float64 `json:"steps_average"`
 }
 
 // SnapContext holds values that are context, never a target.
@@ -163,7 +178,7 @@ func (in *snapInput) day(date string) *dayData {
 		return dd
 	}
 	rows, ok := in.rowsFor(date)
-	dd := &dayData{plan: planDay(in.targets, date, in.today(), in.acts, in.stravaAt, in.now), tot: totalsFromRows(rows), lev: dayLevers(rows), loaded: ok}
+	dd := &dayData{plan: planDay(in.targets, date, in.today(), in.acts, in.stravaAt, in.now, in.ax), tot: totalsFromRows(rows), lev: dayLevers(rows), loaded: ok}
 	dd.fluids, dd.caffeine, dd.alcohol = intakeSums(rows)
 	in.days[date] = dd
 	return dd
@@ -322,6 +337,14 @@ func (in *snapInput) fillV7(s *Snapshot, isToday bool, minute, el float64) {
 			s.Energy.RunAdjustKcal = plan.RunAdjust
 			s.Energy.DeficitKcal = t.V2.Energy.DeficitKcal
 		}
+	}
+	if a := plan.Activity; a != nil {
+		ea := &EnergyActivity{RunKcal: roundTo(a.Run, 10), OtherKcal: roundTo(a.Other, 10), StrengthKcal: roundTo(a.Strength, 10),
+			StepsKcal: roundTo(a.Steps, 10), Steps: a.StepCount}
+		if a.StepBaseline != nil {
+			ea.StepsAverage = fptr(roundTo(*a.StepBaseline, 100))
+		}
+		s.Energy.Activity = ea
 	}
 	if s.Energy.Calibration.State == "" {
 		s.Energy.Calibration = calibOff(t, in.today(), "no calibration result yet")

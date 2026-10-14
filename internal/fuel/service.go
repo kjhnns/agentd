@@ -75,6 +75,7 @@ type Service struct {
 	feed    *Feed
 	photos  *photoStore
 	strava  *stravaIndex
+	steps   *stepsStore
 
 	mu      sync.Mutex
 	ids     VarIDs
@@ -268,6 +269,9 @@ func New(o Options) (*Service, error) {
 	}
 	if s.calib, err = openCalibStore(o.StateDir); err != nil {
 		return nil, fmt.Errorf("fuel: calibration: %w", err)
+	}
+	if s.steps, err = openStepsStore(o.StateDir); err != nil {
+		return nil, fmt.Errorf("fuel: steps: %w", err)
 	}
 	if o.Web.Enabled {
 		if s.web, err = openWeb(o.Web, o.StateDir, o.Token, o.Now); err != nil {
@@ -1531,6 +1535,11 @@ func (s *Service) snapInputFor(date string) (snapInput, error) {
 		si:       si,
 		recs:     s.recordsViewNow(),
 		days:     map[string]*dayData{},
+	}
+	steps := s.steps.Snapshot()
+	in.ax = &activityInput{
+		steps:   func(d string) (int, bool) { n, ok := steps[d]; return n, ok },
+		session: func(d string) bool { return si.day(d).Session },
 	}
 	in.calib, in.drift = s.calibFor(t, asOf.In(t.loc).Format("2006-01-02"))
 	return in, nil

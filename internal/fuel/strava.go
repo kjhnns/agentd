@@ -17,6 +17,8 @@ type Activity struct {
 	DistanceM  float64
 	LocalStart time.Time // wall clock in the athlete's zone, stored as UTC fields
 	LocalDate  string    // YYYY-MM-DD of the local start
+	Kilojoules float64   // work from a power meter (0: none)
+	AvgCadence float64   // Strava average_cadence (0: none)
 }
 
 // stravaIndex caches parsed files by path + mtime so a snapshot does not
@@ -94,6 +96,8 @@ func parseStrava(b []byte) *Activity {
 		MovingTime     float64 `json:"moving_time"`
 		Distance       float64 `json:"distance"`
 		StartDateLocal string  `json:"start_date_local"`
+		Kilojoules     float64 `json:"kilojoules"`
+		AvgCadence     float64 `json:"average_cadence"`
 	}
 	if json.Unmarshal(bytes.TrimSpace(rest[:j]), &raw) != nil {
 		return nil
@@ -108,7 +112,8 @@ func parseStrava(b []byte) *Activity {
 	if err != nil {
 		return nil
 	}
-	return &Activity{SportType: sport, MovingS: raw.MovingTime, DistanceM: raw.Distance, LocalStart: t, LocalDate: t.Format("2006-01-02")}
+	return &Activity{SportType: sport, MovingS: raw.MovingTime, DistanceM: raw.Distance, LocalStart: t, LocalDate: t.Format("2006-01-02"),
+		Kilojoules: raw.Kilojoules, AvgCadence: raw.AvgCadence}
 }
 
 func isTrainingSport(s string) bool {

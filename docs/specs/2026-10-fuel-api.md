@@ -1234,3 +1234,32 @@ Joe (2026-10-04): 83 to 85 % of his 137 chat messages of four days are a log or 
 - `log` adds one header line for the agent ("Joe marked this message as a LOG ..."). It forces nothing: a question typed with Log selected is answered as a question. On the estimator it has no effect.
 - A deploy puts the server first: a server before this section refuses the unknown multipart part with 400.
 - Tests: TestIntentHintHashAndValidation, TestIntentAskWritesNothingOnTheEstimator, TestIntentAskTurnOfTheAgentHasNoCapability.
+
+### 18.15 Activity in the energy target (2026-10-14, Joe)
+
+Joe: "The calories amount per day doesn't account for any activity, steps, or exercises I do." Before this, the provisional target was 2600 or 3000 kcal by day type, so a 5 km and a 25 km run gave the same 3000, and steps, walks, rowing, rides and strength gave nothing. The formula state (18.5) counted run km only.
+
+Targets file: `energy.activity`, optional (absent or null = off: 18.5 exactly). When set, every key is required:
+
+```
+"activity": {"walk_cost_kcal_per_kg_km": 0.5, "step_length_m": 0.75, "run_cadence_spm": 165,
+             "strength_session_kcal": 200, "baseline_days": 28, "min_baseline_days": 7}
+```
+
+Ranges: walk cost 0.2 to 1.0, step length 0.4 to 1.2, cadence 120 to 220, strength 0 to 600, baseline_days 7 to 60, min_baseline_days 3 to 60 and not above baseline_days. A binary before 18.15 refuses the key (503 targets_invalid): deploy the binary first, add the key after; roll back in the reverse order.
+
+Parts of a past date or today d (a future date keeps the 18.5 value and has no activity):
+- run: provisional `k x reference_mass_kg x run_km(d)`; formula the 18.5 run adjustment, unchanged. Strava stale: 0 (18.5).
+- other sport: every Strava activity of d that is not a run, not Walk or Hike (inside the steps) and not WeightTraining (inside strength). A ride with `kilojoules` counts 1 kcal per kJ; anything else `(MET - 1) x 3.5 x mass / 200` per minute of moving time (MET table in activity.go, unknown sport 4).
+- strength: `strength_session_kcal` when d is a strength session by 19.6.
+- steps: walk(d) = max(0, steps(d) - run steps(d)); run steps = moving minutes x cadence (Strava `average_cadence`, doubled when below 120 because Garmin reports per leg; `run_cadence_spm` without one). average = the mean walk over the dates with steps among the baseline_days dates before d; null below min_baseline_days dates (then the part is 0). steps part = `walk_cost x mass x step_length_m / 1000 x (walk(d) - average)`. On today the part is never below 0 (the count is partial).
+
+Mass: reference_mass_kg in state provisional (null: activity off), maintenance.mass_kg in state formula.
+
+Target:
+- provisional: `kcal.rest + run + other + strength + steps`, rounded to 10. Basis: "Provisional. 2600 rest + 400 run + 180 steps (14000, average 8000)"; parts that round to 0 are left out. `provisional` stays true.
+- formula: the 18.5 target plus `(other - its baseline_days mean) + (strength - its mean) + steps`: maintenance holds the average of these, so only the difference is added (the same reason as the run). The calibration interval and the trailing window are not the same days; the difference is accepted.
+
+Steps input: `POST /fuel/steps` `{"days":[{"date":"YYYY-MM-DD","steps":int}]}`, 1 to 60 dates, each within the last 90 days and not after today (targets.tz), steps 0 to 150000. A date sent again replaces its count. Stored in `state_dir/steps.json` (written and synced before the answer, dates older than 90 days dropped). Answer `{"stored":n,"dates":[...]}`. The iOS app sends the Apple Health step count per local date.
+
+Snapshot: `energy.activity` = `{"run_kcal","other_sport_kcal","strength_kcal","steps_kcal","steps":int|null,"steps_average":number|null}` (kcal rounded to 10, the average to 100), null when the key is off or the date is future. The week view and the budgets use the same day plan.
