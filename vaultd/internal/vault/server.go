@@ -35,9 +35,9 @@ type Config struct {
 	PairLogin  string // tailnet owner login allowed to pair
 	PairOS     string // "iOS"
 	// PairSources, when set, are the only remote IPs the pairing listener
-	// answers (checked before any other work). tailscaled accepts all
-	// tailscale0 traffic ahead of ufw, so this is the network-level filter
-	// (deploy review r1 #4).
+	// answers (checked before any other work). An application filter, not a
+	// network one: tailscaled accepts all tailscale0 traffic ahead of ufw, so
+	// other tailnet nodes can still open a TCP connection (deploy review r1 #4).
 	PairSources     []string
 	MaxDevices      int      // 1
 	BackupExclusion string   // clawd commit of the backup change; "" = intake not ready

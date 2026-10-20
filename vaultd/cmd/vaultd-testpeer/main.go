@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -63,6 +64,7 @@ func (s *memStore) CleanTemps() (int, error) { return 0, nil }
 
 func main() {
 	dir := flag.String("dir", "", "output dir for uri.txt and shared.txt")
+	port := flag.Int("port", 28790, "public port; pairing is port+1 (loopback only)")
 	flag.Parse()
 	if *dir == "" {
 		log.Fatal("-dir is required")
@@ -70,7 +72,7 @@ func main() {
 	if err := os.MkdirAll(*dir, 0o700); err != nil {
 		log.Fatal(err)
 	}
-	cfg := vault.Config{ServerID: "agent.gojoe.run", PublicAddr: "127.0.0.1:18790", PairAddr: "127.0.0.1:18791",
+	cfg := vault.Config{ServerID: "agent.gojoe.run", PublicAddr: fmt.Sprintf("127.0.0.1:%d", *port), PairAddr: fmt.Sprintf("127.0.0.1:%d", *port+1),
 		AdminSock: filepath.Join(*dir, "admin.sock"), StateDir: filepath.Join(*dir, "state"),
 		RouteToken: strings.Repeat("t", 40), PairLogin: "test@example.invalid", PairOS: "iOS", MaxDevices: 1,
 		BackupExclusion: "testpeer", TestMode: true}
@@ -98,7 +100,7 @@ func main() {
 		log.Fatal(err)
 	}
 	s.TestReadFloorAtStart()
-	log.Printf("testpeer ready: public 127.0.0.1:18790, pairing 127.0.0.1:18791")
+	log.Printf("testpeer ready: public %s, pairing %s", cfg.PublicAddr, cfg.PairAddr)
 	if err := s.Serve(context.Background()); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}

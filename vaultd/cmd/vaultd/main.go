@@ -178,6 +178,9 @@ func usage() {
 }
 
 func serve(args []string) {
+	if err := noDumps(); err != nil {
+		log.Fatalf("vaultd: cannot disable core dumps: %v", err)
+	}
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	cfgPath := fs.String("config", filepath.Join(home(), ".config", "vaultd", "config.json"), "config file (0600)")
 	_ = fs.Parse(args)
