@@ -1,0 +1,15 @@
+{
+  "server_id": "agent.gojoe.run",
+  "public_addr": "100.120.65.8:8790",
+  "pair_addr": "100.120.65.8:8791",
+  "admin_sock": "",
+  "state_dir": "~/.local/state/vaultd",
+  "store_root": "~/.password-store",
+  "route_token": "pass:vaultd/route-token",
+  "pair_login": "johannesklumpe@gmail.com",
+  "pair_os": "iOS",
+  "max_devices": 1,
+  "backup_exclusion": "",
+  "notify_cmd": ["/home/johannes/clawd/scripts/tg-send", "--source", "vaultd"],
+  "test_mode": false
+}

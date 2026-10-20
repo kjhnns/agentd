@@ -1,0 +1,60 @@
+{
+  "note": "vault v1 interop vectors; scalars are test-only",
+  "keys": {
+    "box_intake": "0404040404040404040404040404040404040404040404040404040404040404",
+    "box_sign": "0303030303030303030303030303030303030303030303030303030303030303",
+    "phone_agr": "0202020202020202020202020202020202020202020202020202020202020202",
+    "phone_sign": "0101010101010101010101010101010101010101010101010101010101010101"
+  },
+  "publics": {
+    "box_intake": "BHMQPsMLPM9X2q4I6TU0rvFEo1lAz2u7oSoM98vV1lpk2CyMmenTxF-SRbqbJ5gsmuqOwduUsZxEeVlCwOsiqjI",
+    "box_sign": "BFkat3HrvP1tnLkJTRBlKK3Rpp1EwsH2J_CJ7Fi5xhrfn05qvw0EXAxpOjxorXyXynK-ZN70om_s0mPdmKkngPA",
+    "phone_agr": "BFUPRxAD89-Xw99QaseX9nIfsaH7e49vg9IkSYplyI4kE2CT1wEuUJpzcVy9CwCjzA_0tcAbP_oZarH7MnA2uOY",
+    "phone_sign": "BG_wO5SSQc4drdQ1GeaWDgqFtBppoFwygQOqK84VlMoWPE91OlW_AdxT9sCwx-7ni0DG_30lqW4igrmJzvccFEo"
+  },
+  "key_ids": {
+    "box_intake": "e6f39369127579d20d5eacd45990055f",
+    "box_sign": "d02c9e7062d4d70c142007e115a13cf4",
+    "phone_agr": "fe00ab0f341901f863a49160cf554588",
+    "phone_sign": "256b1be32745d1d1c9d49121cc87bc45"
+  },
+  "fingerprint_b64": "iTiEasnyw7NcLl0F5-Hj3d43h2to381aIVfPA-l2PQU",
+  "hkdf": {
+    "pair_key S=09*32 pid=00112233445566778899aabbccddeeff": "B0P4ZkWbH2K-64XSkqBifM_7f8xC4quRWmMlCOt0oy8"
+  },
+  "hmac": {
+    "K above, msg 'agentd-vault-v1 pair-hello\\n{}'": "Zby1S2_TUY9gfE6ZdslxrD1Cv9fBC4DfeA768Fo4I-M"
+  },
+  "aad": {
+    "b2p shared.value": "agentd-vault-v1 aad-b2p|agent.gojoe.run|256b1be32745d1d1c9d49121cc87bc45|aabbccddeeff00112233445566778899|fe00ab0f341901f863a49160cf554588|shared.value|0123456789abcdef0123456789abcdef|0",
+    "p2b intake v1": "agentd-vault-v1 aad-p2b|agent.gojoe.run|256b1be32745d1d1c9d49121cc87bc45|aabbccddeeff00112233445566778899|e6f39369127579d20d5eacd45990055f|intake|0123456789abcdef0123456789abcdef|1"
+  },
+  "hpke": [
+    {
+      "recipient": "box_intake",
+      "info": "agentd-vault-v1 p2b",
+      "aad": "agentd-vault-v1 aad-p2b|agent.gojoe.run|256b1be32745d1d1c9d49121cc87bc45|aabbccddeeff00112233445566778899|e6f39369127579d20d5eacd45990055f|intake|0123456789abcdef0123456789abcdef|1",
+      "ct_b64": "BD2v37Ha7J17U4LMdUCumkx4JWWP1RWs-adPFsjAQIropy8d22O5uQ_ttWNTowP0SpPl10e8AN3Eet2ZCQFe1JcllpkzmgOhs6oZdqAz2OWwK6cwyE4MyDaxNVCYANlb2ODU5vhyB7mvV5Ac7klL3fN81pxcdI8FrD-a61rqmOlmIyQfkIF-bIYR5Nr7LF_D1aUrp2KLpuEWB6hxW74",
+      "plaintext": "{\"label\":\"IBKR\",\"login\":\"joe\",\"url\":\"https://x/?a=1\u0026b=\u003c2\u003e\",\"password\":\"pw-1\"}"
+    },
+    {
+      "recipient": "phone_agr",
+      "info": "agentd-vault-v1 b2p",
+      "aad": "agentd-vault-v1 aad-b2p|agent.gojoe.run|256b1be32745d1d1c9d49121cc87bc45|aabbccddeeff00112233445566778899|fe00ab0f341901f863a49160cf554588|shared.value|0123456789abcdef0123456789abcdef|0",
+      "ct_b64": "BCDH6g1glraM_JCnEu2k0-t130EzXA6VZB-lTBk4KosZbCD5g82Br8MA53dnbAIK5M8Uv2xPUEWMiEsweQJXFnMh2MHq13Pl-SE9EPCEyYUv-ReSi8wr_A6olocyK9suHfba6Yx5weXtwVDhJ_YghSr8r7fPQrld43Sy0slnQfBkZR4cVEa4dg",
+      "plaintext": "{\"label\":\"eBay\",\"login\":\"j\",\"url\":\"\",\"password\":\"pw-2\"}"
+    }
+  ],
+  "signatures": [
+    {
+      "signer": "phone_sign",
+      "msg_b64": "YWdlbnRkLXZhdWx0LXYxIHJlcQp7InYiOjEsInNydiI6ImFnZW50Lmdvam9lLnJ1biIsIm9wIjoiZ2l2ZW4ubGlzdCIsInBhdGgiOiIvdmF1bHQvdjEvZ2l2ZW4vbGlzdCIsImRldiI6IjI1NmIxYmUzMjc0NWQxZDFjOWQ0OTEyMWNjODdiYzQ1IiwiZ2VuIjoiYWFiYmNjZGRlZWZmMDAxMTIyMzM0NDU1NjY3Nzg4OTkiLCJyaWQiOiJmZmVlZGRjY2JiYWE5OTg4Nzc2NjU1NDQzMzIyMTEwMCIsInRzIjoxNzkyMDAwMDAwMDAwLCJpdGVtIjoiIiwiaXYiOjAsIm9waWQiOiIiLCJia2lkIjoiIiwiYyI6IiJ9",
+      "sig_b64": "_Oi7oql-8lZM7HHqw1otN7oUGebZLslIi_XwGKhOJV5ifbH5UGg_7_OxItYPIoCpblYnpKfUhpO10UyLJaNA9A"
+    },
+    {
+      "signer": "box_sign",
+      "msg_b64": "YWdlbnRkLXZhdWx0LXYxIHJlc3AKeyJ2IjoxfQ",
+      "sig_b64": "4EL2oVmzF1Bt9VG6foOsoTFqkW_DUA888nQOxkvO_eqUP_ylmFAOmTJtMTrQ-tEUPXFLmUzsfuQkS_YJp8qSUw"
+    }
+  ]
+}
