@@ -24,16 +24,21 @@ import (
 
 // Config is the daemon configuration.
 type Config struct {
-	ServerID        string   // srv, e.g. agent.gojoe.run
-	PublicAddr      string   // 100.120.65.8:8790
-	PairAddr        string   // 100.120.65.8:8791
-	AdminSock       string   // $XDG_RUNTIME_DIR/vaultd/admin.sock
-	StateDir        string   // ~/.local/state/vaultd
-	StoreRoot       string   // ~/.password-store
-	GPGHome         string   // tests only
-	RouteToken      string   // resolved secret
-	PairLogin       string   // tailnet owner login allowed to pair
-	PairOS          string   // "iOS"
+	ServerID   string // srv, e.g. agent.gojoe.run
+	PublicAddr string // 100.120.65.8:8790
+	PairAddr   string // 100.120.65.8:8791
+	AdminSock  string // $XDG_RUNTIME_DIR/vaultd/admin.sock
+	StateDir   string // ~/.local/state/vaultd
+	StoreRoot  string // ~/.password-store
+	GPGHome    string // tests only
+	RouteToken string // resolved secret
+	PairLogin  string // tailnet owner login allowed to pair
+	PairOS     string // "iOS"
+	// PairSources, when set, are the only remote IPs the pairing listener
+	// answers (checked before any other work). tailscaled accepts all
+	// tailscale0 traffic ahead of ufw, so this is the network-level filter
+	// (deploy review r1 #4).
+	PairSources     []string
 	MaxDevices      int      // 1
 	BackupExclusion string   // clawd commit of the backup change; "" = intake not ready
 	NotifyCmd       []string // argv; the notice text is appended
@@ -458,4 +463,12 @@ func (s *Server) Serve(ctx context.Context) error {
 		err = nil
 	}
 	return err
+}
+
+// TestReadFloorAtStart drops the 30 s skew margin of the read floor. Only the
+// test peer (vaultd-testpeer) calls it, so its client can read at once.
+func (s *Server) TestReadFloorAtStart() {
+	if s.cfg.TestMode {
+		s.readFloor = s.startMs
+	}
 }

@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/kjhnns/agentd/vaultd/internal/passstore"
@@ -63,27 +62,6 @@ func (s *Server) listenAdmin() (*net.UnixListener, error) {
 		return nil, err
 	}
 	return l, nil
-}
-
-func peerUID(c *net.UnixConn) (int, error) {
-	raw, err := c.SyscallConn()
-	if err != nil {
-		return -1, err
-	}
-	uid := -1
-	var cerr error
-	err = raw.Control(func(fd uintptr) {
-		cred, e := syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
-		if e != nil {
-			cerr = e
-			return
-		}
-		uid = int(cred.Uid)
-	})
-	if err != nil {
-		return -1, err
-	}
-	return uid, cerr
 }
 
 func (s *Server) serveAdmin(ctx context.Context, l *net.UnixListener) error {

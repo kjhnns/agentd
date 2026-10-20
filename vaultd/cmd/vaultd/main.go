@@ -45,6 +45,7 @@ type fileConfig struct {
 	RouteToken      string   `json:"route_token"` // "pass:<path>" or "env:<NAME>"
 	PairLogin       string   `json:"pair_login"`
 	PairOS          string   `json:"pair_os"`
+	PairSources     []string `json:"pair_sources"`
 	MaxDevices      int      `json:"max_devices"`
 	BackupExclusion string   `json:"backup_exclusion"`
 	NotifyCmd       []string `json:"notify_cmd"`
@@ -87,7 +88,7 @@ func loadConfig(path string) (vault.Config, error) {
 	}
 	cfg := vault.Config{ServerID: fc.ServerID, PublicAddr: fc.PublicAddr, PairAddr: fc.PairAddr,
 		AdminSock: expand(fc.AdminSock), StateDir: expand(fc.StateDir), StoreRoot: expand(fc.StoreRoot),
-		PairLogin: fc.PairLogin, PairOS: fc.PairOS, MaxDevices: fc.MaxDevices,
+		PairLogin: fc.PairLogin, PairOS: fc.PairOS, PairSources: fc.PairSources, MaxDevices: fc.MaxDevices,
 		BackupExclusion: fc.BackupExclusion, NotifyCmd: fc.NotifyCmd, TestMode: fc.TestMode}
 	if cfg.AdminSock == "" {
 		cfg.AdminSock = defaultSock()
@@ -101,6 +102,11 @@ func loadConfig(path string) (vault.Config, error) {
 	}
 	if !cfg.TestMode && filepath.Clean(cfg.StoreRoot) != defStore {
 		return vault.Config{}, errors.New("store_root may differ from ~/.password-store only with test_mode (spec 12)")
+	}
+	for _, a := range cfg.PairSources {
+		if net.ParseIP(a) == nil {
+			return vault.Config{}, fmt.Errorf("pair_sources: %q is not an IP", a)
+		}
 	}
 	if cfg.PairOS == "" {
 		cfg.PairOS = "iOS"
@@ -129,9 +135,21 @@ func resolveSecret(ref string) (string, error) {
 		if err := passstore.ValidPath(p); err != nil {
 			return "", err
 		}
-		out, err := exec.Command("pass", "show", "--", p).Output()
+		// Bounded (deploy review r1 #1): a stalled pass/gpg must not leave a
+		// running unit without listeners. The process group dies on timeout.
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "/usr/bin/pass", "show", "--", p)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+		cmd.WaitDelay = 5 * time.Second
+		cmd.Stdin = nil
+		out, err := cmd.Output()
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
 		if err != nil {
-			return "", errors.New("pass show failed")
+			return "", errors.New("pass show failed or timed out")
 		}
 		return strings.SplitN(string(out), "\n", 2)[0], nil
 	}

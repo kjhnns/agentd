@@ -5,8 +5,10 @@
 #   systemctl --user enable --now vaultd
 [Unit]
 Description=vaultd (Vault tab password exchange, /vault/v1/*)
-After=network-online.target tailscaled.service
-Wants=network-online.target
+# No After=tailscaled/network-online: a user unit cannot order against system
+# units. If the tailnet address is not up yet, binding fails, vaultd exits and
+# Restart retries every 5 s without a limit.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -17,6 +19,8 @@ RestartSec=5
 TimeoutStopSec=40
 UMask=0077
 NoNewPrivileges=yes
+# vaultd holds decrypted values in memory: no core dumps.
+LimitCORE=0
 
 [Install]
 WantedBy=default.target

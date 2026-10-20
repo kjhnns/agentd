@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"os/exec"
 	"strings"
@@ -44,6 +45,10 @@ func TailscaleWhois(ctx context.Context, remoteAddr string) (string, string, str
 // PairHandler serves /vault/v1/pair/* on the pairing listener only.
 func (s *Server) PairHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.pairSourceAllowed(r.RemoteAddr) {
+			unsigned(w, http.StatusNotFound, "not_found")
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.RawQuery != "" || r.URL.ForceQuery || !jsonType(r) {
 			unsigned(w, http.StatusNotFound, "not_found")
 			return
@@ -76,6 +81,24 @@ func (s *Server) PairHandler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, out)
 	})
+}
+
+// pairSourceAllowed applies Config.PairSources (empty = every source).
+func (s *Server) pairSourceAllowed(remote string) bool {
+	if len(s.cfg.PairSources) == 0 {
+		return true
+	}
+	host, _, err := net.SplitHostPort(remote)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	for _, a := range s.cfg.PairSources {
+		if ip != nil && ip.Equal(net.ParseIP(a)) {
+			return true
+		}
+	}
+	return false
 }
 
 // liveRecord returns a copy of the pairing record for pid when it exists, is

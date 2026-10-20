@@ -585,3 +585,21 @@ func TestPagination(t *testing.T) {
 		t.Fatalf("page 2: %d entries, next %q", len(r2.Entries), r2.Next)
 	}
 }
+
+func TestPairSources(t *testing.T) {
+	e := newEnv(t)
+	e.cfg.PairSources = []string{"100.98.133.78"}
+	e.restart()
+	resp, err := http.Post(e.pair.URL+"/vault/v1/pair/keys", "application/json", strings.NewReader(`{"pid":"00112233445566778899aabbccddeeff"}`))
+	if err != nil || resp.StatusCode != 404 {
+		t.Fatalf("a source outside pair_sources: %v %d", err, resp.StatusCode)
+	}
+	resp.Body.Close()
+	e.cfg.PairSources = []string{"127.0.0.1"}
+	e.restart()
+	uri, _ := e.s.PairStart(false)
+	p := e.phone()
+	if err := p.Pair(uri); err != nil {
+		t.Fatalf("an allowed source could not pair: %v", err)
+	}
+}

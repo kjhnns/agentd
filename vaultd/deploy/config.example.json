@@ -10,6 +10,13 @@
   "pair_os": "iOS",
   "max_devices": 1,
   "backup_exclusion": "",
-  "notify_cmd": ["/home/johannes/clawd/scripts/tg-send", "--source", "vaultd"],
-  "test_mode": false
+  "notify_cmd": [
+    "/home/johannes/clawd/scripts/tg-send",
+    "--source",
+    "vaultd"
+  ],
+  "test_mode": false,
+  "pair_sources": [
+    "100.98.133.78"
+  ]
 }
