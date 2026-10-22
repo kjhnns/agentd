@@ -478,6 +478,35 @@ func TestTelegramAlbumAcrossPolls(t *testing.T) {
 	}
 }
 
+// A retryable error of the API (a transcription failure, 502) is tried again,
+// not acknowledged.
+func TestTelegramRetryableError(t *testing.T) {
+	h, fa := newChat(t)
+	fa.script = logsItems(h, "Logged a plum.", food("plum", 60, 30, 0.4, 0))
+	f := newFakeTG(t)
+	f.push(1, tgMsg(h, tgJoe, 41, map[string]any{"text": "a plum"}))
+	var mu sync.Mutex
+	fail := 1
+	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		b := fail > 0 && r.URL.Path == "/fuel/log"
+		if b {
+			fail--
+		}
+		mu.Unlock()
+		if b {
+			writeErr(w, errf(http.StatusBadGateway, "upstream_failed", true, "transcription failed"))
+			return
+		}
+		h.h.ServeHTTP(w, r)
+	})
+	startBot(t, h, f, func(o *TelegramOptions) { o.Handler = wrapped; o.RetryWait = 100 * time.Millisecond })
+	sent := f.waitSent(t, 1)
+	if !strings.HasPrefix(sent[0], "Logged a plum.") {
+		t.Fatalf("sent %q", sent)
+	}
+}
+
 // fueld busy (503) beyond the request's own retries: the message is NOT
 // acknowledged and is tried again; it is logged once.
 func TestTelegramBusyRetries(t *testing.T) {

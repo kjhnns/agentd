@@ -475,6 +475,9 @@ func (b *TelegramBot) handle(ctx context.Context, msgs []*tgMessage) bool {
 				return done
 			}
 			wav, err := b.o.Convert(ctx, raw)
+			if err != nil && ctx.Err() != nil {
+				return false // fueld stops: the message stays for the next start
+			}
 			if err != nil {
 				log.Printf("fuel: telegram voice: %v", err)
 				return reply("I could not read the voice note. Nothing was logged. Send it as text.")
@@ -490,8 +493,17 @@ func (b *TelegramBot) handle(ctx context.Context, msgs []*tgMessage) bool {
 	}
 	_ = b.call(ctx, "sendChatAction", map[string]any{"chat_id": chat, "action": "typing"}, nil)
 	code, body := b.post(ctx, in)
-	if code == http.StatusServiceUnavailable || code == http.StatusTooManyRequests || code == 0 {
+	ae := apiErrOf(body)
+	switch {
+	case code == 0 || code == http.StatusServiceUnavailable || code == http.StatusTooManyRequests:
 		return false
+	case code >= 400 && ae.Retryable:
+		return false // e.g. a transcription failure or a timeout: nothing was written
+	case code == http.StatusConflict && ae.Code == "idempotency_conflict" && first.MediaGroupID != "":
+		// The rest of an album that was already logged, re-delivered after a
+		// later message failed: the album's answer was sent then.
+		log.Printf("fuel: telegram: a re-delivered part of a logged album was skipped")
+		return true
 	}
 	b.replies.Add(1)
 	go func() {
@@ -682,6 +694,20 @@ func tgRound(f float64) float64 {
 	return math.Round(f*10) / 10
 }
 
+type tgAPIErr struct {
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	Retryable bool   `json:"retryable"`
+}
+
+func apiErrOf(body []byte) tgAPIErr {
+	var e struct {
+		Error tgAPIErr `json:"error"`
+	}
+	_ = json.Unmarshal(body, &e)
+	return e.Error
+}
+
 func apiErrText(code int, body []byte) string {
 	var e struct {
 		Error struct {
@@ -730,7 +756,7 @@ func (b *TelegramBot) send(ctx context.Context, chat, replyTo int64, text string
 			if te.code == 400 || te.code == 403 {
 				return // not retryable
 			}
-			if te.retryAfter > 0 && te.retryAfter <= 10 {
+			if te.retryAfter > 0 { // flood control: the send budget bounds it
 				wait = time.Duration(te.retryAfter) * time.Second
 			}
 		}
