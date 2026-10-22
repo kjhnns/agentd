@@ -74,6 +74,11 @@ type DaemonConfig struct {
 	WebEnabled            bool
 	PublicOrigin          string // "https://fuel.gojoe.run"
 	WebInsecureTestCookie bool   // test instances on plain http only; refused with https or without test_mode
+
+	// The Fuel Telegram bot (spec 24).
+	TelegramEnabled   bool
+	TelegramToken     string // literal or "env:VAR": the bot token
+	TelegramAllowUser string // the ONE Telegram user id served, digits
 }
 
 // DefaultConfigPath is where fueld looks without -config.
@@ -160,7 +165,8 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 		key := strings.TrimSpace(line[:eq])
 		raw := stripTOMLComment(strings.TrimSpace(line[eq+1:]))
 		if b := map[string]*bool{"test_mode": &c.TestMode, "recalibrate_enabled": &c.RecalibrateEnabled,
-			"web_enabled": &c.WebEnabled, "web_insecure_test_cookie": &c.WebInsecureTestCookie}[key]; b != nil {
+			"web_enabled": &c.WebEnabled, "web_insecure_test_cookie": &c.WebInsecureTestCookie,
+			"telegram_enabled": &c.TelegramEnabled}[key]; b != nil {
 			v, err := strconv.ParseBool(raw)
 			if err != nil {
 				return c, fmt.Errorf("line %d: %s expects true or false", n, key)
@@ -190,7 +196,8 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 			"chat_backend":         &c.ChatBackend, "chat_agent_url": &c.ChatAgentURL, "chat_agent_token": &c.ChatAgentToken,
 			"chat_agent_workspace": &c.ChatAgentWorkspace, "chat_agent_model": &c.ChatAgentModel,
 			"chat_agent_timeout": &c.ChatAgentTimeout, "agent_op_token": &c.AgentOpToken,
-			"public_origin": &c.PublicOrigin,
+			"public_origin":  &c.PublicOrigin,
+			"telegram_token": &c.TelegramToken, "telegram_allow_user": &c.TelegramAllowUser,
 		}[key]
 		if dst == nil {
 			return c, fmt.Errorf("line %d: unknown key %q", n, key)
@@ -230,6 +237,17 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 		}
 	}
 	// The agent chat broker (spec 22.1).
+	if c.TelegramEnabled {
+		if c.TelegramToken == "" {
+			return c, errors.New("telegram_enabled needs telegram_token")
+		}
+		if n, err := strconv.ParseInt(c.TelegramAllowUser, 10, 64); err != nil || n <= 0 {
+			return c, errors.New("telegram_enabled needs telegram_allow_user (a Telegram user id)")
+		}
+		if c.TelegramToken == c.Token {
+			return c, errors.New("telegram_token must not be the app token")
+		}
+	}
 	if c.ChatBackend != "estimator" && c.ChatBackend != "agent" {
 		return c, fmt.Errorf("chat_backend %q is not \"estimator\" or \"agent\"", c.ChatBackend)
 	}

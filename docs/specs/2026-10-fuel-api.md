@@ -1263,3 +1263,17 @@ Target:
 Steps input: `POST /fuel/steps` `{"days":[{"date":"YYYY-MM-DD","steps":int}]}`, 1 to 60 dates, each within the last 90 days and not after tomorrow (targets.tz; a phone in a zone ahead of it, such as Beijing, is on the next date for some hours), steps 0 to 150000. A date sent again replaces its count. Stored in `state_dir/steps.json` (written and synced before the answer, dates older than 90 days dropped). Answer `{"stored":n,"dates":[...]}`. The iOS app sends the Apple Health step count per local date.
 
 Snapshot: `energy.activity` = `{"run_kcal","other_sport_kcal","strength_kcal","steps_kcal","steps":int|null,"steps_average":number|null}` (kcal rounded to 10, the average to 100), null when the key is off or the date is future. The week view and the budgets use the same day plan.
+
+## 24. Telegram fallback bot (2026-10-22, Joe, ticket OPS-44)
+
+On a flight the Wi-Fi often allows only messaging. The app is then offline (its outbox waits). A separate Telegram bot ("Fuel", @OfferManagementBot, token in pass `fueld/telegram-bot-token`) is the fallback. The app stays primary.
+
+24.1 Poller. fueld long-polls the Bot API (`getUpdates`, 50 s, `allowed_updates: ["message"]`) when `telegram_enabled = true`. No webhook, no agentd turn. Config: `telegram_token` (secret, "env:VAR"), `telegram_allow_user` (digits). Only a PRIVATE chat with that user is served; every other message is ignored without a reply. One poller per token: a second one gets 409 and retries every 60 s. The offset is saved in `state_dir/telegram-offset` after each message.
+
+24.2 Path. Every message goes, in process, through `POST /fuel/log` with the app token: the same chat turn, feed, corrections and coaching as the app. `client_id` = `tg-<chat id>-<message id>` (a re-delivered message replays and never writes twice); `local_time` = the Telegram message time (a message older than 47 h is refused with a reply). Text and captions are the text; a voice note (at most 120 s) is converted to 16 kHz WAV with ffmpeg and transcribed by fueld; a photo (the largest size) or an image document is an image. An album (one `media_group_id`) is one message with up to 4 photos. Stickers and other kinds get a short "text, voice notes and photos" reply. `/start` and `/help` answer a help text and log nothing.
+
+24.3 Reply. The answer is the reply's text blocks, then one line "Today: energy X of Y kcal, protein ..., sat fat ..., fibre ..." from the `macros_today` widget. A pending turn is polled through `GET /fuel/entry/{id}` for up to 5 min with a typing indicator; after that the reply says the answer is in the app. An error answers "Not logged: <message>". Plain text, a reply to the message.
+
+24.4 Marking and duplicate guard. The entry and its user feed line carry `via: "telegram"` (feed wire key `via`, omitted otherwise; never accepted from the wire). The chat history of a turn marks such lines "[via Telegram]". An APP message (no via) whose `local_time` is within 3 h of a Telegram message's time gets a TELEGRAM FALLBACK block in the turn: those messages, and the rule that a message describing the same food and amount is most likely the offline outbox resending it, so the agent logs nothing and asks once. The existing likely_duplicate check of `/fuel/items` (minutes) stays as it is.
+
+24.5 Not in scope: an offline estimate on the phone; the joe_pa Telegram bot is unchanged.

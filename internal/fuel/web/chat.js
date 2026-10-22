@@ -287,7 +287,7 @@ export function createChat(ctx) {
         el('div', { class: 'bubble' },
           (it.photo_ids || []).length ? el('div', { class: 'photos' }, it.photo_ids.map(photo)) : null,
           it.text ? el('p', null, it.text) : null),
-        el('span', { class: 'at' }, clock(it.at)));
+        el('span', { class: 'at' }, clock(it.at) + (it.via === 'telegram' ? ' \u00b7 via Telegram' : '')));
     }
     const parts = [];
     for (const b of it.blocks || []) {

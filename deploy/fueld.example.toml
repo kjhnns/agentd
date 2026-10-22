@@ -39,3 +39,9 @@ recalibrate_min_interval = "30s"                     # between job starts
 # web_enabled   = true
 # public_origin = "https://fuel.gojoe.run"
 # web_insecure_test_cookie = true   # test instances on plain http only; refused with https or without test_mode
+
+# The Fuel Telegram bot (spec 24): the fallback when the app has no connection.
+# One poller per bot token: never enable it on two instances at once.
+# telegram_enabled    = true
+# telegram_token      = "env:FUEL_TELEGRAM_TOKEN"   # pass fueld/telegram-bot-token
+# telegram_allow_user = "7597951120"                # the ONE Telegram user id served

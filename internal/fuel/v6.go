@@ -79,6 +79,9 @@ func (s *Service) historyOf(now time.Time, loc *time.Location, skip func(FeedIte
 		if it.Role == "user" && len(it.PhotoIDs) > 0 {
 			text = strings.TrimSpace(fmt.Sprintf("[%d photo(s)] %s", len(it.PhotoIDs), text))
 		}
+		if it.Role == "user" && it.Via == ViaTelegram {
+			text = strings.TrimSpace(telegramMark + " " + text)
+		}
 		if text = clipRunes(text, historyTurnRunes); text == "" {
 			continue
 		}

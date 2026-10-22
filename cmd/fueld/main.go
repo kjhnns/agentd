@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -65,6 +66,21 @@ func main() {
 		go func() { svc.Start(ctx); log.Printf("fueld: ready") }()
 	}
 
+	// The Telegram bot (spec 24) runs on its own context: it stops and
+	// finishes its open message before the service closes.
+	botCtx, botCancel := context.WithCancel(context.Background())
+	defer botCancel()
+	botDone := make(chan struct{})
+	if cfg.TelegramEnabled {
+		bot, err := newBot(cfg, svc)
+		if err != nil {
+			log.Fatalf("fueld: %v", err)
+		}
+		go func() { defer close(botDone); bot.Run(botCtx) }()
+	} else {
+		close(botDone)
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           Handler(svc.Handler()),
@@ -98,8 +114,29 @@ func main() {
 		log.Printf("fueld: shutdown: %v (closing remaining connections)", err)
 		_ = srv.Close()
 	}
+	botCancel()
+	select {
+	case <-botDone:
+	case <-time.After(150 * time.Second):
+		log.Printf("fueld: telegram bot did not stop in time")
+	}
 	cancel()
 	svc.Close()
+}
+
+func newBot(cfg fuel.DaemonConfig, svc *fuel.Service) (*fuel.TelegramBot, error) {
+	tok := fuel.ResolveSecret(cfg.TelegramToken)
+	if tok == "" {
+		return nil, errors.New("telegram_token resolves to empty")
+	}
+	user, _ := strconv.ParseInt(cfg.TelegramAllowUser, 10, 64)
+	return fuel.NewTelegramBot(fuel.TelegramOptions{
+		Token:     tok,
+		AllowUser: user,
+		AppToken:  fuel.ResolveSecret(cfg.Token),
+		Handler:   svc.Handler(),
+		StateDir:  cfg.StateDir,
+	}), nil
 }
 
 func build(cfg fuel.DaemonConfig) (*fuel.Service, error) {

@@ -360,6 +360,16 @@ func (s *Service) chatMessage(e Entry, capability, mark string, paths []string, 
 		}
 		fmt.Fprintf(&b, "\n  [%s] %s: %s", h.At, who, clipRunes(strings.Join(strings.Fields(h.Text), " "), 400))
 	}
+	if e.Via == "" {
+		// The duplicate guard of the Telegram fallback (spec 24.4).
+		if tg := s.recentTelegram(e.EatenAt, telegramDupWindow, loc); len(tg) > 0 {
+			b.WriteString("\nTELEGRAM FALLBACK: Joe sent these messages through the Fuel Telegram bot in the last 3 hours (an app without a connection, e.g. on a flight):")
+			for _, l := range tg {
+				b.WriteString("\n  " + l)
+			}
+			b.WriteString("\nThe app sends the messages it kept offline once it is online again. If THIS message describes the same food or drink as one of these Telegram messages (same food, similar amount), it is most likely the same meal sent twice: log NOTHING and ask once whether it is a second serving.")
+		}
+	}
 	b.WriteString("\n---- END OF DAY STATE ----\n")
 	text := e.UserText
 	if strings.TrimSpace(text) == "" {
@@ -922,7 +932,7 @@ func (s *Service) chatAccept(ctx context.Context, w http.ResponseWriter, in logI
 		}
 	}
 	entry := Entry{ID: newID("en_"), ClientID: in.ClientID, Date: date, EatenAt: eatenAt, CreatedAt: now, Intent: "question",
-		Transcript: transcript, PhotoIDs: []string{}, ReqHash: hash, UserText: text, Chat: chatAgent, Agent: agentPending, IntentHint: in.Intent}
+		Transcript: transcript, PhotoIDs: []string{}, ReqHash: hash, UserText: text, Chat: chatAgent, Agent: agentPending, IntentHint: in.Intent, Via: in.Via}
 	if clinical {
 		// The clinical guard wins (22.2): not sent, nothing written.
 		entry.Clinical, entry.Agent = true, agentDone

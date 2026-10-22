@@ -125,6 +125,9 @@ type Entry struct {
 	// IntentHint is what the user marked at the input (spec 22.13): "log",
 	// "ask" (a question: the turn can write nothing) or "" (not marked).
 	IntentHint string `json:"intent_hint,omitempty"`
+	// Via is the channel of a message that did not come from the app or the
+	// web: "telegram" (the Fuel bot, spec 24). Set in-process only.
+	Via string `json:"via,omitempty"`
 	// MovedIDs are the new items (on the target day) of the moves of an
 	// agent chat entry. They are not items of the entry's cards.
 	MovedIDs []string `json:"moved_ids,omitempty"`
@@ -798,6 +801,8 @@ type FeedItem struct {
 	Blocks   []Block   `json:"blocks"`
 	// IntentHint of a user line: what the user marked ("log" | "ask").
 	IntentHint string `json:"intent_hint,omitempty"`
+	// Via of a user line: "telegram" for a message of the Fuel bot.
+	Via string `json:"via,omitempty"`
 	// ShowItems marks the fuel reply that carries the entry's item cards.
 	ShowItems bool `json:"show_items,omitempty"`
 	// NoticeOp is the failed op a "could not save" line reports (once per op).

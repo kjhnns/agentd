@@ -354,6 +354,8 @@ type logInput struct {
 	Images    [][]byte
 	// Intent is the optional intent_hint (spec 22.13): "log" | "ask" | "".
 	Intent string
+	// Via is "telegram" for a message of the Fuel bot (spec 24); never from the wire.
+	Via string
 }
 
 const (
@@ -558,6 +560,7 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, e)
 		return
 	}
+	in.Via = viaOf(r.Context())
 	upload := time.Since(t0)
 	// The 30 s clock starts after the body is read; the work is detached from
 	// the client connection so a disconnect never strands a started write.
@@ -835,7 +838,7 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	entry := Entry{ID: newID("en_"), ClientID: in.ClientID, Date: date, EatenAt: eatenAt, CreatedAt: now, IntentHint: in.Intent,
+	entry := Entry{ID: newID("en_"), ClientID: in.ClientID, Date: date, EatenAt: eatenAt, CreatedAt: now, IntentHint: in.Intent, Via: in.Via,
 		Intent: out.Intent, Transcript: transcript, PhotoIDs: []string{}, ReqHash: hash, Note: note, Clinical: clinical}
 	if out.Intent == "log" && (date != now.In(targets.loc).Format("2006-01-02") || date != requestDate) {
 		entry.DayLabel = dayLabel(date)
@@ -1243,7 +1246,7 @@ func (s *Service) appendUserFeed(e Entry) {
 	eid := e.ID
 	if !s.feed.HasKey("u:" + e.ID) {
 		userText := e.UserText
-		if _, err := s.feed.Append(FeedItem{At: e.CreatedAt, Role: "user", Text: &userText, PhotoIDs: e.PhotoIDs, EntryID: &eid, Key: "u:" + e.ID, IntentHint: e.IntentHint}); err != nil {
+		if _, err := s.feed.Append(FeedItem{At: e.CreatedAt, Role: "user", Text: &userText, PhotoIDs: e.PhotoIDs, EntryID: &eid, Key: "u:" + e.ID, IntentHint: e.IntentHint, Via: e.Via}); err != nil {
 			log.Printf("fuel: feed append for %s failed", e.ID)
 		}
 	}
@@ -2158,6 +2161,8 @@ type feedOut struct {
 	Blocks   []Block     `json:"blocks"`
 	// IntentHint of a user line: what the user marked ("log" | "ask", spec 22.13).
 	IntentHint string `json:"intent_hint,omitempty"`
+	// Via of a user line: "telegram" for a message of the Fuel bot (spec 24).
+	Via string `json:"via,omitempty"`
 }
 
 func (s *Service) handleFeed(w http.ResponseWriter, r *http.Request) {
@@ -2208,7 +2213,7 @@ func (s *Service) handleFeed(w http.ResponseWriter, r *http.Request) {
 	s.stateMu.RLock()
 	out := make([]feedOut, 0, len(page))
 	for _, it := range page {
-		fo := feedOut{ID: it.ID, At: it.At, Role: it.Role, Text: it.Text, PhotoIDs: it.PhotoIDs, EntryID: it.EntryID, Items: []ItemState{}, Blocks: it.Blocks, IntentHint: it.IntentHint}
+		fo := feedOut{ID: it.ID, At: it.At, Role: it.Role, Text: it.Text, PhotoIDs: it.PhotoIDs, EntryID: it.EntryID, Items: []ItemState{}, Blocks: it.Blocks, IntentHint: it.IntentHint, Via: it.Via}
 		if it.EntryID != nil && it.Role == "fuel" && len(fo.Blocks) > 0 && fo.Blocks[0].Type == "text" {
 			if e, ok := s.journal.Entry(*it.EntryID); ok && e.Chat == chatAgent {
 				// An agent chat reply: its write line shows the ops' CURRENT state.
