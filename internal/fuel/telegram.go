@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -85,8 +86,8 @@ func (s *Service) recentTelegram(at time.Time, win time.Duration, loc *time.Loca
 		}
 		out = append(out, t.In(loc).Format("15:04")+" "+clipRunes(text, 300))
 	}
-	if len(out) > 10 {
-		out = out[len(out)-10:]
+	if len(out) > 30 {
+		out = out[len(out)-30:]
 	}
 	return out
 }
@@ -103,6 +104,10 @@ type TelegramOptions struct {
 	PollSecs  int          // getUpdates timeout (50 unless a test sets it)
 	EntryWait time.Duration
 	Now       func() time.Time
+	// RetryWait is the pause before a message that failed is tried again (30 s).
+	RetryWait time.Duration
+	// Ready reports that fueld serves requests; the bot polls only after it.
+	Ready func() bool
 	// Convert turns a voice note (OGG/Opus) into WAV; ffmpeg unless a test sets it.
 	Convert func(ctx context.Context, in []byte) ([]byte, error)
 }
@@ -124,6 +129,9 @@ func NewTelegramBot(o TelegramOptions) *TelegramBot {
 	}
 	if o.Client == nil {
 		o.Client = &http.Client{Timeout: time.Duration(o.PollSecs+20) * time.Second}
+	}
+	if o.RetryWait <= 0 {
+		o.RetryWait = 30 * time.Second
 	}
 	if o.EntryWait <= 0 {
 		o.EntryWait = 5 * time.Minute
@@ -255,21 +263,40 @@ func (b *TelegramBot) saveOffset(n int64) {
 	}
 }
 
-// Run polls until ctx ends, then waits for the open replies. A message that
-// was sent to /fuel/log is acknowledged (the offset moves on) only after the
-// log request returned, so a crash re-sends it: its client_id is derived from
-// the message id, so the repeat replays and never writes twice.
+// Run polls until ctx ends, then waits for the open replies. An update is
+// acknowledged (the offset moves past it) only after its message was handled,
+// so a crash re-sends it: its client_id is derived from the message id, so
+// the repeat replays and never writes twice. Telegram returns every
+// unacknowledged update again on the next poll; the bot relies on that for
+// albums and for retries.
 func (b *TelegramBot) Run(ctx context.Context) {
 	defer b.replies.Wait()
+	for b.o.Ready != nil && !b.o.Ready() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
 	b.loadOffset()
 	log.Printf("fuel: telegram bot polling (user %d)", b.o.AllowUser)
 	backoff := time.Second
-	var group []*tgMessage // an album: one message per photo, one media_group_id
+	albums := map[string]int{} // media_group_id -> photos seen at the last poll
+	tries := map[int64]int{}   // first update id of a job -> failed rounds
+	short := false
 	for ctx.Err() == nil {
 		secs := b.o.PollSecs
-		if len(group) > 0 {
-			secs = 2 // the rest of an album comes within a second or two
+		if short {
+			// An album is still arriving: look again shortly. A poll with
+			// unacknowledged updates returns at once, so wait first.
+			select {
+			case <-ctx.Done():
+				continue
+			case <-time.After(1500 * time.Millisecond):
+			}
+			secs = 0
 		}
+		short = false
 		var ups []tgUpdate
 		err := b.call(ctx, "getUpdates", map[string]any{"offset": b.offset + 1, "timeout": secs, "allowed_updates": []string{"message"}}, &ups)
 		if err != nil {
@@ -293,42 +320,87 @@ func (b *TelegramBot) Run(ctx context.Context) {
 			continue
 		}
 		backoff = time.Second
-		if len(ups) == 0 && len(group) > 0 {
-			b.handle(ctx, group)
-			b.saveOffset(b.offset) // nothing new; the group's last id is already saved
-			group = nil
-			continue
-		}
-		for _, u := range ups {
-			m := u.Message
-			if len(group) > 0 && (m == nil || m.MediaGroupID != group[0].MediaGroupID) {
-				b.handle(ctx, group)
-				group = nil
+		jobs := tgJobs(ups, b.allowed)
+		for k, j := range jobs {
+			if ctx.Err() != nil {
+				break
 			}
-			switch {
-			case m == nil || !b.allowed(m):
-				if m != nil {
-					log.Printf("fuel: telegram: ignored a message from another chat")
+			if j.msgs != nil {
+				if g := j.msgs[0].MediaGroupID; g != "" && albums[g] != j.size {
+					// The album grew since the last poll (or is new): wait for
+					// the rest. Nothing from here on is acknowledged.
+					albums[g] = j.size
+					short = true
+					break
 				}
-				b.saveOffset(u.UpdateID)
-				continue
-			case m.MediaGroupID != "" && len(group) < maxImages:
-				group = append(group, m)
-				// The offset moves when the group is handled.
-				b.offset = u.UpdateID
-				continue
-			case m.MediaGroupID != "":
-				b.offset = u.UpdateID // a fifth photo: dropped
-				continue
+				if !b.handle(ctx, j.msgs) {
+					tries[j.first]++
+					if tries[j.first] < 5 && ctx.Err() == nil {
+						log.Printf("fuel: telegram: message not handled (try %d); retry in %s", tries[j.first], b.o.RetryWait)
+						select {
+						case <-ctx.Done():
+						case <-time.After(b.o.RetryWait):
+						}
+						break // not acknowledged: the next poll returns it
+					}
+					if ctx.Err() != nil {
+						break
+					}
+					b.send(ctx, j.msgs[0].Chat.ID, j.msgs[0].MessageID, "Not logged: Fuel could not take this message after several tries. Send it again later or log it in the app.")
+				}
+				delete(tries, j.first)
+				if g := j.msgs[0].MediaGroupID; g != "" {
+					delete(albums, g)
+				}
+			} else {
+				log.Printf("fuel: telegram: ignored a message from another chat")
 			}
-			b.handle(ctx, []*tgMessage{m})
-			b.saveOffset(u.UpdateID)
+			b.saveOffset(ackAfter(jobs, k, ups))
 		}
-		// A pending album's offset is kept in memory only, but the next
-		// getUpdates confirms it to Telegram: a stop in the 2 s before the
-		// album is handled loses it (accepted: Joe sends it again).
 	}
 	log.Printf("fuel: telegram bot stopped")
+}
+
+// tgJob is one unit of work: one message, one album, or one ignored update
+// (msgs nil). Jobs are in the order of their first update.
+type tgJob struct {
+	first int64 // update id of the first update
+	size  int   // updates of an album
+	msgs  []*tgMessage
+}
+
+func tgJobs(ups []tgUpdate, allowed func(*tgMessage) bool) []tgJob {
+	var jobs []tgJob
+	album := map[string]int{} // media_group_id -> index in jobs
+	for _, u := range ups {
+		m := u.Message
+		switch {
+		case m == nil || !allowed(m):
+			jobs = append(jobs, tgJob{first: u.UpdateID})
+		case m.MediaGroupID != "":
+			if i, ok := album[m.MediaGroupID]; ok {
+				jobs[i].size++
+				if len(jobs[i].msgs) < maxImages {
+					jobs[i].msgs = append(jobs[i].msgs, m) // a fifth photo is dropped
+				}
+				continue
+			}
+			album[m.MediaGroupID] = len(jobs)
+			jobs = append(jobs, tgJob{first: u.UpdateID, size: 1, msgs: []*tgMessage{m}})
+		default:
+			jobs = append(jobs, tgJob{first: u.UpdateID, msgs: []*tgMessage{m}})
+		}
+	}
+	return jobs
+}
+
+// ackAfter is the offset to save once jobs[:k+1] are done: everything below
+// the next job's first update, or the whole batch.
+func ackAfter(jobs []tgJob, k int, ups []tgUpdate) int64 {
+	if k+1 < len(jobs) {
+		return jobs[k+1].first - 1
+	}
+	return ups[len(ups)-1].UpdateID
 }
 
 func (b *TelegramBot) allowed(m *tgMessage) bool {
@@ -340,44 +412,54 @@ const tgHelp = "Fuel on Telegram, for when the app has no connection (a flight).
 	"Corrections work as in the app: \"no, it was 100 g\", \"remove the coffee\".\n\n" +
 	"Everything lands in the Fuel app too, marked via Telegram."
 
-// handle sends one message (or one album) to /fuel/log and replies.
-func (b *TelegramBot) handle(ctx context.Context, msgs []*tgMessage) {
+// handle sends one message (or one album) to /fuel/log and replies. It
+// returns false when the message should be tried again later (a network
+// failure, fueld busy); every other outcome has a reply and returns true.
+func (b *TelegramBot) handle(ctx context.Context, msgs []*tgMessage) bool {
 	first := msgs[0]
 	chat := first.Chat.ID
-	reply := func(text string) { b.send(ctx, chat, first.MessageID, text) }
+	reply := func(text string) bool { b.send(ctx, chat, first.MessageID, text); return true }
 	text := strings.TrimSpace(first.Text)
 	if text == "/start" || text == "/help" {
-		reply(tgHelp)
-		return
+		return reply(tgHelp)
 	}
 	at := time.Unix(first.Date, 0)
 	if b.o.Now().Sub(at) > 47*time.Hour {
-		reply("This message is older than 2 days. Nothing was logged. Send it again with the day, e.g. \"yesterday at 13:00 ...\".")
-		return
+		return reply("This message is older than 2 days. Nothing was logged. Send it again with the day, e.g. \"yesterday at 13:00 ...\".")
 	}
-	in := tgInput{clientID: fmt.Sprintf("tg-%d-%d", chat, first.MessageID), localTime: at.UTC().Format(time.RFC3339)}
+	in := tgInput{clientID: tgClientID(first), localTime: at.UTC().Format(time.RFC3339)}
 	for _, m := range msgs {
 		if t := strings.TrimSpace(m.Text + m.Caption); t != "" && in.text == "" {
 			in.text = t
 		}
 	}
+	// fetch downloads a file; a permanent failure replies, a transient one
+	// asks for a retry.
+	fetch := func(id string, size int64, what string) ([]byte, bool, bool) {
+		raw, err := b.download(ctx, id, size)
+		if err == nil {
+			return raw, true, true
+		}
+		log.Printf("fuel: telegram %s download: %v", what, err)
+		var te *tgError
+		if errors.As(err, &te) && te.code >= 400 && te.code < 500 && te.code != 429 || errors.Is(err, errTGTooBig) {
+			return nil, false, reply("I could not load the " + what + " (" + shortErr(err) + "). Nothing was logged.")
+		}
+		return nil, false, false
+	}
 	for _, m := range msgs {
 		switch {
 		case len(m.Photo) > 0:
 			p := m.Photo[len(m.Photo)-1] // the largest size
-			img, err := b.download(ctx, p.FileID, p.FileSize)
-			if err != nil {
-				log.Printf("fuel: telegram photo download: %v", err)
-				reply("I could not load the photo (" + shortErr(err) + "). Nothing was logged. Send it as text if the connection is slow.")
-				return
+			img, ok, done := fetch(p.FileID, p.FileSize, "photo")
+			if !ok {
+				return done
 			}
 			in.images = append(in.images, img)
 		case m.Document != nil && (m.Document.MimeType == "image/jpeg" || m.Document.MimeType == "image/png"):
-			img, err := b.download(ctx, m.Document.FileID, m.Document.FileSize)
-			if err != nil {
-				log.Printf("fuel: telegram image download: %v", err)
-				reply("I could not load the image (" + shortErr(err) + "). Nothing was logged.")
-				return
+			img, ok, done := fetch(m.Document.FileID, m.Document.FileSize, "image")
+			if !ok {
+				return done
 			}
 			in.images = append(in.images, img)
 		case m.Voice != nil || m.Audio != nil:
@@ -386,35 +468,52 @@ func (b *TelegramBot) handle(ctx context.Context, msgs []*tgMessage) {
 				f = m.Audio
 			}
 			if f.Duration > tgMaxVoiceSecs {
-				reply("Voice notes up to 2 minutes, please. Nothing was logged.")
-				return
+				return reply("Voice notes up to 2 minutes, please. Nothing was logged.")
 			}
-			raw, err := b.download(ctx, f.FileID, f.FileSize)
-			if err == nil {
-				in.audio, err = b.o.Convert(ctx, raw)
+			raw, ok, done := fetch(f.FileID, f.FileSize, "voice note")
+			if !ok {
+				return done
 			}
+			wav, err := b.o.Convert(ctx, raw)
 			if err != nil {
 				log.Printf("fuel: telegram voice: %v", err)
-				reply("I could not read the voice note (" + shortErr(err) + "). Nothing was logged. Send it as text.")
-				return
+				return reply("I could not read the voice note. Nothing was logged. Send it as text.")
 			}
+			in.audio = wav
 		}
 	}
 	if in.text == "" && in.audio == nil && len(in.images) == 0 {
-		reply("I can read text, voice notes and photos. Nothing was logged.")
-		return
+		return reply("I can read text, voice notes and photos. Nothing was logged.")
 	}
-	if len(in.text) > 16<<10 {
-		in.text = in.text[:16<<10]
+	if r := []rune(in.text); len(r) > maxTextChars {
+		in.text = string(r[:maxTextChars])
 	}
 	_ = b.call(ctx, "sendChatAction", map[string]any{"chat_id": chat, "action": "typing"}, nil)
 	code, body := b.post(ctx, in)
+	if code == http.StatusServiceUnavailable || code == http.StatusTooManyRequests || code == 0 {
+		return false
+	}
 	b.replies.Add(1)
 	go func() {
 		defer b.replies.Done()
 		b.finish(ctx, chat, first.MessageID, code, body)
 	}()
+	return true
 }
+
+// tgClientID is the idempotency key of a message: the album id for an album
+// (stable when Telegram re-delivers only part of it), else the message id.
+func tgClientID(m *tgMessage) string {
+	if g := m.MediaGroupID; tgGroupRe.MatchString(g) {
+		return fmt.Sprintf("tg-%d-g%s", m.Chat.ID, g)
+	}
+	return fmt.Sprintf("tg-%d-%d", m.Chat.ID, m.MessageID)
+}
+
+var (
+	errTGTooBig = errors.New("file over 20 MB")
+	tgGroupRe   = regexp.MustCompile(`^[0-9A-Za-z]{1,40}$`)
+)
 
 type tgInput struct {
 	clientID, localTime, text string
@@ -443,7 +542,7 @@ func (b *TelegramBot) post(ctx context.Context, in tgInput) (int, []byte) {
 	_ = mw.Close()
 	var code int
 	var body []byte
-	for attempt := 0; attempt < 6; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		req := httptest.NewRequest("POST", "/fuel/log", bytes.NewReader(buf.Bytes())).WithContext(WithVia(context.WithoutCancel(ctx), ViaTelegram))
 		req.RemoteAddr = "127.0.0.1:0"
 		req.Header.Set("Authorization", "Bearer "+b.o.AppToken)
@@ -460,7 +559,7 @@ func (b *TelegramBot) post(ctx context.Context, in tgInput) (int, []byte) {
 		}
 		select {
 		case <-ctx.Done():
-			return code, body
+			return 0, nil
 		case <-time.After(wait):
 		}
 	}
@@ -495,6 +594,8 @@ func (b *TelegramBot) finish(ctx context.Context, chat, msgID int64, code int, b
 		}
 		select {
 		case <-ctx.Done():
+			// fueld stops: the turn ends without an answer here.
+			b.send(ctx, chat, msgID, "Fuel restarted before the answer came. Check the app or ask again.")
 			return
 		case <-time.After(1500 * time.Millisecond):
 		}
@@ -613,8 +714,12 @@ func (b *TelegramBot) send(ctx context.Context, chat, replyTo int64, text string
 	if replyTo != 0 {
 		p["reply_parameters"] = map[string]any{"message_id": replyTo, "allow_sending_without_reply": true}
 	}
+	// At most about 40 s, also while fueld stops: a reply is worth a short
+	// wait, not a stuck shutdown.
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 40*time.Second)
+	defer cancel()
 	for attempt := 0; attempt < 3; attempt++ {
-		err := b.call(context.WithoutCancel(ctx), "sendMessage", p, nil)
+		err := b.call(sctx, "sendMessage", p, nil)
 		if err == nil {
 			return
 		}
@@ -625,18 +730,22 @@ func (b *TelegramBot) send(ctx context.Context, chat, replyTo int64, text string
 			if te.code == 400 || te.code == 403 {
 				return // not retryable
 			}
-			if te.retryAfter > 0 && te.retryAfter <= 60 {
+			if te.retryAfter > 0 && te.retryAfter <= 10 {
 				wait = time.Duration(te.retryAfter) * time.Second
 			}
 		}
-		time.Sleep(wait)
+		select {
+		case <-sctx.Done():
+			return
+		case <-time.After(wait):
+		}
 	}
 }
 
 // download fetches a file the bot received (at most 20 MB, the Bot API limit).
 func (b *TelegramBot) download(ctx context.Context, fileID string, size int64) ([]byte, error) {
 	if size > tgMaxFile {
-		return nil, errors.New("file over 20 MB")
+		return nil, errTGTooBig
 	}
 	var f struct {
 		FilePath string `json:"file_path"`
@@ -665,7 +774,7 @@ func (b *TelegramBot) download(ctx context.Context, fileID string, size int64) (
 		return nil, fmt.Errorf("download: %s", errClass(err))
 	}
 	if len(raw) > tgMaxFile {
-		return nil, errors.New("file over 20 MB")
+		return nil, errTGTooBig
 	}
 	return raw, nil
 }

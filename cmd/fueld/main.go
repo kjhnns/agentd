@@ -105,19 +105,21 @@ func main() {
 		}
 	}
 	log.Printf("fueld: shutting down")
-	// In-flight requests finish: upload deadline 30 s + slot wait 10 s +
-	// log budget 90 s. Detached Variables writes are then drained by Close, so
-	// their outcome is journaled before the stores close.
+	// The bot stops FIRST (no new message starts), then in-flight requests
+	// finish: upload deadline 30 s + slot wait 10 s + log budget 90 s. Both
+	// share one deadline under the unit's TimeoutStopSec (150 s). Detached
+	// Variables writes are then drained by Close, so their outcome is
+	// journaled before the stores close.
+	botCancel()
 	sctx, scancel := context.WithTimeout(context.Background(), 135*time.Second)
 	defer scancel()
 	if err := srv.Shutdown(sctx); err != nil {
 		log.Printf("fueld: shutdown: %v (closing remaining connections)", err)
 		_ = srv.Close()
 	}
-	botCancel()
 	select {
 	case <-botDone:
-	case <-time.After(150 * time.Second):
+	case <-sctx.Done():
 		log.Printf("fueld: telegram bot did not stop in time")
 	}
 	cancel()
@@ -135,6 +137,7 @@ func newBot(cfg fuel.DaemonConfig, svc *fuel.Service) (*fuel.TelegramBot, error)
 		AllowUser: user,
 		AppToken:  fuel.ResolveSecret(cfg.Token),
 		Handler:   svc.Handler(),
+		Ready:     svc.Ready,
 		StateDir:  cfg.StateDir,
 	}), nil
 }

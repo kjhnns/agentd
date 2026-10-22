@@ -486,6 +486,13 @@ func IsConfigError(err error) bool { return errors.Is(err, errConfig) }
 // Start hydrates the cache (35 days of Food log, the Body composition
 // history), resumes every non-terminal op and starts the background loops.
 // Resolve must have succeeded.
+// Ready reports that the routes serve (Start finished its startup).
+func (s *Service) Ready() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ready
+}
+
 func (s *Service) Start(ctx context.Context) {
 	// Register BEFORE any work, so Stop cancels and waits for startup too.
 	lctx, cancel := context.WithCancel(ctx)

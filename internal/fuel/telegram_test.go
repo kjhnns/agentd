@@ -296,7 +296,7 @@ func TestTelegramVoiceAndAlbum(t *testing.T) {
 	if !ok || v.Transcript == nil || *v.Transcript != "two eggs" {
 		t.Fatalf("voice entry: %+v (sent %q)", v, sent)
 	}
-	a, ok := entryByClient(h, fmt.Sprintf("tg-%d-12", tgJoe))
+	a, ok := entryByClient(h, fmt.Sprintf("tg-%d-gg1", tgJoe))
 	if !ok || len(a.PhotoIDs) != 2 || a.UserText != "lunch" {
 		t.Fatalf("album entry: %+v", a)
 	}
@@ -442,5 +442,87 @@ func TestTelegramOggToWAV(t *testing.T) {
 	}
 	if _, err := oggToWAV(context.Background(), filepath.Join(dir, "tmp"), []byte("not audio")); err == nil {
 		t.Fatal("garbage converted")
+	}
+}
+
+func (f *fakeTG) pollCount() int { f.mu.Lock(); defer f.mu.Unlock(); return f.polls }
+
+// An album whose second photo arrives after the first poll, with a message of
+// another user in between, is still ONE turn with two photos; the offset
+// moves past everything only after it.
+func TestTelegramAlbumAcrossPolls(t *testing.T) {
+	h, fa := newChat(t)
+	fa.script = logsItems(h, "Logged lunch.", food("lunch", 400, 600, 30, 5))
+	f := newFakeTG(t)
+	f.files["p1"] = testJPEG(64, 48)
+	f.files["p2"] = testJPEG(80, 60)
+	f.push(1, tgMsg(h, tgJoe, 21, map[string]any{"media_group_id": "77", "caption": "lunch", "photo": []any{map[string]any{"file_id": "p1"}}}))
+	startBot(t, h, f)
+	for deadline := time.Now().Add(5 * time.Second); f.pollCount() < 1 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	f.push(2, tgMsg(h, tgElse, 5, map[string]any{"text": "spam"}))
+	f.push(3, tgMsg(h, tgJoe, 22, map[string]any{"media_group_id": "77", "photo": []any{map[string]any{"file_id": "p2"}}}))
+	f.waitSent(t, 1)
+	e, ok := entryByClient(h, fmt.Sprintf("tg-%d-g77", tgJoe))
+	if !ok || len(e.PhotoIDs) != 2 {
+		t.Fatalf("album entry: %+v (found %v), entries %d", e, ok, len(chatEntries(h)))
+	}
+	if n := len(chatEntries(h)); n != 1 {
+		t.Fatalf("entries: %d", n)
+	}
+	time.Sleep(200 * time.Millisecond)
+	raw, _ := os.ReadFile(filepath.Join(h.opts.StateDir, "telegram-offset"))
+	if strings.TrimSpace(string(raw)) != "3" {
+		t.Fatalf("offset %q", raw)
+	}
+}
+
+// fueld busy (503) beyond the request's own retries: the message is NOT
+// acknowledged and is tried again; it is logged once.
+func TestTelegramBusyRetries(t *testing.T) {
+	h, fa := newChat(t)
+	fa.script = logsItems(h, "Logged a pear.", food("pear", 170, 100, 0.6, 0))
+	f := newFakeTG(t)
+	f.push(1, tgMsg(h, tgJoe, 31, map[string]any{"text": "a pear"}))
+	var mu sync.Mutex
+	busy := 4
+	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		b := busy > 0 && r.URL.Path == "/fuel/log"
+		if b {
+			busy--
+		}
+		mu.Unlock()
+		if b {
+			w.Header().Set("Retry-After", "1")
+			writeErr(w, errf(http.StatusServiceUnavailable, "busy", true, "busy"))
+			return
+		}
+		h.h.ServeHTTP(w, r)
+	})
+	startBot(t, h, f, func(o *TelegramOptions) { o.Handler = wrapped; o.RetryWait = 100 * time.Millisecond })
+	sent := f.waitSent(t, 1)
+	if !strings.HasPrefix(sent[0], "Logged a pear.") {
+		t.Fatalf("sent %q", sent)
+	}
+	if n := len(chatEntries(h)); n != 1 {
+		t.Fatalf("entries: %d", n)
+	}
+}
+
+func TestTelegramClientID(t *testing.T) {
+	m := &tgMessage{MessageID: 9}
+	m.Chat.ID = tgJoe
+	if got := tgClientID(m); got != "tg-7597951120-9" || !clientIDRe.MatchString(got) {
+		t.Fatal(got)
+	}
+	m.MediaGroupID = "13999999999999999"
+	if got := tgClientID(m); got != "tg-7597951120-g13999999999999999" || !clientIDRe.MatchString(got) {
+		t.Fatal(got)
+	}
+	m.MediaGroupID = "bad id/x"
+	if got := tgClientID(m); got != "tg-7597951120-9" {
+		t.Fatal(got)
 	}
 }
