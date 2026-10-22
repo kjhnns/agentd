@@ -415,6 +415,12 @@ func TestTelegramConfig(t *testing.T) {
 	if _, err := ParseDaemonConfig([]byte(base + "telegram_enabled = true\ntelegram_token = \"env:T\"\ntelegram_allow_user = \"1\"\n")); err == nil {
 		t.Fatal("the app token as the bot token accepted")
 	}
+	if _, err := ParseDaemonConfig([]byte(base + "telegram_enabled = true\ntelegram_token = \"env:B\"\ntelegram_allow_user = \"1\"\ntelegram_api = \"http://127.0.0.1:9\"\n")); err == nil {
+		t.Fatal("telegram_api accepted without test_mode")
+	}
+	if _, err := ParseDaemonConfig([]byte(base + "test_mode = true\ntelegram_enabled = true\ntelegram_token = \"env:B\"\ntelegram_allow_user = \"1\"\ntelegram_api = \"http://127.0.0.1:9\"\n")); err != nil {
+		t.Fatalf("telegram_api refused with test_mode: %v", err)
+	}
 	c, err := ParseDaemonConfig([]byte(base + "telegram_enabled = true\ntelegram_token = \"env:B\"\ntelegram_allow_user = \"7597951120\"\n"))
 	if err != nil || !c.TelegramEnabled || c.TelegramAllowUser != "7597951120" {
 		t.Fatalf("%+v %v", c, err)

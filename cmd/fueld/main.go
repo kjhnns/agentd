@@ -135,6 +135,7 @@ func newBot(cfg fuel.DaemonConfig, svc *fuel.Service) (*fuel.TelegramBot, error)
 	return fuel.NewTelegramBot(fuel.TelegramOptions{
 		Token:     tok,
 		AllowUser: user,
+		API:       strings.TrimRight(cfg.TelegramAPI, "/"),
 		AppToken:  fuel.ResolveSecret(cfg.Token),
 		Handler:   svc.Handler(),
 		Ready:     svc.Ready,

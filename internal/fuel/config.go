@@ -79,6 +79,7 @@ type DaemonConfig struct {
 	TelegramEnabled   bool
 	TelegramToken     string // literal or "env:VAR": the bot token
 	TelegramAllowUser string // the ONE Telegram user id served, digits
+	TelegramAPI       string // the Bot API base; another value only with test_mode (an e2e fake)
 }
 
 // DefaultConfigPath is where fueld looks without -config.
@@ -197,7 +198,7 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 			"chat_agent_workspace": &c.ChatAgentWorkspace, "chat_agent_model": &c.ChatAgentModel,
 			"chat_agent_timeout": &c.ChatAgentTimeout, "agent_op_token": &c.AgentOpToken,
 			"public_origin":  &c.PublicOrigin,
-			"telegram_token": &c.TelegramToken, "telegram_allow_user": &c.TelegramAllowUser,
+			"telegram_token": &c.TelegramToken, "telegram_allow_user": &c.TelegramAllowUser, "telegram_api": &c.TelegramAPI,
 		}[key]
 		if dst == nil {
 			return c, fmt.Errorf("line %d: unknown key %q", n, key)
@@ -246,6 +247,12 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 		}
 		if c.TelegramToken == c.Token {
 			return c, errors.New("telegram_token must not be the app token")
+		}
+		if c.TelegramAPI != "" && c.TelegramAPI != "https://api.telegram.org" {
+			u, err := url.Parse(c.TelegramAPI)
+			if !c.TestMode || err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				return c, errors.New("telegram_api is only for a test instance (test_mode) and must be an http(s) URL")
+			}
 		}
 	}
 	if c.ChatBackend != "estimator" && c.ChatBackend != "agent" {

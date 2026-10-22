@@ -45,3 +45,4 @@ recalibrate_min_interval = "30s"                     # between job starts
 # telegram_enabled    = true
 # telegram_token      = "env:FUEL_TELEGRAM_TOKEN"   # pass fueld/telegram-bot-token
 # telegram_allow_user = "7597951120"                # the ONE Telegram user id served
+# telegram_api        = "http://127.0.0.1:8799"      # test_mode only: a fake Bot API for an e2e run
