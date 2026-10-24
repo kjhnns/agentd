@@ -1005,9 +1005,9 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		}
 	}
 
-	// A session has the prompt once RunTurn owns it; the working glyph is set
-	// when the session is resolved. Every exit below flips it to the done or
-	// error glyph via the deferred final reaction.
+	// The working glyph is set when RunTurn owns the session (OnStart). Every
+	// exit below flips it to the done or error glyph via the deferred final
+	// reaction.
 	finalReaction := channel.ReactionError
 	reacted := false
 	var result string
@@ -1020,7 +1020,6 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		sessionID = id
 		if !reacted {
 			reacted = true
-			react(channel.ReactionWorking)
 			defer func() { react(finalReaction) }()
 		}
 		// One turn, owned and collected by RunTurn: the needs-input glyph is
@@ -1034,6 +1033,10 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 			Chat:        in.UserID,
 			Conv:        ConvMain,
 			Attachments: mediaAttachments(in),
+			// The working glyph goes up when the turn owns the session; a
+			// message queued behind another turn stays "queued" until then, so
+			// a restart re-enqueues it instead of calling it interrupted.
+			OnStart: func() { react(channel.ReactionWorking) },
 			Options: TurnOptions{
 				Timeout: m.Policy.turnTimeout(),
 				Ceiling: m.Policy.turnCeiling(),

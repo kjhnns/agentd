@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kjhnns/agentd/internal/channel"
 	"github.com/kjhnns/agentd/internal/eventbus"
 	"github.com/kjhnns/agentd/internal/harness"
 )
@@ -254,3 +255,56 @@ func waitFor(t *testing.T, cond func() bool) {
 }
 
 var _ = strings.Contains
+
+// ackChannel records the reactions per message id.
+type ackChannel struct {
+	recordingChannel
+	mu2  sync.Mutex
+	acks map[string][]string
+}
+
+func (c *ackChannel) Ack(chatID, msgID, reaction string) error {
+	c.mu2.Lock()
+	defer c.mu2.Unlock()
+	if c.acks == nil {
+		c.acks = map[string][]string{}
+	}
+	c.acks[msgID] = append(c.acks[msgID], reaction)
+	return nil
+}
+
+func (c *ackChannel) of(id string) []string {
+	c.mu2.Lock()
+	defer c.mu2.Unlock()
+	return append([]string(nil), c.acks[id]...)
+}
+
+// TestQueuedMessageIsNotMarkedWorking: a message waiting behind another
+// turn is not "working" until its turn owns the session. A restart then
+// re-enqueues it (D5) instead of calling it interrupted.
+func TestQueuedMessageIsNotMarkedWorking(t *testing.T) {
+	a := newEchoAdapter()
+	mgr := NewManager(a, eventbus.New(), nil)
+	mgr.Policy = Policy{TurnTimeout: 5 * time.Second}
+	chats := NewChatMap(LaneMain)
+	ch := &ackChannel{}
+	gate := a.gate("first")
+	done := make(chan error, 2)
+	go func() {
+		done <- mgr.RouteInbound(context.Background(), ch, channel.InboundMsg{Channel: "watch", UserID: "c", MsgID: "m1", Text: "first"}, chats, t.TempDir(), "")
+	}()
+	waitFor(t, func() bool { return a.sendsContaining("first") == 1 })
+	go func() {
+		done <- mgr.RouteInbound(context.Background(), ch, channel.InboundMsg{Channel: "watch", UserID: "c", MsgID: "m2", Text: "second"}, chats, t.TempDir(), "")
+	}()
+	time.Sleep(150 * time.Millisecond)
+	if got := ch.of("m2"); len(got) != 0 {
+		t.Fatalf("queued message got reactions %v before its turn started", got)
+	}
+	close(gate)
+	<-done
+	<-done
+	if got := ch.of("m2"); len(got) != 2 || got[0] != channel.ReactionWorking || got[1] != channel.ReactionDone {
+		t.Fatalf("m2 reactions = %v", got)
+	}
+}

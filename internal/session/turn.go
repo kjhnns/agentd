@@ -99,6 +99,10 @@ type TurnRequest struct {
 	Attachments []TurnAttachment
 	// Options bounds and observes the collection.
 	Options TurnOptions
+	// OnStart, when set, is called once the turn owns the session (after the
+	// queue wait), before the harness gets the text. RouteInbound sets the
+	// working glyph here, so a message that only waits stays "queued".
+	OnStart func()
 	// NoCollect returns as soon as the harness finished the send, without
 	// collecting a result (the legacy Send). The turn still owns the lock
 	// for the whole send.
@@ -151,6 +155,9 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 
 	if m.log != nil {
 		_ = m.log.Append("input", map[string]string{"session": id, "text": req.Text})
+	}
+	if req.OnStart != nil {
+		req.OnStart()
 	}
 
 	turnID := newID()
