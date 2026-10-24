@@ -397,6 +397,9 @@ func (d *resultDeduper) Apply(evs []eventbus.Event) []eventbus.Event {
 		case eventbus.KindOutput:
 			d.lastOutput = evs[i].Text
 		case eventbus.KindResult:
+			// The full text stays the authoritative answer even when the
+			// output it repeats is dropped on a full queue.
+			evs[i].Answer = evs[i].Text
 			if evs[i].Text != "" && evs[i].Text == d.lastOutput {
 				evs[i].Text = ""
 			}

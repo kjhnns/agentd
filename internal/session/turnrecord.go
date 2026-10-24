@@ -99,10 +99,11 @@ func (m *Manager) conversationEpoch(chat, conv string) uint64 {
 	return m.epochs.m[epochKey(chat, conv)]
 }
 
-// writeTurnRecord appends the turn record. Caller owns the session (RunTurn).
-func (m *Manager) writeTurnRecord(s *Session, req TurnRequest, res TurnResult, err error) {
+// writeTurnRecord appends the turn record and reports whether it is durable
+// (one retry). Caller owns the session (RunTurn).
+func (m *Manager) writeTurnRecord(s *Session, req TurnRequest, res TurnResult, err error) bool {
 	if m.log == nil {
-		return
+		return false
 	}
 	conv := req.Conv
 	if conv == "" && req.Chat != "" {
@@ -129,9 +130,15 @@ func (m *Manager) writeTurnRecord(s *Session, req TurnRequest, res TurnResult, e
 	if err != nil {
 		rec.Error = err.Error()
 	}
-	if aerr := m.log.Append("turn", rec); aerr != nil {
-		log.Printf("session %s: turn record not written: %v", s.ID, aerr)
+	aerr := m.log.Append("turn", rec)
+	if aerr != nil {
+		aerr = m.log.Append("turn", rec)
 	}
+	if aerr != nil {
+		log.Printf("session %s: turn record not written: %v", s.ID, aerr)
+		return false
+	}
+	return true
 }
 
 // FindTurn returns the newest committed turn record of an inbound message

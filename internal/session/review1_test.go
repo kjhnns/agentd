@@ -306,3 +306,28 @@ func TestRecapShowsAFailedTurnOnce(t *testing.T) {
 		t.Fatalf("recap:\n%s", got)
 	}
 }
+
+// noticeFailsDurable is a durable channel whose every Send fails.
+type noticeFailsDurable struct{ seqChannel }
+
+func (f *noticeFailsDurable) AckDurable(chatID, msgID, reaction string) error {
+	return f.Ack(chatID, msgID, reaction)
+}
+func (f *noticeFailsDurable) Send(ctx context.Context, m channel.OutboundMsg) (channel.SendReceipt, error) {
+	return channel.SendReceipt{}, errors.New("disk full")
+}
+
+// TestNoFailedWithoutItsNotice (review round 4): on a durable channel a
+// request is not marked failed when its notice could not be stored.
+func TestNoFailedWithoutItsNotice(t *testing.T) {
+	mgr := NewManager(&cancelAdapter{newEchoAdapter()}, eventbus.New(), nil)
+	mgr.Policy = Policy{TurnTimeout: time.Second}
+	ch := &noticeFailsDurable{}
+	in := channel.InboundMsg{Channel: "watch", UserID: "c", MsgID: "m", Text: "cancel"}
+	_ = mgr.RouteInbound(context.Background(), ch, in, NewChatMap(LaneMain), t.TempDir(), "")
+	for _, e := range ch.log {
+		if e == "ack:"+channel.ReactionError {
+			t.Fatalf("failed without a stored notice: %v", ch.log)
+		}
+	}
+}

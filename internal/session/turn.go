@@ -124,6 +124,9 @@ type TurnResult struct {
 	Text       string
 	TurnID     string
 	Generation uint64
+	// Committed is true when the turn record is durably in the run-log, so
+	// the restart recovery can deliver this answer.
+	Committed bool
 }
 
 // abortWait bounds how long an abandoned turn is awaited after the interrupt
@@ -279,7 +282,7 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 
 	res := TurnResult{Text: text, TurnID: turnID, Generation: gen}
 	if turnErr != nil {
-		m.afterTurn(s, req, res, turnErr)
+		m.afterTurn(s, req, &res, turnErr)
 		return res, turnErr
 	}
 
@@ -297,7 +300,7 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 	}
 
 	tripped, reason := m.evalTriggers(s)
-	m.afterTurn(s, req, res, nil)
+	m.afterTurn(s, req, &res, nil)
 	release()
 
 	if tripped {
@@ -315,8 +318,8 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 
 // afterTurn runs at the end of a turn, still under ownership: it writes the
 // turn record (D6).
-func (m *Manager) afterTurn(s *Session, req TurnRequest, res TurnResult, err error) {
-	m.writeTurnRecord(s, req, res, err)
+func (m *Manager) afterTurn(s *Session, req TurnRequest, res *TurnResult, err error) {
+	res.Committed = m.writeTurnRecord(s, req, *res, err)
 }
 
 // abortTurn ends an abandoned turn before anyone else may use the session:

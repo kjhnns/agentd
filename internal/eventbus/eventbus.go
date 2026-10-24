@@ -44,6 +44,10 @@ type Event struct {
 	// harness: the id of the turn that owned the session at that moment. A
 	// collector accepts only its own turn's events. Empty outside a turn.
 	TurnID string `json:"turn_id,omitempty"`
+	// Answer is the full text of a result event, kept by the adapter when it
+	// blanks Text for display (a result that repeats the last output). It is
+	// the authoritative answer of the turn; never serialized.
+	Answer string `json:"-"`
 }
 
 // Bus is an in-process pub/sub hub. Subscribers get a buffered channel; a slow

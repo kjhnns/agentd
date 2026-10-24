@@ -362,7 +362,10 @@ func (m *Manager) pump(s *Session, h harness.Handle, gen uint64) {
 				case eventbus.KindResult:
 					if !s.turnGot {
 						s.turnGot = true
-						s.turnRes = e.Text
+						s.turnRes = e.Answer
+						if s.turnRes == "" {
+							s.turnRes = e.Text
+						}
 						if s.turnRes == "" {
 							s.turnRes = s.turnOut
 						}
@@ -1024,12 +1027,19 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	finalReaction := channel.ReactionError
 	reacted := false
 	var react func(string)
+	_, durable := ch.(channel.DurableAcker)
 	defer func() {
 		if rerr != nil && !replied {
 			text := failureNotice(in, rerr)
 			nctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			if _, err := ch.Send(nctx, channel.OutboundMsg{ChatID: in.UserID, Text: text, InReplyTo: in.MsgID, Failure: true}); err != nil {
 				log.Printf("session: failure notice to %s/%s failed: %v", in.Channel, in.UserID, err)
+				if durable {
+					// No "failed" without its explanation on a channel that
+					// persists both: the request stays unfinished and the
+					// restart reconciliation settles it.
+					reacted = false
+				}
 			} else if m.log != nil {
 				_ = m.log.Append("outbound", map[string]string{
 					"session": sessionID, "chat": in.UserID, "text": text, "kind": "failure-notice", "rec": recTurn, "ref": ref,
@@ -1059,10 +1069,11 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	// exit below flips it to the done or error glyph via the deferred final
 	// reaction.
 	var result string
+	committed := false
 	for attempt := 0; ; attempt++ {
 		id, err := m.sessionForChat(ctx, chats, in.UserID, cwd, model)
 		if err != nil {
-			react(channel.ReactionError)
+			reacted = true // the deferred handler sends the notice, then the error glyph
 			return err
 		}
 		sessionID = id
@@ -1112,6 +1123,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 			return err
 		}
 		result = res.Text
+		committed = res.Committed
 		break
 	}
 	err := m.deliverReply(ctx, ch, in, sessionID, ref, result, false, &replied)
@@ -1130,11 +1142,14 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 					break
 				}
 			}
-			if err != nil {
+			if err != nil && committed {
 				log.Printf("session: delivery to %s/%s failed after retries; left unfinished for the restart recovery: %v", in.Channel, in.MsgID, err)
 				reacted = false // no final glyph: the request stays working
 				replied = true  // no failure notice: the answer exists
 				return err
+			}
+			if err != nil {
+				return err // not recoverable: no committed turn record
 			}
 		} else {
 			return err

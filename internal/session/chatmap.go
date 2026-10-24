@@ -3,6 +3,8 @@ package session
 import (
 	"context"
 	"sync"
+
+	"github.com/kjhnns/agentd/internal/channel"
 )
 
 // Lane classifies a session for the per-workspace interactive lock and for
@@ -79,4 +81,24 @@ func (m *Manager) sessionForChat(ctx context.Context, chats *ChatMap, chat, cwd,
 	}
 	chats.m[chat] = s.ID
 	return s.ID, nil
+}
+
+// DispatchInOrder runs handle for each inbound message on its own goroutine,
+// but a message's handle starts only after the previous message's handle
+// returned. The wrist uses it: its messages share one session and are
+// serial anyway, and a restart re-enqueues queued requests in order, so a
+// follow-up never runs before the request it refers to. It returns when in
+// is closed.
+func DispatchInOrder(in <-chan channel.InboundMsg, handle func(channel.InboundMsg)) {
+	prev := make(chan struct{})
+	close(prev)
+	for msg := range in {
+		done := make(chan struct{})
+		go func(msg channel.InboundMsg, prev <-chan struct{}, done chan<- struct{}) {
+			defer close(done)
+			<-prev
+			handle(msg)
+		}(msg, prev, done)
+		prev = done
+	}
 }

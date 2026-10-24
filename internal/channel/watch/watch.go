@@ -236,8 +236,8 @@ func (a *Adapter) Notify(n notify.Notification) error {
 	if n.Source != "" {
 		text = n.Source + ": " + text
 	}
-	a.store.Append(Message{Role: RoleSystem, Kind: KindNotice, Text: text, TS: n.Ts})
-	return nil
+	_, err := a.store.AppendDurable(Message{Role: RoleSystem, Kind: KindNotice, Text: text, TS: n.Ts})
+	return err
 }
 
 func (a *Adapter) echo(text string, silent bool) {

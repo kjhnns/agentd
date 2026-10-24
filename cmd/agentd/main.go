@@ -805,15 +805,14 @@ func serve(args []string) {
 		hub.Register(wch)
 		log.Printf("agentd: watch channel started (routes /watch/*, shared_session=%v, mirror=%v)", shared, c.Mirror)
 
+		// In order: the wrist's messages share one session, and the restart
+		// reconciliation re-enqueues queued requests in their order.
 		go func(ch *watch.Adapter, m *session.ChatMap) {
-			for in := range ch.Inbound() {
-				in := in
-				go func() {
-					if err := mgr.RouteInbound(ctx, ch, in, m, cwd, model); err != nil {
-						log.Printf("agentd: watch route inbound error: %v", err)
-					}
-				}()
-			}
+			session.DispatchInOrder(ch.Inbound(), func(in channel.InboundMsg) {
+				if err := mgr.RouteInbound(ctx, ch, in, m, cwd, model); err != nil {
+					log.Printf("agentd: watch route inbound error: %v", err)
+				}
+			})
 		}(wch, sessMap)
 
 		// Restart reconciliation (D5): every request the last run left

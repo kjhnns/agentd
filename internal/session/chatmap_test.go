@@ -58,3 +58,27 @@ func emitOnHandle(s *Session, e eventbus.Event) {
 	s.mu.Unlock()
 	h.events <- e
 }
+
+// TestDispatchInOrder (review round 4): messages are handled strictly in
+// their queue order even though each runs on its own goroutine.
+func TestDispatchInOrder(t *testing.T) {
+	in := make(chan channel.InboundMsg, 50)
+	for i := 0; i < 50; i++ {
+		in <- channel.InboundMsg{MsgID: string(rune('A' + i%26)), TS: int64(i)}
+	}
+	close(in)
+	var mu sync.Mutex
+	var got []int64
+	DispatchInOrder(in, func(m channel.InboundMsg) {
+		time.Sleep(time.Duration(50-m.TS) * 100 * time.Microsecond)
+		mu.Lock()
+		got = append(got, m.TS)
+		mu.Unlock()
+	})
+	waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(got) == 50 })
+	for i, v := range got {
+		if v != int64(i) {
+			t.Fatalf("order = %v", got)
+		}
+	}
+}

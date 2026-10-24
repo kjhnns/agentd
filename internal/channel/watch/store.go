@@ -392,10 +392,15 @@ func (s *Store) Append(m Message) Message {
 	return s.appendLocked(m)
 }
 
+// appendLocked appends durably. On a write error nothing is applied (no
+// memory-only snapshot, no seq a client could see and a restart would hand
+// out again); the error is logged and the returned message has no seq.
 func (s *Store) appendLocked(m Message) Message {
-	out, err := s.appendDurable(m, false)
+	out, err := s.appendDurable(m, true)
 	if err != nil {
 		log.Printf("watch store: append %s: %v", m.ID, err)
+		m.Seq = 0
+		return m
 	}
 	return out
 }
