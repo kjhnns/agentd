@@ -184,7 +184,7 @@ func routeWithReply(t *testing.T, budget int, reply string) ([]channel.OutboundM
 
 	ch := &recordingChannel{}
 	in := channel.InboundMsg{Channel: "watch", UserID: "chat1", MsgID: "m1", Text: "how is the trip looking"}
-	if err := mgr.RouteInbound(context.Background(), ch, in, map[string]string{"chat1": sess.ID}, t.TempDir(), ""); err != nil {
+	if err := mgr.RouteInbound(context.Background(), ch, in, chatMapWith("chat1", sess.ID), t.TempDir(), ""); err != nil {
 		t.Fatalf("RouteInbound: %v", err)
 	}
 	return ch.messages(), fa.sentTexts()
@@ -346,7 +346,7 @@ func routeOn(t *testing.T, source string, budget int, reply string) []channel.Ou
 	fa.mu.Unlock()
 	ch := &recordingChannel{}
 	in := channel.InboundMsg{Channel: source, UserID: "chat1", MsgID: "m1", Text: "q"}
-	if err := mgr.RouteInbound(context.Background(), ch, in, map[string]string{"chat1": sess.ID}, t.TempDir(), ""); err != nil {
+	if err := mgr.RouteInbound(context.Background(), ch, in, chatMapWith("chat1", sess.ID), t.TempDir(), ""); err != nil {
 		t.Fatalf("RouteInbound: %v", err)
 	}
 	return ch.messages()

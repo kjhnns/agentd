@@ -360,7 +360,7 @@ func runTurn(t *testing.T, a *Adapter, ha harness.Adapter, u tgUpdate) {
 		t.Fatal("no inbound message emitted")
 	}
 	done := make(chan error, 1)
-	go func() { done <- mgr.RouteInbound(ctx, a, in, map[string]string{}, "", "") }()
+	go func() { done <- mgr.RouteInbound(ctx, a, in, session.NewChatMap(session.LaneMain), "", "") }()
 	select {
 	case err := <-done:
 		if err != nil {

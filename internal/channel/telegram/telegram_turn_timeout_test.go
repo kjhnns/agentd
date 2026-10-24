@@ -54,7 +54,7 @@ func routeWithPolicy(t *testing.T, a *Adapter, ha harness.Adapter, p session.Pol
 	t.Cleanup(cancel)
 
 	done := make(chan error, 1)
-	go func() { done <- mgr.RouteInbound(ctx, a, in, map[string]string{}, "", "") }()
+	go func() { done <- mgr.RouteInbound(ctx, a, in, session.NewChatMap(session.LaneMain), "", "") }()
 	select {
 	case err := <-done:
 		return err

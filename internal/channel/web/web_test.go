@@ -97,7 +97,7 @@ func newStackWith(t *testing.T, ha harness.Adapter) (*httptest.Server, *web.Adap
 	t.Cleanup(ts.Close)
 
 	// Inbound loop: exactly what cmd/agentd/main.go wires for the web channel.
-	sessionForWeb := map[string]string{}
+	sessionForWeb := session.NewChatMap(session.LaneMain)
 	go func() {
 		for in := range webCh.Inbound() {
 			in := in

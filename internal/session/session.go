@@ -34,6 +34,7 @@ type Session struct {
 	Harness   string          `json:"harness"`
 	Title     string          `json:"title"`
 	Workspace string          `json:"workspace,omitempty"` // workspace name homing this session
+	Lane      Lane            `json:"lane"`                // main | side | other (see Lane)
 	Created   time.Time       `json:"created"`
 	handle    harness.Handle  `json:"-"`
 	adapter   harness.Adapter `json:"-"`
@@ -234,6 +235,15 @@ func newID() string {
 // injection (instructions + memory index + handoff). The cwd argument is only
 // honored when no workspace store is configured (legacy/bare mode).
 func (m *Manager) Create(ctx context.Context, workspaceName, cwd, model, title string) (*Session, error) {
+	return m.CreateInLane(ctx, LaneOther, workspaceName, cwd, model, title)
+}
+
+// CreateInLane is Create with an explicit lane. Channel sessions are LaneMain
+// (see ChatMap); the scheduler and the API create LaneOther sessions.
+func (m *Manager) CreateInLane(ctx context.Context, lane Lane, workspaceName, cwd, model, title string) (*Session, error) {
+	if lane == "" {
+		lane = LaneOther
+	}
 	id := newID()
 	// An empty model means "no preference", not "no model". The channels pass
 	// the configured one explicitly, but POST /sessions (so `agentd run`, and
@@ -280,6 +290,7 @@ func (m *Manager) Create(ctx context.Context, workspaceName, cwd, model, title s
 		ID:           id,
 		Harness:      m.adapter.Name(),
 		Title:        title,
+		Lane:         lane,
 		Created:      now,
 		handle:       h,
 		adapter:      m.adapter,
@@ -1112,7 +1123,7 @@ func timeoutDetail(err error) string {
 // RouteInbound wires a channel inbound message to a session and sends the harness
 // result back through the channel. It reuses one session per chat id (created on
 // first message). This is the end-to-end path.
-func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, sessionForChat map[string]string, cwd, model string) (rerr error) {
+func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, chats *ChatMap, cwd, model string) (rerr error) {
 	if m.log != nil {
 		_ = m.log.Append("inbound", in)
 	}
@@ -1155,23 +1166,10 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		}
 	}
 
-	id, ok := sessionForChat[in.UserID]
-	if ok {
-		// A session the idle-GC reclaimed (process freed) no longer exists; the
-		// next inbound lazily re-hydrates a FRESH one from the workspace
-		// artifacts (context.md + memory), which is exactly the reclaim contract.
-		if _, alive := m.Get(id); !alive {
-			ok = false
-		}
-	}
-	if !ok {
-		s, err := m.Create(ctx, "", cwd, model, "telegram:"+in.UserID)
-		if err != nil {
-			react(channel.ReactionError)
-			return err
-		}
-		id = s.ID
-		sessionForChat[in.UserID] = id
+	id, err := m.sessionForChat(ctx, chats, in.UserID, cwd, model)
+	if err != nil {
+		react(channel.ReactionError)
+		return err
 	}
 	sessionID = id
 

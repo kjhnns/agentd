@@ -619,8 +619,8 @@ func serve(args []string) {
 	// that can also deliver notifications register as notify-hub sinks.
 	var tg *telegram.Adapter
 	var tgAllow []string
-	sessionForChat := map[string]string{} // Telegram chat id -> session (shared with the watch when share_session)
-	var watchCfgs []config.Channel        // wired AFTER the loop: the watch may piggyback on Telegram
+	sessionForChat := session.NewChatMap(session.LaneMain) // Telegram chat id -> session (shared with the watch when share_session)
+	var watchCfgs []config.Channel                         // wired AFTER the loop: the watch may piggyback on Telegram
 	for _, c := range cfg.Channel {
 		if !c.Enabled {
 			log.Printf("agentd: channel %q disabled (enabled=false); skipped", c.Kind)
@@ -706,7 +706,7 @@ func serve(args []string) {
 			log.Printf("agentd: whatsapp channel started (allow=%v, groups=%v, readonly=%v, dm=%s, group=%s, reactions=%v, receipts=%v, sync=%v)",
 				c.Allow, c.AllowGroups, c.ReadonlyGroups, pdm, pgrp, c.Reactions, c.ReadReceipts, c.Sync)
 
-			sessionForWA := map[string]string{}
+			sessionForWA := session.NewChatMap(session.LaneMain)
 			go func(ch *whatsapp.Adapter) {
 				for in := range ch.Inbound() {
 					in := in
@@ -735,7 +735,7 @@ func serve(args []string) {
 
 			// Inbound: a message typed in the UI routes through the SAME
 			// RouteInbound path as any channel (one warm web session).
-			sessionForWeb := map[string]string{}
+			sessionForWeb := session.NewChatMap(session.LaneMain)
 			go func(ch *web.Adapter) {
 				for in := range ch.Inbound() {
 					in := in
@@ -776,7 +776,7 @@ func serve(args []string) {
 		if mediaSvc != nil {
 			wch.WithMedia(mediaSvc)
 		}
-		sessMap := map[string]string{}
+		sessMap := session.NewChatMap(session.LaneMain)
 		shared := false
 		if c.ShareSession {
 			if tg != nil && len(tgAllow) > 0 {
@@ -805,7 +805,7 @@ func serve(args []string) {
 		hub.Register(wch)
 		log.Printf("agentd: watch channel started (routes /watch/*, shared_session=%v, mirror=%v)", shared, c.Mirror)
 
-		go func(ch *watch.Adapter, m map[string]string) {
+		go func(ch *watch.Adapter, m *session.ChatMap) {
 			for in := range ch.Inbound() {
 				in := in
 				go func() {
