@@ -146,8 +146,15 @@ func (s *Store) archiveLocked(m Message) error {
 	if !ValidConvID(conv) {
 		return fmt.Errorf("conversation id %q cannot name an archive file", conv)
 	}
-	if err := os.MkdirAll(s.archiveDir, 0o700); err != nil {
-		return err
+	if _, err := os.Stat(s.archiveDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(s.archiveDir, 0o700); err != nil {
+			return err
+		}
+		// The new directory entry must be durable before anything in it
+		// counts as archived.
+		if err := syncDir(filepath.Dir(s.archiveDir)); err != nil {
+			return err
+		}
 	}
 	path := filepath.Join(s.archiveDir, conv+".jsonl")
 	_, statErr := os.Stat(path)
@@ -178,14 +185,25 @@ func (s *Store) archiveLocked(m Message) error {
 		return err
 	}
 	if os.IsNotExist(statErr) {
-		if d, err := os.Open(s.archiveDir); err == nil {
-			_ = d.Sync()
-			d.Close()
+		// A new archive file: its directory entry must be durable before
+		// the eviction (and a later compaction) drops the live snapshot.
+		if err := syncDir(s.archiveDir); err != nil {
+			return err
 		}
 	}
 	s.archived[m.ID] = m.Seq
 	s.archivedConv[m.ID] = conv
 	return nil
+}
+
+// syncDir fsyncs a directory (its entries become durable).
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // readArchive returns the archived snapshots of one conversation.
@@ -358,8 +376,11 @@ func (s *Store) ensureConvLocked(id, firstText string) error {
 		f := false
 		rec = Message{ID: convRecordID(id), Role: RoleSystem, Kind: KindConv, Conv: id, Archived: &f}
 	}
+	// The default title comes from the first user message ADMITTED: a
+	// record left behind by an admission whose message write failed is
+	// renamed by the next first message.
 	title := rec.Title
-	if !rec.TitleSet && rec.Title == "" {
+	if !rec.TitleSet && !s.hasUserMessageLocked(id) {
 		title = cleanTitle(firstText, defaultTitleRunes)
 	}
 	if ok && title == rec.Title {
@@ -368,6 +389,24 @@ func (s *Store) ensureConvLocked(id, firstText string) error {
 	rec.Title = title
 	_, err := s.appendDurable(rec, true)
 	return err
+}
+
+// hasUserMessageLocked reports whether a conversation holds a user message
+// (live, or evicted into the archive).
+func (s *Store) hasUserMessageLocked(id string) bool {
+	for _, oid := range s.order {
+		if m := s.latest[oid]; m.Role == RoleUser && convOf(m) == id {
+			return true
+		}
+	}
+	for mid, c := range s.archivedConv {
+		if c == id {
+			if _, live := s.latest[mid]; !live {
+				return true // archived messages of a side conversation imply a first message
+			}
+		}
+	}
+	return false
 }
 
 // ---- listing ----

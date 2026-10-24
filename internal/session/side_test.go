@@ -265,3 +265,22 @@ func TestMainTurnsNeverStartAConversation(t *testing.T) {
 		t.Fatalf("process starts = %d", n)
 	}
 }
+
+// TestFreshStartArtifactSurvivesACrashBeforeTheTurnRecord: the artifact of
+// a fresh start is durable with the epoch, so the recap of a process started
+// before any turn record of the epoch exists still points at it.
+func TestFreshStartArtifactSurvivesACrashBeforeTheTurnRecord(t *testing.T) {
+	path := writeThread(t, []func(*runlog.Log){
+		func(l *runlog.Log) {
+			_ = l.Append("conversation_start", conversationStart{Chat: sideChat, Conv: "c", Epoch: 4,
+				Attachments: []TurnAttachment{{Kind: "conv", ID: "c", Path: "/state/watch-artifacts/c-9.jsonl", Name: "Old"}}})
+		},
+	})
+	got, err := ThreadRecap(path, "telegram:"+sideChat, RecapPolicy{}, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "/state/watch-artifacts/c-9.jsonl") {
+		t.Fatalf("recap = %q", got)
+	}
+}

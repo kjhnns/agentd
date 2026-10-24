@@ -55,6 +55,10 @@ type conversationStart struct {
 	Chat  string `json:"chat"`
 	Conv  string `json:"conv"`
 	Epoch uint64 `json:"epoch"`
+	// Attachments are the artifacts the fresh start attached (the
+	// conversation's own transcript). They are durable with the epoch, so a
+	// crash before the first turn record still lets the recap point at them.
+	Attachments []TurnAttachment `json:"attachments,omitempty"`
 }
 
 // epochs is the persisted conversation epoch and active conversation per
@@ -115,11 +119,11 @@ func (m *Manager) activeConversation(chat string) string {
 // startConversation persists a conversation_start {chat, conv, epoch+1} and
 // makes conv the chat's active conversation. Nothing changes when the record
 // cannot be written. Caller owns the chat's session (RunTurn).
-func (m *Manager) startConversation(chat, conv string) (uint64, error) {
+func (m *Manager) startConversation(chat, conv string, atts []TurnAttachment) (uint64, error) {
 	m.loadEpochs()
 	m.epochs.mu.Lock()
 	defer m.epochs.mu.Unlock()
-	cs := conversationStart{Chat: chat, Conv: conv, Epoch: m.epochs.m[chat].Epoch + 1}
+	cs := conversationStart{Chat: chat, Conv: conv, Epoch: m.epochs.m[chat].Epoch + 1, Attachments: atts}
 	if m.log != nil {
 		if err := m.log.Append("conversation_start", cs); err != nil {
 			return 0, err

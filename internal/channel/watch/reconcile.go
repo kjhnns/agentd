@@ -73,7 +73,7 @@ func (a *Adapter) Reconcile(ctx context.Context,
 			if p := strings.TrimSpace(t.Result); p != "" {
 				text += "\n\nHere is what I had so far:\n" + p
 			}
-			if _, err := a.store.AppendDurable(Message{Role: RoleAgent, Kind: KindFailure, Text: text, ReplyTo: m.ID}); err != nil {
+			if _, err := a.store.AppendDurable(Message{Role: RoleAgent, Kind: KindFailure, Text: text, ReplyTo: m.ID, Conv: m.Conv}); err != nil {
 				log.Printf("watch: reconcile %s: failure notice not stored: %v", m.ID, err)
 				continue
 			}
@@ -87,7 +87,7 @@ func (a *Adapter) Reconcile(ctx context.Context,
 			}
 		}
 		if !a.hasFailure(m.ID) {
-			if _, err := a.store.AppendDurable(Message{Role: RoleAgent, Kind: KindFailure, Text: InterruptedNotice, ReplyTo: m.ID}); err != nil {
+			if _, err := a.store.AppendDurable(Message{Role: RoleAgent, Kind: KindFailure, Text: InterruptedNotice, ReplyTo: m.ID, Conv: m.Conv}); err != nil {
 				log.Printf("watch: reconcile %s: failure notice not stored: %v", m.ID, err)
 				continue
 			}

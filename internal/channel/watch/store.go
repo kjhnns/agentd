@@ -88,6 +88,10 @@ func (m Message) Public() Message {
 	m.Inbound = nil
 	m.Evicted = false
 	m.TitleSet = false
+	if m.Kind == KindConv && m.Title == "" {
+		// The contract: a conv record always carries its display title.
+		m.Title = DefaultConvTitle
+	}
 	if len(m.Attachments) > 0 {
 		atts := make([]Attachment, len(m.Attachments))
 		for i, a := range m.Attachments {

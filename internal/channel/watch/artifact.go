@@ -104,32 +104,24 @@ func (a *Adapter) ExportConv(conv, excludeMsgID string) (channel.ConvArtifact, b
 	if err != nil {
 		return channel.ConvArtifact{}, false, err
 	}
-	var lines [][]byte
-	var stamps []time.Time
+	var kept []artifactLine
 	for _, m := range msgs {
 		if m.ID == excludeMsgID || inFlight(m) || strings.TrimSpace(m.Text) == "" {
 			continue
 		}
-		b, err := json.Marshal(artifactLine{Role: m.Role, TS: m.TS, Text: m.Text})
-		if err != nil {
-			return channel.ConvArtifact{}, false, err
-		}
-		lines = append(lines, b)
-		stamps = append(stamps, m.TS)
+		kept = append(kept, artifactLine{Role: m.Role, TS: m.TS, Text: m.Text})
 	}
-	if len(lines) == 0 {
+	if len(kept) == 0 {
 		return channel.ConvArtifact{}, false, nil
 	}
-	// Size guard: keep the newest part.
-	cut, size := 0, 0
-	for _, l := range lines {
-		size += len(l) + 1
+	lines, cut, shortened, err := fitArtifact(kept, maxArtifactBytes-artifactHeaderReserve)
+	if err != nil {
+		return channel.ConvArtifact{}, false, err
 	}
-	for size > maxArtifactBytes && cut < len(lines)-1 {
-		size -= len(lines[cut]) + 1
-		cut++
+	stamps := make([]time.Time, 0, len(lines))
+	for _, l := range kept[cut:] {
+		stamps = append(stamps, l.TS)
 	}
-	lines, stamps = lines[cut:], stamps[cut:]
 
 	title := a.store.ConvTitle(conv)
 	now := a.now()
@@ -137,6 +129,9 @@ func (a *Adapter) ExportConv(conv, excludeMsgID string) (channel.ConvArtifact, b
 		quote(title), now.Format("2006-01-02 15:04Z"))
 	if cut > 0 {
 		note += fmt.Sprintf(" The oldest %d message(s) were cut to fit %d KB; this file holds the newest %d.", cut, maxArtifactBytes>>10, len(lines))
+	}
+	if shortened {
+		note += " The newest message alone was over the limit and is cut short."
 	}
 	from, to := stamps[0], stamps[len(stamps)-1]
 	head, err := json.Marshal(artifactHeader{Note: note, Conv: conv, Messages: len(lines), From: from, To: to, Cut: cut})
@@ -172,6 +167,50 @@ func (a *Adapter) ExportConv(conv, excludeMsgID string) (channel.ConvArtifact, b
 	pointer := fmt.Sprintf("Attached earlier conversation %s (%d messages, %s-%s): %s. Read it when the request needs it.",
 		quote(title), len(lines), from.UTC().Format("2006-01-02 15:04Z"), to.UTC().Format("2006-01-02 15:04Z"), path)
 	return channel.ConvArtifact{Conv: conv, Title: title, Path: path, Messages: len(lines), Pointer: pointer}, true, nil
+}
+
+// artifactHeaderReserve is the room kept for the header line (a title is at
+// most maxTitleRunes, JSON-escaped).
+const artifactHeaderReserve = 4 << 10
+
+// fitArtifact encodes the lines and keeps the newest that fit budget bytes
+// (newline included). When even the newest alone does not fit, its text is
+// cut short with a marker. It returns the encoded lines, how many of the
+// oldest were cut, and whether the newest was shortened.
+func fitArtifact(msgs []artifactLine, budget int) ([][]byte, int, bool, error) {
+	enc := make([][]byte, len(msgs))
+	size := 0
+	for i, m := range msgs {
+		b, err := json.Marshal(m)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		enc[i] = b
+		size += len(b) + 1
+	}
+	cut := 0
+	for size > budget && cut < len(enc)-1 {
+		size -= len(enc[cut]) + 1
+		cut++
+	}
+	enc = enc[cut:]
+	if size <= budget {
+		return enc, cut, false, nil
+	}
+	last := msgs[len(msgs)-1]
+	r := []rune(last.Text)
+	for {
+		r = r[:len(r)*9/10]
+		last.Text = string(r) + "\n[... cut short by agentd: over the artifact size limit]"
+		b, err := json.Marshal(last)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		if len(b)+1 <= budget || len(r) == 0 {
+			enc[len(enc)-1] = b
+			return enc, cut, true, nil
+		}
+	}
 }
 
 // quote JSON-escapes a title for a pointer or header line.

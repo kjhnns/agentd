@@ -358,7 +358,7 @@ func (m *Manager) maybeStartConversation(ctx context.Context, s *Session, req *T
 	if err := m.replaceProcess(ctx, s, "fresh conversation", false); err != nil {
 		return err
 	}
-	epoch, err := m.startConversation(req.Chat, conv)
+	epoch, err := m.startConversation(req.Chat, conv, atts)
 	if err != nil {
 		// The process is fresh but the epoch did not move: replace it again
 		// with the recap of the epoch that is still current, so the window

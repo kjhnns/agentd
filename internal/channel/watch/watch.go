@@ -885,7 +885,7 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 		// A concurrent repeat was admitted first: this copy's files belong to
 		// no turn.
 		removeImages(arts)
-		writeJSON(w, http.StatusAccepted, map[string]any{"message": receipt(stored, convParam), "pending": a.store.Pending(), "duplicate": true})
+		writeJSON(w, http.StatusAccepted, map[string]any{"message": receipt(stored, convParam), "pending": a.receiptPending(convParam), "duplicate": true})
 		return
 	case outcome == Rejected:
 		// The photos of a message that starts no turn would stay on disk
@@ -897,7 +897,7 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 	if convOf(stored) == ConvMain {
 		a.echo("⌚ You: "+stored.Text, false) // side conversations never mirror
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"message": receipt(stored, convParam), "pending": a.store.Pending()})
+	writeJSON(w, http.StatusAccepted, map[string]any{"message": receipt(stored, convParam), "pending": a.receiptPending(convParam)})
 }
 
 // receipt is the stored user message as the 202 answer: it carries conv
@@ -908,6 +908,16 @@ func receipt(m Message, convParam string) Message {
 		p.Conv = convOf(m)
 	}
 	return p
+}
+
+// receiptPending is the pending count of a receipt: main only for a client
+// that names no conversation (as its reads and the ping), every
+// conversation for a new one.
+func (a *Adapter) receiptPending(convParam string) int {
+	if convParam == "" {
+		return a.store.PendingF(MainOnly)
+	}
+	return a.store.Pending()
 }
 
 // checkConvFields validates conv and context_conv of a POST. It returns the
@@ -958,7 +968,7 @@ func (a *Adapter) answerDuplicate(w http.ResponseWriter, requestID, convParam st
 	if !ok || prev.Status == StatusRejected {
 		return false
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"message": receipt(prev, convParam), "pending": a.store.Pending(), "duplicate": true})
+	writeJSON(w, http.StatusAccepted, map[string]any{"message": receipt(prev, convParam), "pending": a.receiptPending(convParam), "duplicate": true})
 	return true
 }
 

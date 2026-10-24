@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"path/filepath"
@@ -332,4 +333,68 @@ func TestRestartReconciliationKeepsTheConversation(t *testing.T) {
 	if last := fr.Messages[len(fr.Messages)-1]; last.Text != "side answer" || last.Conv != "b" {
 		t.Fatalf("the stored answer is not in the side thread: %+v", last)
 	}
+}
+
+// TestReviewRound1Fixes covers the Codex round-1 findings of R4.
+func TestReviewRound1Fixes(t *testing.T) {
+	t.Run("restart notice stays in its conversation", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "watch.jsonl")
+		st, _ := OpenStore(path)
+		a := New("wt", st)
+		_, w, _ := postJSON(t, a, `{"text":"lost side","conv":"b","request_id":"w"}`)
+		_ = a.Ack("", w.ID, channel.ReactionWorking)
+		st.Close()
+		st2, _ := OpenStore(path)
+		defer st2.Close()
+		b := New("wt", st2)
+		b.Reconcile(context.Background(),
+			func(string, string) (CommittedTurn, bool) { return CommittedTurn{}, false },
+			func(context.Context, channel.InboundMsg, string, string, bool) error { return nil })
+		if main, _, _ := st2.TailF(MainOnly, 50); len(main) != 0 {
+			t.Fatalf("the notice went to main: %+v", main)
+		}
+		fr := fetch(t, b.Handler(), "?conv=b")
+		if last := fr.Messages[len(fr.Messages)-1]; last.Kind != KindFailure || last.Text != InterruptedNotice {
+			t.Fatalf("side thread ends with %+v", last)
+		}
+	})
+	t.Run("receipt pending is main only for an old client", func(t *testing.T) {
+		a, _ := newAdapter(t)
+		postJSON(t, a, `{"text":"side","conv":"b"}`)
+		rec := do(t, a.Handler(), http.MethodPost, "/watch/messages", "wt", bytes.NewBufferString(`{"text":"main"}`), "application/json")
+		if !strings.Contains(rec.Body.String(), `"pending":1}`) {
+			t.Fatalf("receipt = %s", rec.Body.String())
+		}
+	})
+	t.Run("a conv record always carries its title", func(t *testing.T) {
+		a, _ := newAdapter(t)
+		do(t, a.Handler(), http.MethodPut, "/watch/conversations/e1", "wt", bytes.NewBufferString(`{}`), "application/json")
+		fr := fetch(t, a.Handler(), "?scope=all")
+		if len(fr.Messages) != 1 || fr.Messages[0].Title != DefaultConvTitle {
+			t.Fatalf("record = %+v", fr.Messages)
+		}
+		postJSON(t, a, `{"text":"the real first message","conv":"e1"}`)
+		if info, _ := a.store.ConvInfo("e1"); info.Title != "the real first message" {
+			t.Fatalf("title = %q", info.Title)
+		}
+	})
+	t.Run("a failed admission does not pin the default title", func(t *testing.T) {
+		a, st := newAdapter(t)
+		writes := 0
+		st.failWrite = func() error {
+			writes++
+			if writes == 2 { // the conversation record is written, the message is not
+				return errors.New("disk full")
+			}
+			return nil
+		}
+		if code, _, _ := postJSON(t, a, `{"text":"lost first","conv":"f1"}`); code != http.StatusServiceUnavailable {
+			t.Fatalf("code = %d", code)
+		}
+		st.failWrite = nil
+		postJSON(t, a, `{"text":"kept first","conv":"f1"}`)
+		if info, _ := st.ConvInfo("f1"); info.Title != "kept first" {
+			t.Fatalf("title = %q", info.Title)
+		}
+	})
 }

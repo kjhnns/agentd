@@ -146,3 +146,24 @@ func TestArtifactsRefuseADirInsideTheWorkspace(t *testing.T) {
 		t.Fatal("export without an artifact dir")
 	}
 }
+
+// TestArtifactOversizedNewestMessageIsCutShort: one message over the limit
+// is cut, so the file stays within it.
+func TestArtifactOversizedNewestMessageIsCutShort(t *testing.T) {
+	a, st, _ := artifactAdapter(t)
+	if _, err := st.UpsertConv("huge", ConvPatch{}, true); err != nil {
+		t.Fatal(err)
+	}
+	st.Append(Message{Role: RoleAgent, Kind: KindReply, Text: strings.Repeat("\"<", 120<<10), Conv: "huge"})
+	art, ok, err := a.ExportConv("huge", "")
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	if info, _ := os.Stat(art.Path); info.Size() > maxArtifactBytes {
+		t.Fatalf("export is %d bytes", info.Size())
+	}
+	lines := readJSONL(t, art.Path)
+	if !strings.Contains(lines[0]["note"].(string), "cut short") || !strings.HasSuffix(lines[1]["text"].(string), "over the artifact size limit]") {
+		t.Fatalf("header = %v", lines[0]["note"])
+	}
+}

@@ -215,6 +215,7 @@ func threadTranscript(logPath, title string) ([]recapMsg, []TurnAttachment, erro
 	// in epoch 0.
 	epoch := uint64(0)
 	activeConv := ConvMain
+	var startArts []TurnAttachment // attached by the current epoch's fresh start
 	turnMsgs := map[string]bool{} // message ids a turn record covers
 	turnRefs := map[string]bool{} // inbound/outbound refs a turn record covers
 	if chatID != "" {
@@ -237,6 +238,7 @@ func threadTranscript(logPath, title string) ([]recapMsg, []TurnAttachment, erro
 				if json.Unmarshal(rec.Data, &cs) == nil && cs.Chat == chatID && cs.Epoch >= epoch && cs.Epoch > 0 {
 					epoch = cs.Epoch
 					activeConv = cs.Conv
+					startArts = cs.Attachments
 					if activeConv == "" {
 						activeConv = ConvMain
 					}
@@ -255,7 +257,7 @@ func threadTranscript(logPath, title string) ([]recapMsg, []TurnAttachment, erro
 	}
 
 	var out []recapMsg
-	var arts []TurnAttachment
+	arts := append([]TurnAttachment(nil), startArts...)
 	for _, rec := range recs {
 		switch rec.Type {
 		case "turn":
