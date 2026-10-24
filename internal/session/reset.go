@@ -267,6 +267,15 @@ func (m *Manager) recoverDead(ctx context.Context, s *Session) {
 // start of a side conversation). It advances the process generation. Caller
 // holds the session's locks.
 func (m *Manager) replaceProcessLocked(ctx context.Context, s *Session, reason string) error {
+	return m.replaceProcess(ctx, s, reason, true)
+}
+
+// replaceProcess is replaceProcessLocked with the recap optional: the fresh
+// start of a side conversation (RunTurn) starts WITHOUT one, so no other
+// conversation's transcript is in the new window. The workspace composition
+// (constitution, memory index, context.md) is loaded either way. Caller holds
+// the session's locks.
+func (m *Manager) replaceProcess(ctx context.Context, s *Session, reason string, recap bool) error {
 	s.mu.Lock()
 	old := s.handle
 	s.mu.Unlock()
@@ -283,7 +292,9 @@ func (m *Manager) replaceProcessLocked(ctx context.Context, s *Session, reason s
 	// A dead process was never checkpoint-flushed, so context.md is stale as of
 	// the last reset. The run-log recap is the ONLY record of what was said
 	// since; it matters more here than anywhere else. See recap.go.
-	systemPrompt = m.composeInjection(systemPrompt, s.Title)
+	if recap {
+		systemPrompt = m.composeInjection(systemPrompt, s.Title)
+	}
 	h, err := m.adapter.Start(ctx, harness.SessionConfig{
 		SessionID:       s.ID,
 		Cwd:             cwd,

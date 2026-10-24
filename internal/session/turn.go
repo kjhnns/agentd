@@ -113,6 +113,18 @@ type TurnRequest struct {
 	// error ends the turn before the harness sees it (the wrist could not
 	// persist "working").
 	OnStart func() error
+	// Side marks a turn of the side session (iOS side conversations). Inside
+	// the locks, RunTurn compares Conv with the chat's ACTIVE conversation;
+	// when they differ it starts a fresh conversation: OnFresh runs, the
+	// process is replaced without a flush and without a recap, and a
+	// conversation_start advances the persisted epoch. Two queued messages for
+	// one new conversation therefore start fresh once: the second finds it
+	// active. A failed start changes nothing and fails the turn.
+	Side bool
+	// OnFresh, on a fresh start, returns text to put before Text (the pointer
+	// line of the conversation's own transcript artifact) and the matching
+	// attachments. An error fails the turn before anything changed.
+	OnFresh func() (prefix string, atts []TurnAttachment, err error)
 	// NoCollect returns as soon as the harness finished the send, without
 	// collecting a result (the legacy Send). The turn still owns the lock
 	// for the whole send.
@@ -174,13 +186,18 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 		return TurnResult{}, fmt.Errorf("session %s: %w", id, ErrSessionGone)
 	}
 
-	if m.log != nil {
-		_ = m.log.Append("input", map[string]string{"session": id, "text": req.Text})
-	}
 	if req.OnStart != nil {
 		if err := req.OnStart(); err != nil {
 			return TurnResult{}, fmt.Errorf("session %s: turn not started: %w", id, err)
 		}
+	}
+	if req.Side {
+		if err := m.maybeStartConversation(ctx, s, &req); err != nil {
+			return TurnResult{}, fmt.Errorf("session %s: conversation %s not started: %w", id, req.Conv, err)
+		}
+	}
+	if m.log != nil {
+		_ = m.log.Append("input", map[string]string{"session": id, "text": req.Text})
 	}
 
 	turnID := newID()
@@ -314,6 +331,53 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 		}()
 	}
 	return res, nil
+}
+
+// maybeStartConversation is the fresh start of a side conversation, decided
+// under the turn's ownership (see TurnRequest.Side). Caller holds the locks.
+func (m *Manager) maybeStartConversation(ctx context.Context, s *Session, req *TurnRequest) error {
+	conv := req.Conv
+	if conv == "" || req.Chat == "" {
+		return errors.New("a side turn needs a chat and a conversation")
+	}
+	if m.activeConversation(req.Chat) == conv {
+		return nil
+	}
+	prefix := ""
+	var atts []TurnAttachment
+	if req.OnFresh != nil {
+		p, a, err := req.OnFresh()
+		if err != nil {
+			return err
+		}
+		prefix, atts = p, a
+	}
+	// The new window holds no other conversation: no recap. The epoch is
+	// persisted only once the process runs, so a failed start leaves the old
+	// conversation and epoch active.
+	if err := m.replaceProcess(ctx, s, "fresh conversation", false); err != nil {
+		return err
+	}
+	epoch, err := m.startConversation(req.Chat, conv)
+	if err != nil {
+		// The process is fresh but the epoch did not move: replace it again
+		// with the recap of the epoch that is still current, so the window
+		// matches what the run-log says.
+		if rerr := m.replaceProcess(ctx, s, "conversation_start not written", true); rerr != nil {
+			log.Printf("session %s: restore after a failed conversation_start: %v", s.ID, rerr)
+		}
+		return err
+	}
+	log.Printf("session %s: fresh conversation %s (chat %s, epoch %d, %d attachment(s))", s.ID, conv, req.Chat, epoch, len(atts))
+	if prefix != "" {
+		if req.UserText == "" {
+			// The turn record keeps what the user wrote, not the pointer.
+			req.UserText = req.Text
+		}
+		req.Text = prefix + "\n\n" + req.Text
+	}
+	req.Attachments = append(req.Attachments, atts...)
+	return nil
 }
 
 // afterTurn runs at the end of a turn, still under ownership: it writes the

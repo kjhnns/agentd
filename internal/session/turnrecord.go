@@ -12,9 +12,12 @@ package session
 // its message id.
 //
 // The CONVERSATION EPOCH of a chat is persisted in the run-log as
-// `conversation_start` records {chat, conv, epoch}. Nothing writes one yet
-// (side conversations come in a later release), so every chat is in epoch 0.
-// The recap reads only the current epoch's turn records; the legacy
+// `conversation_start` records {chat, conv, epoch}. It is a property of the
+// CHAT (the session key), not of one conversation id: it advances only when
+// the side session starts a fresh conversation (RunTurn, Side), and it
+// survives resets, recovery and reclaim. The newest record of a chat also
+// names its ACTIVE conversation. A main chat never gets one and stays in
+// epoch 0. The recap reads only the current epoch's turn records; the legacy
 // inbound/outbound matching applies only to epoch 0, and only to records
 // written before the chat's first turn record.
 
@@ -54,29 +57,18 @@ type conversationStart struct {
 	Epoch uint64 `json:"epoch"`
 }
 
-// epochs is the persisted conversation epoch per (chat, conv), loaded once
-// from the run-log.
+// epochs is the persisted conversation epoch and active conversation per
+// chat, loaded once from the run-log and updated by startConversation.
 type epochs struct {
 	once sync.Once
 	mu   sync.Mutex
-	m    map[string]uint64
+	m    map[string]conversationStart
 }
 
-func epochKey(chat, conv string) string {
-	if conv == "" {
-		conv = ConvMain
-	}
-	return chat + "\x00" + conv
-}
-
-// conversationEpoch returns the current conversation epoch of a chat's
-// conversation (0 until a conversation_start advances it).
-func (m *Manager) conversationEpoch(chat, conv string) uint64 {
-	if chat == "" {
-		return 0
-	}
+// loadEpochs reads the conversation_start records once.
+func (m *Manager) loadEpochs() {
 	m.epochs.once.Do(func() {
-		m.epochs.m = map[string]uint64{}
+		m.epochs.m = map[string]conversationStart{}
 		if m.log == nil {
 			return
 		}
@@ -89,14 +81,52 @@ func (m *Manager) conversationEpoch(chat, conv string) uint64 {
 				continue
 			}
 			var cs conversationStart
-			if json.Unmarshal(r.Data, &cs) == nil && cs.Epoch > m.epochs.m[epochKey(cs.Chat, cs.Conv)] {
-				m.epochs.m[epochKey(cs.Chat, cs.Conv)] = cs.Epoch
+			if json.Unmarshal(r.Data, &cs) == nil && cs.Chat != "" && cs.Epoch >= m.epochs.m[cs.Chat].Epoch {
+				m.epochs.m[cs.Chat] = cs
 			}
 		}
 	})
+}
+
+// conversationEpoch returns the current conversation epoch of a chat (0
+// until a conversation_start advances it).
+func (m *Manager) conversationEpoch(chat string) uint64 {
+	if chat == "" {
+		return 0
+	}
+	m.loadEpochs()
 	m.epochs.mu.Lock()
 	defer m.epochs.mu.Unlock()
-	return m.epochs.m[epochKey(chat, conv)]
+	return m.epochs.m[chat].Epoch
+}
+
+// activeConversation returns the conversation the chat's session holds now
+// ("" before the first conversation_start).
+func (m *Manager) activeConversation(chat string) string {
+	if chat == "" {
+		return ""
+	}
+	m.loadEpochs()
+	m.epochs.mu.Lock()
+	defer m.epochs.mu.Unlock()
+	return m.epochs.m[chat].Conv
+}
+
+// startConversation persists a conversation_start {chat, conv, epoch+1} and
+// makes conv the chat's active conversation. Nothing changes when the record
+// cannot be written. Caller owns the chat's session (RunTurn).
+func (m *Manager) startConversation(chat, conv string) (uint64, error) {
+	m.loadEpochs()
+	m.epochs.mu.Lock()
+	defer m.epochs.mu.Unlock()
+	cs := conversationStart{Chat: chat, Conv: conv, Epoch: m.epochs.m[chat].Epoch + 1}
+	if m.log != nil {
+		if err := m.log.Append("conversation_start", cs); err != nil {
+			return 0, err
+		}
+	}
+	m.epochs.m[chat] = cs
+	return cs.Epoch, nil
 }
 
 // writeTurnRecord appends the turn record and reports whether it is durable
@@ -120,7 +150,7 @@ func (m *Manager) writeTurnRecord(s *Session, req TurnRequest, res TurnResult, e
 		Ref:               req.Ref,
 		Chat:              req.Chat,
 		Conv:              conv,
-		ConversationEpoch: m.conversationEpoch(req.Chat, conv),
+		ConversationEpoch: m.conversationEpoch(req.Chat),
 		ProcessGeneration: res.Generation,
 		Session:           s.ID,
 		UserText:          user,
