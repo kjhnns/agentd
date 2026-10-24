@@ -40,6 +40,10 @@ type Event struct {
 	Status     string    `json:"status,omitempty"`
 	Tool       string    `json:"tool,omitempty"`
 	Confidence float64   `json:"confidence,omitempty"`
+	// TurnID is stamped by the session pump when it reads the event from the
+	// harness: the id of the turn that owned the session at that moment. A
+	// collector accepts only its own turn's events. Empty outside a turn.
+	TurnID string `json:"turn_id,omitempty"`
 }
 
 // Bus is an in-process pub/sub hub. Subscribers get a buffered channel; a slow

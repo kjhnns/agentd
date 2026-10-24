@@ -178,7 +178,7 @@ func routeWithReply(t *testing.T, budget int, reply string) ([]channel.OutboundM
 	}
 	fa.mu.Lock()
 	fa.onSend = func(string) {
-		bus.Publish(eventbus.Event{SessionID: sess.ID, Kind: eventbus.KindResult, Text: reply})
+		emitOnHandle(sess, eventbus.Event{SessionID: sess.ID, Kind: eventbus.KindResult, Text: reply})
 	}
 	fa.mu.Unlock()
 
@@ -341,7 +341,7 @@ func routeOn(t *testing.T, source string, budget int, reply string) []channel.Ou
 	}
 	fa.mu.Lock()
 	fa.onSend = func(string) {
-		bus.Publish(eventbus.Event{SessionID: sess.ID, Kind: eventbus.KindResult, Text: reply})
+		emitOnHandle(sess, eventbus.Event{SessionID: sess.ID, Kind: eventbus.KindResult, Text: reply})
 	}
 	fa.mu.Unlock()
 	ch := &recordingChannel{}

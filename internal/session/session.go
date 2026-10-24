@@ -46,7 +46,7 @@ type Session struct {
 	// and the handle swap during a reset all take it, so an inbound that arrives
 	// mid-turn QUEUES as the next turn (single-active-session policy) and a reset
 	// never races a live turn.
-	turnMu sync.Mutex
+	turnMu turnLock
 
 	mu           sync.Mutex
 	status       harness.Status
@@ -54,6 +54,14 @@ type Session struct {
 	turns        int       // turns on the CURRENT handle (reset back to 0 on reset)
 	handleStart  time.Time // when the current handle was started (for max_wallclock)
 	lastActivity time.Time // last turn boundary (for idle GC)
+	// gen is the PROCESS GENERATION: it advances on every replacement of the
+	// harness process (reset, recovery, reclaim, abandoned turn). The pump of
+	// an older generation never stamps a turn id, and a reset scheduled for
+	// an older generation is dropped.
+	gen uint64
+	// curTurn is the id of the turn that owns the session (RunTurn), stamped
+	// by the pump on every event it reads. Empty between turns.
+	curTurn string
 }
 
 // Status snapshots the session for the API.
@@ -314,15 +322,24 @@ func (m *Manager) CreateInLane(ctx context.Context, lane Lane, workspaceName, cw
 	// Pump the adapter's per-session events onto the shared bus + run-log. The
 	// handle is passed explicitly so a reset can start a fresh pump for the new
 	// handle while the old pump drains and exits on its closed event channel.
-	go m.pump(s, h)
+	go m.pump(s, h, 0)
 	return s, nil
 }
 
 // pump forwards ONE handle's harness events to the bus and durable log until
 // that handle's event channel closes (teardown). A reset spawns a new pump for
-// the replacement handle.
-func (m *Manager) pump(s *Session, h harness.Handle) {
+// the replacement handle. The pump stamps the id of the turn that owns the
+// session on each event as it reads it; a pump of an older process
+// generation (still draining) stamps nothing, so no turn collects its events.
+func (m *Manager) pump(s *Session, h harness.Handle, gen uint64) {
 	for e := range s.adapter.Events(h) {
+		s.mu.Lock()
+		if s.gen == gen {
+			e.TurnID = s.curTurn
+		} else {
+			e.TurnID = ""
+		}
+		s.mu.Unlock()
 		m.bus.Publish(e)
 		if m.log != nil {
 			_ = m.log.Append("event", e)
@@ -390,77 +407,6 @@ type SendResult struct {
 	Events []eventbus.Event // all normalized events from the turn
 }
 
-// Send routes one user turn to the session's harness and returns the result. It
-// takes the per-session turn lock so concurrent inbound serializes as the NEXT
-// turn (single-active-session policy) rather than spawning a parallel session.
-// After a COMPLETED turn it evaluates the context-reset triggers (pressure /
-// max_turns / max_wallclock) at that natural boundary and, if one trips, kicks
-// off a controlled reset in the background so the just-produced reply is not
-// delayed. It never checks mid-turn.
-func (m *Manager) Send(ctx context.Context, id, text string) (*SendResult, error) {
-	s, ok := m.Get(id)
-	if !ok {
-		return nil, fmt.Errorf("session %s not found", id)
-	}
-	if m.log != nil {
-		_ = m.log.Append("input", map[string]string{"session": id, "text": text})
-	}
-
-	s.turnMu.Lock()
-
-	s.mu.Lock()
-	s.running = true
-	s.status = harness.StatusThinking
-	handle := s.handle
-	s.mu.Unlock()
-
-	err := s.adapter.Send(ctx, handle, harness.Input{Text: text})
-
-	now := time.Now().UTC()
-	s.mu.Lock()
-	s.running = false
-	s.status = s.adapter.Status(s.handle)
-	if err != nil {
-		s.status = harness.StatusError
-	}
-	s.turns++
-	s.lastActivity = now
-	s.mu.Unlock()
-
-	if err != nil {
-		s.turnMu.Unlock()
-		return nil, err
-	}
-
-	// End-of-turn workspace commit: if the turn changed anything under the
-	// workspace (memory re-syntheses, context.md handoff, working files),
-	// commit it now so history accrues at natural boundaries. Best-effort:
-	// autocommit failure is logged, never fails the turn.
-	if m.GitAutoCommit && s.ws != nil {
-		sha, cerr := s.ws.AutoCommit("turn " + id)
-		if cerr != nil {
-			log.Printf("session %s: workspace autocommit failed: %v", id, cerr)
-		} else if sha != "" && m.log != nil {
-			_ = m.log.Append("workspace_commit", map[string]string{"session": id, "workspace": s.ws.Name, "commit": sha})
-		}
-	}
-
-	tripped, reason := m.evalTriggers(s)
-	s.turnMu.Unlock()
-
-	if tripped {
-		// Background so the reply goes out promptly; Reset re-takes turnMu and
-		// serializes against any queued turn. Use a detached context so an
-		// ending request context does not abort the reset.
-		go func() {
-			if rerr := m.Reset(context.Background(), id, reason); rerr != nil {
-				log.Printf("session %s: post-turn reset (%s) failed: %v", id, reason, rerr)
-			}
-		}()
-	}
-	return &SendResult{}, nil
-}
-
 // TurnOptions tunes ONE collected turn (SendAndCollect).
 type TurnOptions struct {
 	// Timeout is the QUIET window, not a wallclock cap on the turn: the turn is
@@ -504,151 +450,6 @@ func isProgress(k eventbus.Kind) bool {
 		return true
 	}
 	return false
-}
-
-// SendAndCollect sends one user turn to a session and returns the turn's
-// USER-VISIBLE result text. It is the single implementation of the
-// subscribe-then-send-then-drain dance that every caller of Send needs (the
-// channel router, the scheduler runner, the HTTP /input endpoint): subscribing
-// BEFORE the send so the result event cannot be missed, mapping a blanked
-// result text back onto the turn's last streamed output (the harness blanks a
-// result that merely duplicates it, so there is one visible reply), and
-// draining briefly after Send returns because bus delivery can lag the call.
-//
-// The returned text is "" when the turn produced nothing; callers that must
-// say SOMETHING substitute their own placeholder.
-func (m *Manager) SendAndCollect(ctx context.Context, id, text string, opt TurnOptions) (string, error) {
-	if _, ok := m.Get(id); !ok {
-		return "", fmt.Errorf("session %s not found", id)
-	}
-
-	// Subscribe BEFORE sending so the turn's result event cannot be missed.
-	subID, events := m.bus.Subscribe()
-	defer m.bus.Unsubscribe(subID)
-
-	turnErr := make(chan error, 1)
-	go func() {
-		_, err := m.Send(ctx, id, text)
-		turnErr <- err
-	}()
-
-	started := time.Now()
-	var result, lastOutput string
-	gotResult := false
-	steps := 0
-	lastStep := ""
-	lastProgress := started
-
-	// The quiet timer. A zero/negative Timeout means "no bound beyond ctx": a
-	// nil channel blocks forever in the select, which is exactly that.
-	var quiet *time.Timer
-	var quietC <-chan time.Time
-	if opt.Timeout > 0 {
-		quiet = time.NewTimer(opt.Timeout)
-		defer quiet.Stop()
-		quietC = quiet.C
-	}
-	// The absolute backstop. Armed once and never reset: that is the point.
-	var ceilingC <-chan time.Time
-	if opt.Ceiling > 0 {
-		ct := time.NewTimer(opt.Ceiling)
-		defer ct.Stop()
-		ceilingC = ct.C
-	}
-
-	collect := func(e eventbus.Event) {
-		if e.SessionID != id {
-			return
-		}
-		if opt.OnEvent != nil {
-			opt.OnEvent(e)
-		}
-		// Progress resets the quiet timer. This is the whole fix: work that is
-		// visibly happening buys more time; silence does not.
-		if quiet != nil && isProgress(e.Kind) {
-			if !quiet.Stop() {
-				// Already fired: drain so the stale tick cannot end the turn on
-				// the next loop iteration even though we just saw progress.
-				select {
-				case <-quiet.C:
-				default:
-				}
-			}
-			quiet.Reset(opt.Timeout)
-		}
-		if isProgress(e.Kind) {
-			steps++
-			lastProgress = time.Now()
-			if e.Kind == eventbus.KindToolCall && e.Tool != "" {
-				lastStep = "tool " + e.Tool
-			} else if e.Kind == eventbus.KindOutput && e.Text != "" {
-				lastStep = firstLine(e.Text)
-			}
-		}
-		switch e.Kind {
-		case eventbus.KindOutput:
-			lastOutput = e.Text
-		case eventbus.KindResult:
-			gotResult = true
-			if e.Text != "" {
-				result = e.Text
-			} else {
-				result = lastOutput
-			}
-		}
-	}
-
-	// abandon builds the timeout error. The PARTIAL work is not thrown away: the
-	// last streamed output and a count of completed steps ride along so the user
-	// is told what was accomplished instead of getting a bare error.
-	abandon := func(ceiling bool) (string, error) {
-		te := &TurnTimeoutError{
-			SessionID: id,
-			Ceiling:   ceiling,
-			Elapsed:   time.Since(started),
-			Quiet:     time.Since(lastProgress),
-			Budget:    opt.Timeout,
-			Steps:     steps,
-			LastStep:  lastStep,
-			Partial:   lastOutput,
-		}
-		if ceiling {
-			te.Budget = opt.Ceiling
-		}
-		return lastOutput, te
-	}
-
-	for {
-		select {
-		case e := <-events:
-			collect(e)
-		case err := <-turnErr:
-			if err != nil {
-				return "", err
-			}
-			// Send returning can race the bus delivery of the turn's events;
-			// drain briefly until the result event lands so the reply is not
-			// built from a partial turn.
-			grace := time.After(resultGrace)
-			for !gotResult {
-				select {
-				case e := <-events:
-					collect(e)
-				case <-grace:
-					return result, nil
-				case <-ctx.Done():
-					return "", ctx.Err()
-				}
-			}
-			return result, nil
-		case <-quietC:
-			return abandon(false)
-		case <-ceilingC:
-			return abandon(true)
-		case <-ctx.Done():
-			return "", ctx.Err()
-		}
-	}
 }
 
 // firstLine returns the first non-empty line of s, truncated, for use in a
@@ -1120,6 +921,18 @@ func timeoutDetail(err error) string {
 	return s
 }
 
+// mediaAttachments lists an inbound message's media as turn attachments.
+func mediaAttachments(in channel.InboundMsg) []TurnAttachment {
+	if len(in.Media) == 0 {
+		return nil
+	}
+	out := make([]TurnAttachment, 0, len(in.Media))
+	for _, a := range in.Media {
+		out = append(out, TurnAttachment{Kind: string(a.Kind), Path: a.Path, Name: a.Name})
+	}
+	return out
+}
+
 // RouteInbound wires a channel inbound message to a session and sends the harness
 // result back through the channel. It reuses one session per chat id (created on
 // first message). This is the end-to-end path.
@@ -1166,35 +979,56 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		}
 	}
 
-	id, err := m.sessionForChat(ctx, chats, in.UserID, cwd, model)
-	if err != nil {
-		react(channel.ReactionError)
-		return err
-	}
-	sessionID = id
-
-	// A session has the prompt: the turn is in flight. Every exit below flips
-	// this to the done or error glyph via the deferred final reaction.
-	react(channel.ReactionWorking)
+	// A session has the prompt once RunTurn owns it; the working glyph is set
+	// when the session is resolved. Every exit below flips it to the done or
+	// error glyph via the deferred final reaction.
 	finalReaction := channel.ReactionError
-	defer func() { react(finalReaction) }()
-
-	// One turn, collected by the shared SendAndCollect: the needs-input glyph is
-	// the only channel-specific piece, delivered through the event hook.
-	result, err := m.SendAndCollect(ctx, id, m.RenderTurn(in), TurnOptions{
-		Timeout: m.Policy.turnTimeout(),
-		Ceiling: m.Policy.turnCeiling(),
-		OnEvent: func(e eventbus.Event) {
-			if e.Kind == eventbus.KindNeedsInput {
-				// Interim state: the agent is blocked on the user. The terminal
-				// done/error glyph still replaces it when the turn resolves.
-				react(channel.ReactionNeedsInput)
-			}
-		},
-	})
-	if err != nil {
-		return err
+	reacted := false
+	var result string
+	for attempt := 0; ; attempt++ {
+		id, err := m.sessionForChat(ctx, chats, in.UserID, cwd, model)
+		if err != nil {
+			react(channel.ReactionError)
+			return err
+		}
+		sessionID = id
+		if !reacted {
+			reacted = true
+			react(channel.ReactionWorking)
+			defer func() { react(finalReaction) }()
+		}
+		// One turn, owned and collected by RunTurn: the needs-input glyph is
+		// the only channel-specific piece, delivered through the event hook.
+		res, err := m.RunTurn(ctx, TurnRequest{
+			SessionID:   id,
+			Text:        m.RenderTurn(in),
+			UserText:    in.Text,
+			MessageID:   in.MsgID,
+			Chat:        in.UserID,
+			Attachments: mediaAttachments(in),
+			Options: TurnOptions{
+				Timeout: m.Policy.turnTimeout(),
+				Ceiling: m.Policy.turnCeiling(),
+				OnEvent: func(e eventbus.Event) {
+					if e.Kind == eventbus.KindNeedsInput {
+						// Interim state: the agent is blocked on the user. The
+						// terminal done/error glyph still replaces it.
+						react(channel.ReactionNeedsInput)
+					}
+				},
+			},
+		})
+		if errors.Is(err, ErrSessionGone) && attempt < 2 {
+			// Reclaimed while this message waited: resolve (re-create) it.
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		result = res.Text
+		break
 	}
+	id := sessionID
 	if result == "" {
 		result = "(no result)"
 	}

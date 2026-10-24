@@ -49,3 +49,12 @@ func chatMapWith(chat, id string) *ChatMap {
 	c.Set(chat, id)
 	return c
 }
+
+// emitOnHandle feeds an event into the session's live fake handle, as the
+// harness would, so the pump stamps the owning turn id on it.
+func emitOnHandle(s *Session, e eventbus.Event) {
+	s.mu.Lock()
+	h := s.handle.(*fakeHandle)
+	s.mu.Unlock()
+	h.events <- e
+}

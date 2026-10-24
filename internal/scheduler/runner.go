@@ -7,6 +7,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 
 	"github.com/kjhnns/agentd/internal/eventbus"
 	"github.com/kjhnns/agentd/internal/session"
@@ -26,18 +27,28 @@ type ManagerRunner struct {
 // workspace); the idle-GC contract means a reclaimed session is lazily
 // re-hydrated fresh from the workspace artifacts.
 func (r *ManagerRunner) RunTurn(ctx context.Context, workspaceName, prompt, title string) (string, error) {
-	s, ok := r.Mgr.FindByWorkspace(workspaceName)
-	if !ok {
-		var err error
-		s, err = r.Mgr.Create(ctx, workspaceName, "", r.Model, title)
-		if err != nil {
+	for attempt := 0; ; attempt++ {
+		s, ok := r.Mgr.FindByWorkspace(workspaceName)
+		if !ok {
+			var err error
+			s, err = r.Mgr.Create(ctx, workspaceName, "", r.Model, title)
+			if err != nil {
+				return "", err
+			}
+		}
+		// The turn is owned and collected by session.RunTurn (the one
+		// implementation used by the channel router and the HTTP API too). The
+		// job run is already bounded by the scheduler's per-job context, so no
+		// extra turn timeout is imposed here.
+		res, err := r.Mgr.RunTurn(ctx, session.TurnRequest{SessionID: s.ID, Text: prompt, Chat: "job:" + title})
+		if errors.Is(err, session.ErrSessionGone) && attempt < 2 {
+			// Reclaimed while the run waited: find or create it again.
+			continue
+		}
+		var te *session.TurnTimeoutError
+		if err != nil && !errors.As(err, &te) {
 			return "", err
 		}
+		return res.Text, err
 	}
-
-	// The turn itself is collected by the shared session.SendAndCollect (one
-	// implementation of subscribe-before-send + drain-after-send, used by the
-	// channel router and the HTTP API too). The job run is already bounded by
-	// the scheduler's per-job context, so no extra turn timeout is imposed here.
-	return r.Mgr.SendAndCollect(ctx, s.ID, prompt, session.TurnOptions{})
 }

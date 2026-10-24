@@ -26,6 +26,7 @@ type scriptedAdapter struct {
 type scriptedHandle struct {
 	id     string
 	events chan eventbus.Event
+	dead   bool // torn down (echoAdapter with keepOpen)
 }
 
 func (h *scriptedHandle) ID() string { return h.id }

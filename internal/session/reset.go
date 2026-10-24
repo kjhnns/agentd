@@ -44,8 +44,40 @@ func (m *Manager) Reset(ctx context.Context, id, reason string) error {
 	if !ok {
 		return fmt.Errorf("session %s not found", id)
 	}
-	s.turnMu.Lock()
-	defer s.turnMu.Unlock()
+	unlock, err := m.lockSession(ctx, s)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if cur, ok := m.Get(id); !ok || cur != s {
+		return fmt.Errorf("session %s: %w", id, ErrSessionGone)
+	}
+	return m.resetLocked(ctx, s, reason)
+}
+
+// resetIfGeneration is the post-turn reset: it runs only when the process is
+// still the generation the trigger fired on. A reset for an older generation
+// (the process was already replaced) is dropped.
+func (m *Manager) resetIfGeneration(ctx context.Context, id, reason string, gen uint64) error {
+	s, ok := m.Get(id)
+	if !ok {
+		return nil
+	}
+	unlock, err := m.lockSession(ctx, s)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if cur, ok := m.Get(id); !ok || cur != s {
+		return nil
+	}
+	s.mu.Lock()
+	cur := s.gen
+	s.mu.Unlock()
+	if cur != gen {
+		log.Printf("session %s: post-turn reset (%s) dropped: generation %d is gone (now %d)", id, reason, gen, cur)
+		return nil
+	}
 	return m.resetLocked(ctx, s, reason)
 }
 
@@ -108,15 +140,8 @@ func (m *Manager) resetLocked(ctx context.Context, s *Session, reason string) er
 	}
 
 	now := time.Now().UTC()
-	s.mu.Lock()
-	s.handle = h
-	s.turns = 0
-	s.handleStart = now
-	s.lastActivity = now
-	s.status = harness.StatusIdle
-	s.mu.Unlock()
-
-	go m.pump(s, h)
+	gen := m.installHandle(s, h, now)
+	go m.pump(s, h, gen)
 
 	if m.log != nil {
 		_ = m.log.Append("session_reset", map[string]any{
@@ -203,8 +228,21 @@ func (m *Manager) gcSweep(ctx context.Context) {
 }
 
 // recoverDead restarts a dead session's process fresh from the workspace
-// artifacts, preserving the session id. Caller holds s.turnMu.
+// artifacts, preserving the session id. Caller holds the session's locks.
 func (m *Manager) recoverDead(ctx context.Context, s *Session) {
+	if err := m.replaceProcessLocked(ctx, s, "dead"); err != nil {
+		log.Printf("session %s: dead-recovery restart failed: %v", s.ID, err)
+		return
+	}
+	log.Printf("session %s: recovered dead process (fresh from artifacts)", s.ID)
+}
+
+// replaceProcessLocked tears the current process down and starts a fresh one
+// for the same session id WITHOUT a checkpoint flush: the dead-process
+// recovery path, also used after an abandoned turn (and later for the fresh
+// start of a side conversation). It advances the process generation. Caller
+// holds the session's locks.
+func (m *Manager) replaceProcessLocked(ctx context.Context, s *Session, reason string) error {
 	s.mu.Lock()
 	old := s.handle
 	s.mu.Unlock()
@@ -231,22 +269,33 @@ func (m *Manager) recoverDead(ctx context.Context, s *Session) {
 		PermissionMode:  m.PermissionMode,
 	})
 	if err != nil {
-		log.Printf("session %s: dead-recovery restart failed: %v", s.ID, err)
-		return
+		s.mu.Lock()
+		s.status = harness.StatusDead
+		s.mu.Unlock()
+		return err
 	}
 	now := time.Now().UTC()
+	gen := m.installHandle(s, h, now)
+	go m.pump(s, h, gen)
+	if m.log != nil {
+		_ = m.log.Append("session_recover", map[string]any{"session": s.ID, "reason": reason, "generation": gen, "ts": now})
+	}
+	return nil
+}
+
+// installHandle makes h the session's live process and advances the process
+// generation. It returns the new generation for the handle's pump.
+func (m *Manager) installHandle(s *Session, h harness.Handle, now time.Time) uint64 {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.handle = h
+	s.gen++
+	s.curTurn = ""
 	s.turns = 0
 	s.handleStart = now
 	s.lastActivity = now
 	s.status = harness.StatusIdle
-	s.mu.Unlock()
-	go m.pump(s, h)
-	if m.log != nil {
-		_ = m.log.Append("session_recover", map[string]any{"session": s.ID, "reason": "dead", "ts": now})
-	}
-	log.Printf("session %s: recovered dead process (fresh from artifacts)", s.ID)
+	return s.gen
 }
 
 // reclaimIdle checkpoint-flushes an idle session, captures the artifacts, tears
@@ -275,6 +324,7 @@ func (m *Manager) reclaimIdle(ctx context.Context, s *Session) {
 
 	s.mu.Lock()
 	s.status = harness.StatusDead
+	s.gen++
 	s.mu.Unlock()
 
 	if m.log != nil {
