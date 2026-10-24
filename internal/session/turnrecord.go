@@ -1,0 +1,163 @@
+package session
+
+// TURN RECORDS (D6).
+//
+// RunTurn writes ONE `turn` record per turn into the run-log while it still
+// owns the session: who asked (request id, message id, chat, conversation),
+// what was asked, what came back, on which process generation and in which
+// conversation epoch. Inbound and outbound records are written outside the
+// turn lock, so they cannot tell two conversations of one chat apart; turn
+// records can. The recap reads them (both channels of a shared session),
+// and the wrist's restart recovery (D5) finds a request's committed result by
+// its message id.
+//
+// The CONVERSATION EPOCH of a chat is persisted in the run-log as
+// `conversation_start` records {chat, conv, epoch}. Nothing writes one yet
+// (side conversations come in a later release), so every chat is in epoch 0.
+// The recap reads only the current epoch's turn records; the legacy
+// inbound/outbound matching applies only to epoch 0, and only to records
+// written before the chat's first turn record.
+
+import (
+	"encoding/json"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/kjhnns/agentd/internal/runlog"
+)
+
+// ConvMain is the primary conversation of a chat (an absent conv).
+const ConvMain = "main"
+
+// TurnRecord is the payload of a `turn` run-log record.
+type TurnRecord struct {
+	TurnID            string           `json:"turn_id"`
+	RequestID         string           `json:"request_id,omitempty"`
+	MessageID         string           `json:"message_id,omitempty"`
+	Chat              string           `json:"chat,omitempty"`
+	Conv              string           `json:"conv,omitempty"`
+	ConversationEpoch uint64           `json:"conversation_epoch"`
+	ProcessGeneration uint64           `json:"process_generation"`
+	Session           string           `json:"session"`
+	UserText          string           `json:"user_text"`
+	Result            string           `json:"result"`
+	Error             string           `json:"error,omitempty"`
+	Attachments       []TurnAttachment `json:"attachments,omitempty"`
+}
+
+// conversationStart is the payload of a `conversation_start` record.
+type conversationStart struct {
+	Chat  string `json:"chat"`
+	Conv  string `json:"conv"`
+	Epoch uint64 `json:"epoch"`
+}
+
+// epochs is the persisted conversation epoch per (chat, conv), loaded once
+// from the run-log.
+type epochs struct {
+	once sync.Once
+	mu   sync.Mutex
+	m    map[string]uint64
+}
+
+func epochKey(chat, conv string) string {
+	if conv == "" {
+		conv = ConvMain
+	}
+	return chat + "\x00" + conv
+}
+
+// conversationEpoch returns the current conversation epoch of a chat's
+// conversation (0 until a conversation_start advances it).
+func (m *Manager) conversationEpoch(chat, conv string) uint64 {
+	if chat == "" {
+		return 0
+	}
+	m.epochs.once.Do(func() {
+		m.epochs.m = map[string]uint64{}
+		if m.log == nil {
+			return
+		}
+		recs, err := runlog.Replay(m.log.Path())
+		if err != nil {
+			log.Printf("session: conversation epochs: %v", err)
+		}
+		for _, r := range recs {
+			if r.Type != "conversation_start" {
+				continue
+			}
+			var cs conversationStart
+			if json.Unmarshal(r.Data, &cs) == nil && cs.Epoch > m.epochs.m[epochKey(cs.Chat, cs.Conv)] {
+				m.epochs.m[epochKey(cs.Chat, cs.Conv)] = cs.Epoch
+			}
+		}
+	})
+	m.epochs.mu.Lock()
+	defer m.epochs.mu.Unlock()
+	return m.epochs.m[epochKey(chat, conv)]
+}
+
+// writeTurnRecord appends the turn record. Caller owns the session (RunTurn).
+func (m *Manager) writeTurnRecord(s *Session, req TurnRequest, res TurnResult, err error) {
+	if m.log == nil {
+		return
+	}
+	conv := req.Conv
+	if conv == "" && req.Chat != "" {
+		conv = ConvMain
+	}
+	user := req.UserText
+	if user == "" {
+		user = req.Text
+	}
+	rec := TurnRecord{
+		TurnID:            res.TurnID,
+		RequestID:         req.RequestID,
+		MessageID:         req.MessageID,
+		Chat:              req.Chat,
+		Conv:              conv,
+		ConversationEpoch: m.conversationEpoch(req.Chat, conv),
+		ProcessGeneration: res.Generation,
+		Session:           s.ID,
+		UserText:          user,
+		Result:            res.Text,
+		Attachments:       req.Attachments,
+	}
+	if err != nil {
+		rec.Error = err.Error()
+	}
+	if aerr := m.log.Append("turn", rec); aerr != nil {
+		log.Printf("session %s: turn record not written: %v", s.ID, aerr)
+	}
+}
+
+// FindTurn returns the newest committed turn record of an inbound message
+// (by message id, else by request id), for the restart recovery of the
+// wrist (D5).
+func (m *Manager) FindTurn(messageID, requestID string) (TurnRecord, time.Time, bool) {
+	if m.log == nil || (messageID == "" && requestID == "") {
+		return TurnRecord{}, time.Time{}, false
+	}
+	recs, err := runlog.Replay(m.log.Path())
+	if err != nil {
+		return TurnRecord{}, time.Time{}, false
+	}
+	return findTurn(recs, messageID, requestID)
+}
+
+func findTurn(recs []runlog.Record, messageID, requestID string) (TurnRecord, time.Time, bool) {
+	for i := len(recs) - 1; i >= 0; i-- {
+		if recs[i].Type != "turn" {
+			continue
+		}
+		var tr TurnRecord
+		if json.Unmarshal(recs[i].Data, &tr) != nil {
+			continue
+		}
+		if (messageID != "" && tr.MessageID == messageID) || (requestID != "" && tr.RequestID == requestID) {
+			return tr, recs[i].TS, true
+		}
+	}
+	return TurnRecord{}, time.Time{}, false
+}

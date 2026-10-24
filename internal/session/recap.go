@@ -161,11 +161,58 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 		}
 	}
 
+	// D6: from a chat's first `turn` record on, the turn records are the
+	// transcript (written under turn ownership, both channels of a shared
+	// session, keyed by conversation epoch). Inbound/outbound records are the
+	// legacy source, used only for epoch 0 and only before that boundary.
+	boundary := len(recs)
+	epoch := uint64(0)
+	turnMsgs := map[string]bool{} // message ids a turn record covers
+	if chatID != "" {
+		for i, rec := range recs {
+			switch rec.Type {
+			case "turn":
+				var tr TurnRecord
+				if json.Unmarshal(rec.Data, &tr) == nil && tr.Chat == chatID {
+					if boundary == len(recs) {
+						boundary = i
+					}
+					if tr.MessageID != "" {
+						turnMsgs[tr.MessageID] = true
+					}
+				}
+			case "conversation_start":
+				var cs conversationStart
+				if json.Unmarshal(rec.Data, &cs) == nil && cs.Chat == chatID &&
+					(cs.Conv == "" || cs.Conv == ConvMain) && cs.Epoch > epoch {
+					epoch = cs.Epoch
+				}
+			}
+		}
+	}
+	legacy := func(i int) bool { return epoch == 0 && i < boundary }
+
 	var out []recapMsg
-	for _, rec := range recs {
+	for i, rec := range recs {
 		switch rec.Type {
-		case "inbound":
+		case "turn":
 			if chatID == "" {
+				continue
+			}
+			var tr TurnRecord
+			if json.Unmarshal(rec.Data, &tr) != nil || tr.Chat != chatID || tr.ConversationEpoch != epoch {
+				continue
+			}
+			if tr.Conv != "" && tr.Conv != ConvMain {
+				continue
+			}
+			out = append(out, recapMsg{TS: rec.TS, Role: "user", Text: tr.UserText, MsgID: tr.MessageID})
+			if tr.Error == "" && strings.TrimSpace(tr.Result) != "" {
+				out = append(out, recapMsg{TS: rec.TS, Role: "agent", Text: recapResult(tr.Result)})
+			}
+
+		case "inbound":
+			if chatID == "" || !legacy(i) {
 				continue
 			}
 			var in struct {
@@ -177,12 +224,20 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 			if json.Unmarshal(rec.Data, &in) != nil {
 				continue
 			}
-			if in.UserID != chatID || (channelName != "" && in.Channel != "" && in.Channel != channelName) {
+			// The wrist shares the Telegram chat's session (share_session), so
+			// its questions belong to the same thread.
+			if in.UserID != chatID || (channelName != "" && in.Channel != "" && in.Channel != channelName && in.Channel != "watch") {
 				continue
+			}
+			if in.MsgID != "" && turnMsgs[in.MsgID] {
+				continue // its turn record carries it
 			}
 			out = append(out, recapMsg{TS: rec.TS, Role: "user", Text: in.Text, MsgID: in.MsgID})
 
 		case "outbound":
+			if chatID != "" && !legacy(i) {
+				continue
+			}
 			var ob struct {
 				Chat    string `json:"chat"`
 				Session string `json:"session"`
@@ -202,8 +257,8 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 
 		case "input":
 			// CLI / non-channel threads only. For a channel thread the same
-			// text is already present as an `inbound` record and replaying it
-			// here would duplicate every user message.
+			// text is already present as an `inbound` or `turn` record and
+			// replaying it here would duplicate every user message.
 			if chatID != "" {
 				continue
 			}
@@ -218,6 +273,14 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 		}
 	}
 	return out, nil
+}
+
+// recapResult is the answer of a turn as the user saw it: without the
+// proposed-replies trailer, and the full body when the reply was split.
+func recapResult(result string) string {
+	clean, _ := ExtractReplies(result)
+	body, _ := SplitReply(clean, 1<<20)
+	return body
 }
 
 // renderRecap turns reconstructed messages into the injected block, applying

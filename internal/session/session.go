@@ -133,6 +133,9 @@ type Manager struct {
 	ilockMu sync.Mutex
 	ilocks  map[string]*turnLock
 
+	// epochs caches the persisted conversation epochs (turnrecord.go).
+	epochs epochs
+
 	// gcBeforeLock is a test hook: it runs in the GC sweep between reading a
 	// session's state and taking its locks.
 	gcBeforeLock func(*Session)
@@ -1028,6 +1031,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 			UserText:    in.Text,
 			MessageID:   in.MsgID,
 			Chat:        in.UserID,
+			Conv:        ConvMain,
 			Attachments: mediaAttachments(in),
 			Options: TurnOptions{
 				Timeout: m.Policy.turnTimeout(),

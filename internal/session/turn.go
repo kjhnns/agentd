@@ -241,8 +241,11 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 	return res, nil
 }
 
-// afterTurn is the hook for the end of a turn, still under ownership.
-func (m *Manager) afterTurn(s *Session, req TurnRequest, res TurnResult, err error) {}
+// afterTurn runs at the end of a turn, still under ownership: it writes the
+// turn record (D6).
+func (m *Manager) afterTurn(s *Session, req TurnRequest, res TurnResult, err error) {
+	m.writeTurnRecord(s, req, res, err)
+}
 
 // abortTurn ends an abandoned turn before anyone else may use the session:
 // it interrupts the turn, cancels its send, waits (bounded) for the send to
