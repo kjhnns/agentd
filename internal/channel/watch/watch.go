@@ -158,6 +158,7 @@ func (a *Adapter) Send(ctx context.Context, m channel.OutboundMsg) (channel.Send
 	}
 	if ok {
 		msg.ReplyTo = u.ID
+		msg.Conv = u.Conv
 		if u.Status == StatusFailed {
 			msg.Kind = KindFailure
 			msg.Part = ""
@@ -176,7 +177,10 @@ func (a *Adapter) Send(ctx context.Context, m channel.OutboundMsg) (channel.Send
 	}
 	// Silence carries into the mirror too: the long half of a split reply must
 	// not raise a Telegram push either, or the user gets the truncated one.
-	a.echo("⌚ "+m.Text, m.Silent)
+	// Side conversations never mirror to Telegram.
+	if convOf(stored) == ConvMain {
+		a.echo("⌚ "+m.Text, m.Silent)
+	}
 	return channel.SendReceipt{ID: stored.ID}, nil
 }
 
@@ -270,6 +274,8 @@ func (a *Adapter) Handler() http.Handler {
 	mux.HandleFunc("/watch/usage", a.handleUsage)
 	mux.HandleFunc("/watch/messages", a.handleMessages)
 	mux.HandleFunc("/watch/transcribe", a.handleTranscribe)
+	mux.HandleFunc("/watch/conversations", a.handleConversations)
+	mux.HandleFunc("/watch/conversations/", a.handleConversation)
 	gated := a.auth(mux)
 
 	// The UI route runs BEFORE the gate: it owns the sign-in flow (it turns a
@@ -425,8 +431,13 @@ func (a *Adapter) handlePing(w http.ResponseWriter, r *http.Request) {
 	// server from before it took only the first file part and dropped the
 	// rest without a word, so a client sends several only when it reads this.
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "title": a.title, "pending": a.store.Pending(), "server_time": a.now(),
+		"ok": true, "title": a.title, "pending": a.store.PendingF(MainOnly), "server_time": a.now(),
 		"max_files": maxPostFiles,
+		// features: what a new app may use. "conversations" = side
+		// conversations, conv/scope reads, /watch/conversations (R4).
+		"features": []string{"conversations"},
+		// pending_all counts side conversations too (operators, the app).
+		"pending_all": a.store.Pending(),
 	})
 }
 
@@ -508,6 +519,26 @@ func (a *Adapter) handleFetch(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	waitS, _ := strconv.Atoi(q.Get("wait"))
 	before := q.Get("before")
+	// Which messages (R4): no conv and no scope = main only, today's
+	// contract for the wrist, the complications, /watch/ui and old builds.
+	filter := Filter(MainOnly)
+	labelled := false
+	switch scope, conv := q.Get("scope"), q.Get("conv"); {
+	case scope != "" && conv != "":
+		writeErr(w, http.StatusBadRequest, "give conv or scope, not both")
+		return
+	case scope == "all":
+		filter, labelled = nil, true
+	case scope != "":
+		writeErr(w, http.StatusBadRequest, "bad scope")
+		return
+	case conv != "":
+		if conv != ConvMain && !ValidConvID(conv) {
+			writeErr(w, http.StatusBadRequest, "bad conv")
+			return
+		}
+		filter, labelled = InConv(conv), true
+	}
 
 	var (
 		msgs        []Message
@@ -518,7 +549,7 @@ func (a *Adapter) handleFetch(w http.ResponseWriter, r *http.Request) {
 	)
 	switch {
 	case before != "":
-		msgs, hasMore, latest = a.store.Page(before, limit)
+		msgs, hasMore, latest = a.store.PageF(filter, before, limit)
 	case after > 0:
 		if waitS > 0 {
 			d := time.Duration(waitS) * time.Second
@@ -527,16 +558,22 @@ func (a *Adapter) handleFetch(w http.ResponseWriter, r *http.Request) {
 			}
 			a.store.Wait(r.Context(), after, d)
 		}
-		msgs, latest, reset, moreChanges = a.store.SincePage(after, limit)
+		msgs, latest, reset, moreChanges = a.store.SincePageF(filter, after, limit)
 		if reset {
 			// The client is being handed a fresh tail, so tell it whether
 			// older messages are still pageable.
-			_, hasMore, _ = a.store.Tail(limit)
+			_, hasMore, _ = a.store.TailF(filter, limit)
 		}
 	default:
-		msgs, hasMore, latest = a.store.Tail(limit)
+		msgs, hasMore, latest = a.store.TailF(filter, limit)
 	}
 	msgs = publicAll(msgs)
+	if labelled {
+		// A new client reads conv on every row.
+		for i := range msgs {
+			msgs[i].Conv = convOf(msgs[i])
+		}
+	}
 	// latest_seq is the cursor to ask from next. On an incremental read it is
 	// the seq of the last returned change when the page was cut
 	// (has_more_changes), so paging never skips a change (D3).
@@ -546,7 +583,7 @@ func (a *Adapter) handleFetch(w http.ResponseWriter, r *http.Request) {
 		"reset":            reset,
 		"has_more":         hasMore,
 		"has_more_changes": moreChanges,
-		"pending":          a.store.Pending(),
+		"pending":          a.store.PendingF(filter),
 		"server_time":      a.now(),
 	})
 }
@@ -646,10 +683,24 @@ const maxPostFiles = 6
 // is QUEUED; the reply arrives later through fetch.
 func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 	var (
-		text      string
-		arts      []media.Artifact
-		requestID string
+		text        string
+		arts        []media.Artifact
+		requestID   string
+		convParam   string
+		conv        string
+		contextConv string
 	)
+	// checkConv validates the R4 fields before anything is ingested.
+	checkConv := func(c, cc string) bool {
+		var msg string
+		convParam = c
+		conv, contextConv, msg = a.checkConvFields(c, cc)
+		if msg != "" {
+			writeErr(w, http.StatusBadRequest, msg)
+			return false
+		}
+		return true
+	}
 	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	switch {
 	case strings.HasPrefix(ct, "multipart/"):
@@ -672,9 +723,12 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "bad request_id")
 			return
 		}
+		if !checkConv(strings.TrimSpace(r.FormValue("conv")), strings.TrimSpace(r.FormValue("context_conv"))) {
+			return
+		}
 		// A repeat answers the original receipt before anything is ingested
 		// again (no second transcription, no second copy of the photos).
-		if a.answerDuplicate(w, requestID) {
+		if a.answerDuplicate(w, requestID, convParam) {
 			return
 		}
 		var headers []*multipart.FileHeader
@@ -739,8 +793,10 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 		}
 	default:
 		var body struct {
-			Text      string `json:"text"`
-			RequestID string `json:"request_id"`
+			Text        string `json:"text"`
+			RequestID   string `json:"request_id"`
+			Conv        string `json:"conv"`
+			ContextConv string `json:"context_conv"`
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxInboundText+(4<<10))
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -757,7 +813,10 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "bad request_id")
 			return
 		}
-		if a.answerDuplicate(w, requestID) {
+		if !checkConv(strings.TrimSpace(body.Conv), strings.TrimSpace(body.ContextConv)) {
+			return
+		}
+		if a.answerDuplicate(w, requestID, convParam) {
 			return
 		}
 	}
@@ -786,13 +845,21 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	msg.RequestID = requestID
+	if conv != ConvMain {
+		msg.Conv = conv // main stays absent: old readers see today's rows
+	}
+	if contextConv != "" {
+		msg.Attachments = []Attachment{{Kind: KindConv, ID: contextConv, Title: a.store.ConvTitle(contextConv)}}
+	}
 	in := channel.InboundMsg{
-		Channel:   "watch",
-		UserID:    a.userID,
-		Sender:    "watch",
-		TS:        a.now().Unix(),
-		Text:      text,
-		RequestID: requestID,
+		Channel:     "watch",
+		UserID:      a.userID,
+		Sender:      "watch",
+		TS:          a.now().Unix(),
+		Text:        text,
+		RequestID:   requestID,
+		Conv:        msg.Conv,
+		ContextConv: contextConv,
 	}
 	in.Media = arts
 	stored, outcome, err := a.store.Admit(msg, in, func() bool {
@@ -816,7 +883,7 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 		// A concurrent repeat was admitted first: this copy's files belong to
 		// no turn.
 		removeImages(arts)
-		writeJSON(w, http.StatusAccepted, map[string]any{"message": stored.Public(), "pending": a.store.Pending(), "duplicate": true})
+		writeJSON(w, http.StatusAccepted, map[string]any{"message": receipt(stored, convParam), "pending": a.store.Pending(), "duplicate": true})
 		return
 	case outcome == Rejected:
 		// The photos of a message that starts no turn would stay on disk
@@ -825,8 +892,44 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "inbound queue full, try again")
 		return
 	}
-	a.echo("⌚ You: "+stored.Text, false)
-	writeJSON(w, http.StatusAccepted, map[string]any{"message": stored.Public(), "pending": a.store.Pending()})
+	if convOf(stored) == ConvMain {
+		a.echo("⌚ You: "+stored.Text, false) // side conversations never mirror
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"message": receipt(stored, convParam), "pending": a.store.Pending()})
+}
+
+// receipt is the stored user message as the 202 answer: it carries conv
+// when the client named one (a new app), and is today's shape otherwise.
+func receipt(m Message, convParam string) Message {
+	p := m.Public()
+	if convParam != "" {
+		p.Conv = convOf(m)
+	}
+	return p
+}
+
+// checkConvFields validates conv and context_conv of a POST. It returns the
+// target conversation ("main" when absent), the context conversation ("" =
+// none) and a 400 message when they are not acceptable.
+func (a *Adapter) checkConvFields(conv, contextConv string) (string, string, string) {
+	if conv == "" {
+		conv = ConvMain
+	}
+	if conv != ConvMain && !ValidConvID(conv) {
+		return "", "", "bad conv"
+	}
+	if contextConv != "" {
+		if contextConv != ConvMain && !ValidConvID(contextConv) {
+			return "", "", "bad context_conv"
+		}
+		if contextConv == conv {
+			return "", "", "context_conv is the conversation itself"
+		}
+		if !a.store.ConvExists(contextConv) {
+			return "", "", "unknown context_conv"
+		}
+	}
+	return conv, contextConv, ""
 }
 
 // maxRequestID bounds a client idempotency key.
@@ -848,12 +951,12 @@ func validRequestID(id string) bool {
 
 // answerDuplicate answers a repeat of a known, not rejected request with its
 // original receipt. It reports whether it answered.
-func (a *Adapter) answerDuplicate(w http.ResponseWriter, requestID string) bool {
+func (a *Adapter) answerDuplicate(w http.ResponseWriter, requestID, convParam string) bool {
 	prev, ok := a.store.LookupRequest(requestID)
 	if !ok || prev.Status == StatusRejected {
 		return false
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"message": prev.Public(), "pending": a.store.Pending(), "duplicate": true})
+	writeJSON(w, http.StatusAccepted, map[string]any{"message": receipt(prev, convParam), "pending": a.store.Pending(), "duplicate": true})
 	return true
 }
 

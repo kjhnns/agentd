@@ -42,7 +42,7 @@ func (a *Adapter) Reconcile(ctx context.Context,
 	deliver func(ctx context.Context, in channel.InboundMsg, sessionID, result string, finalOnly bool) error,
 ) (requeued, delivered, failed int) {
 	for _, m := range a.store.Unfinished() {
-		in := channel.InboundMsg{Channel: "watch", UserID: a.userID, MsgID: m.ID, Sender: "watch", Text: m.Text, RequestID: m.RequestID}
+		in := channel.InboundMsg{Channel: "watch", UserID: a.userID, MsgID: m.ID, Sender: "watch", Text: m.Text, RequestID: m.RequestID, Conv: m.Conv}
 		if m.Inbound != nil {
 			in = *m.Inbound
 			in.MsgID = m.ID

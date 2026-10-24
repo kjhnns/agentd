@@ -29,6 +29,12 @@ type InboundMsg struct {
 	// RequestID is the client's idempotency key (the wrist's request_id),
 	// carried into the turn record. Empty for channels without one.
 	RequestID string `json:"request_id,omitempty"`
+	// Conv is the wrist conversation the message belongs to (R4): "" or
+	// "main" is the primary thread; any other id is an iOS side
+	// conversation, routed to the side session. ContextConv names another
+	// conversation to attach as an artifact. Other channels leave both empty.
+	Conv        string `json:"conv,omitempty"`
+	ContextConv string `json:"context_conv,omitempty"`
 }
 
 // Lifecycle reaction emoji. These are the visible progress feedback a user gets
