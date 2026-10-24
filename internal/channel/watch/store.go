@@ -59,6 +59,27 @@ type Message struct {
 	// index (D5b): replay indexes it but does not put it back into the
 	// conversation.
 	Evicted bool `json:"evicted,omitempty"`
+	// Conv is the conversation the message belongs to (R4). Absent means
+	// "main": old rows, the wrist, Telegram-shared turns.
+	Conv string `json:"conv,omitempty"`
+	// Title and Archived are set on kind "conv" records only (one record id
+	// per conversation, re-appended on every change).
+	Title    string `json:"title,omitempty"`
+	Archived *bool  `json:"archived,omitempty"`
+	// TitleSet marks a title given by PUT/PATCH; the default title from the
+	// first message never replaces it. Server only.
+	TitleSet bool `json:"title_set,omitempty"`
+	// Attachments are the artifacts a user message carried (a conversation
+	// attached as context). The server path is never served.
+	Attachments []Attachment `json:"attachments,omitempty"`
+}
+
+// Attachment is one artifact on a user message.
+type Attachment struct {
+	Kind  string `json:"kind"` // "conv"
+	ID    string `json:"id"`
+	Title string `json:"title,omitempty"`
+	Path  string `json:"path,omitempty"` // server only
 }
 
 // Public is the message as clients see it: without the persisted inbound
@@ -66,6 +87,15 @@ type Message struct {
 func (m Message) Public() Message {
 	m.Inbound = nil
 	m.Evicted = false
+	m.TitleSet = false
+	if len(m.Attachments) > 0 {
+		atts := make([]Attachment, len(m.Attachments))
+		for i, a := range m.Attachments {
+			a.Path = ""
+			atts[i] = a
+		}
+		m.Attachments = atts
+	}
 	return m
 }
 
@@ -90,6 +120,7 @@ const (
 	KindFailure = "failure"
 	KindNotice  = "notice"
 	KindSummary = "summary" // the short half of a split reply; the long half precedes it
+	KindConv    = "conv"    // conversation metadata record (R4)
 
 	PartBody = "body"
 
@@ -144,8 +175,19 @@ type Store struct {
 	broken error
 
 	maxLog    int // in-memory append log bound
-	maxIDs    int // distinct messages kept
+	maxIDs    int // distinct messages kept PER CONVERSATION
 	compactAt int // JSONL lines that trigger a compaction on open
+
+	// archiveDir holds watch-archive/<conv>.jsonl: every message is appended
+	// there before trim evicts it ("" = a memory-only store, no archive).
+	archiveDir string
+	// archived is the exact archive index: message id -> the highest seq of
+	// its snapshot in the archive, and the conversation it was filed under.
+	// Rebuilt from the archive files on open.
+	archived     map[string]int64
+	archivedConv map[string]string
+	// failArchive is a test hook: it fails the next archive write.
+	failArchive func() error
 }
 
 // Record and line bounds. One oversized record must never be able to take the
@@ -167,18 +209,25 @@ func openStore(path string, compactAt int) (*Store, error) {
 
 func openStoreWith(path string, compactAt, maxIDs int) (*Store, error) {
 	s := &Store{
-		path:      path,
-		latest:    map[string]Message{},
-		reqs:      map[string]Message{},
-		wake:      make(chan struct{}),
-		maxLog:    4000,
-		maxIDs:    maxIDs,
-		compactAt: compactAt,
+		path:         path,
+		latest:       map[string]Message{},
+		reqs:         map[string]Message{},
+		wake:         make(chan struct{}),
+		maxLog:       4000,
+		maxIDs:       maxIDs,
+		compactAt:    compactAt,
+		archived:     map[string]int64{},
+		archivedConv: map[string]string{},
 	}
 	if path == "" {
 		return s, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	// The archive index first: replay trims, and a trim archives.
+	s.archiveDir = filepath.Join(filepath.Dir(path), "watch-archive")
+	if err := s.loadArchiveIndex(); err != nil {
 		return nil, err
 	}
 	lines, skipped, err := s.replay()
@@ -569,9 +618,12 @@ func (s *Store) evictedRequests() []Message {
 	return out
 }
 
-// trimLocked bounds memory: the append log and the distinct-id set. A user
-// message whose turn is still in flight is never evicted (D5b); the request
-// index keeps the snapshot of an evicted request.
+// trimLocked bounds memory: the append log, and the distinct messages PER
+// CONVERSATION (maxIDs each). A user message whose turn is still in flight
+// is never evicted (D5b), nor a message answering one, nor a kind "conv"
+// record (one per conversation, kept forever). Every evicted message is
+// archived first (watch-archive/<conv>.jsonl); when that write fails the
+// eviction stops and the store grows rather than loses.
 func (s *Store) trimLocked() {
 	if len(s.log) > s.maxLog {
 		s.log = append([]Message(nil), s.log[len(s.log)-s.maxLog/2:]...)
@@ -579,9 +631,21 @@ func (s *Store) trimLocked() {
 	if len(s.order) <= s.maxIDs {
 		return
 	}
-	// Protected: an unfinished user message, any message answering one, and
-	// the record just written. When everything is protected the store
-	// overflows for a while and trims once those requests finish.
+	counts := map[string]int{}
+	for _, id := range s.order {
+		if m := s.latest[id]; m.Kind != KindConv {
+			counts[convOf(m)]++
+		}
+	}
+	excess := map[string]int{}
+	for c, n := range counts {
+		if n > s.maxIDs {
+			excess[c] = n - s.maxIDs
+		}
+	}
+	if len(excess) == 0 {
+		return
+	}
 	open := map[string]bool{}
 	for _, id := range s.order {
 		if inFlight(s.latest[id]) {
@@ -589,12 +653,19 @@ func (s *Store) trimLocked() {
 		}
 	}
 	keep := make([]string, 0, len(s.order))
-	excess := len(s.order) - s.maxIDs
+	stopped := false
 	for _, id := range s.order {
 		m := s.latest[id]
-		if excess > 0 && !open[id] && !open[m.ReplyTo] && m.Seq != s.seq {
+		c := convOf(m)
+		if !stopped && m.Kind != KindConv && excess[c] > 0 && !open[id] && !open[m.ReplyTo] && m.Seq != s.seq {
+			if err := s.archiveLocked(m); err != nil {
+				log.Printf("watch store: archive of %s failed, eviction stopped (the store grows instead): %v", id, err)
+				stopped = true
+				keep = append(keep, id)
+				continue
+			}
 			delete(s.latest, id)
-			excess--
+			excess[c]--
 			continue
 		}
 		keep = append(keep, id)
@@ -636,18 +707,48 @@ func clampLimit(limit int) int {
 	return limit
 }
 
-// tailLocked returns the newest `limit` distinct messages (oldest first) and
-// the index they start at in the conversation order.
-func (s *Store) tailLocked(limit int) ([]Message, int) {
-	start := 0
-	if len(s.order) > limit {
-		start = len(s.order) - limit
+// Filter selects the messages a reader sees (R4): nil is every message.
+type Filter func(Message) bool
+
+func (f Filter) match(m Message) bool { return f == nil || f(m) }
+
+// MainOnly is today's contract for the wrist, the complications, /watch/ui
+// and old app builds: the main conversation, without conversation records.
+func MainOnly(m Message) bool { return m.Kind != KindConv && convOf(m) == ConvMain }
+
+// InConv is one conversation's thread, its conversation record included.
+func InConv(id string) Filter {
+	return func(m Message) bool { return convOf(m) == id }
+}
+
+// tailLocked returns the newest `limit` matching messages (oldest first) and
+// whether older matching ones remain.
+func (s *Store) tailLocked(f Filter, limit int) ([]Message, bool) {
+	return s.beforeLocked(f, len(s.order), limit)
+}
+
+// beforeLocked collects up to limit matching messages before order index
+// end (oldest first) and whether older matching ones remain.
+func (s *Store) beforeLocked(f Filter, end, limit int) ([]Message, bool) {
+	var rev []Message
+	i := end - 1
+	for ; i >= 0 && len(rev) < limit; i-- {
+		if m := s.latest[s.order[i]]; f.match(m) {
+			rev = append(rev, m)
+		}
 	}
-	out := make([]Message, 0, len(s.order)-start)
-	for _, id := range s.order[start:] {
-		out = append(out, s.latest[id])
+	more := false
+	for ; i >= 0; i-- {
+		if f.match(s.latest[s.order[i]]) {
+			more = true
+			break
+		}
 	}
-	return out, start
+	out := make([]Message, len(rev))
+	for j := range rev {
+		out[j] = rev[len(rev)-1-j]
+	}
+	return out, more
 }
 
 // Tail returns the newest `limit` distinct messages (oldest first), whether
@@ -655,10 +756,15 @@ func (s *Store) tailLocked(limit int) ([]Message, int) {
 // page a client loads; it then pages backwards with Page and forwards with
 // Since, so a long conversation is never sent in one piece.
 func (s *Store) Tail(limit int) (msgs []Message, hasMore bool, latest int64) {
+	return s.TailF(nil, limit)
+}
+
+// TailF is Tail over the messages f selects.
+func (s *Store) TailF(f Filter, limit int) (msgs []Message, hasMore bool, latest int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out, start := s.tailLocked(clampLimit(limit))
-	return out, start > 0, s.seq
+	out, more := s.tailLocked(f, clampLimit(limit))
+	return out, more, s.seq
 }
 
 // Page returns up to limit messages that sit immediately BEFORE beforeID in
@@ -668,6 +774,11 @@ func (s *Store) Tail(limit int) (msgs []Message, hasMore bool, latest int64) {
 // whose anchor has already been trimmed out of the store still gets a usable
 // page instead of an error.
 func (s *Store) Page(beforeID string, limit int) (msgs []Message, hasMore bool, latest int64) {
+	return s.PageF(nil, beforeID, limit)
+}
+
+// PageF is Page over the messages f selects.
+func (s *Store) PageF(f Filter, beforeID string, limit int) (msgs []Message, hasMore bool, latest int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	limit = clampLimit(limit)
@@ -679,18 +790,11 @@ func (s *Store) Page(beforeID string, limit int) (msgs []Message, hasMore bool, 
 		}
 	}
 	if end < 0 {
-		out, start := s.tailLocked(limit)
-		return out, start > 0, s.seq
+		out, more := s.tailLocked(f, limit)
+		return out, more, s.seq
 	}
-	start := end - limit
-	if start < 0 {
-		start = 0
-	}
-	out := make([]Message, 0, end-start)
-	for _, id := range s.order[start:end] {
-		out = append(out, s.latest[id])
-	}
-	return out, start > 0, s.seq
+	out, more := s.beforeLocked(f, end, limit)
+	return out, more, s.seq
 }
 
 // Since returns the newest snapshot of every message touched after seq
@@ -713,20 +817,26 @@ func (s *Store) Since(after int64, limit int) (msgs []Message, cursor int64, res
 // high-water seq even when the page was cut, and a message whose change sat
 // behind the cut was never seen.
 func (s *Store) SincePage(after int64, limit int) (msgs []Message, cursor int64, reset, more bool) {
+	return s.SincePageF(nil, after, limit)
+}
+
+// SincePageF is SincePage over the messages f selects. The cursor and the
+// reset floor are the store's (one seq space for every conversation).
+func (s *Store) SincePageF(f Filter, after int64, limit int) (msgs []Message, cursor int64, reset, more bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	limit = clampLimit(limit)
 	if after <= 0 {
-		out, _ := s.tailLocked(limit)
+		out, _ := s.tailLocked(f, limit)
 		return out, s.seq, false, false
 	}
 	if len(s.log) > 0 && after < s.log[0].Seq-1 {
-		out, _ := s.tailLocked(limit)
+		out, _ := s.tailLocked(f, limit)
 		return out, s.seq, true, false
 	}
 	changed := []Message{}
 	for _, id := range s.order {
-		if m := s.latest[id]; m.Seq > after {
+		if m := s.latest[id]; m.Seq > after && f.match(m) {
 			changed = append(changed, m)
 		}
 	}
@@ -756,13 +866,16 @@ func (s *Store) Wait(ctx context.Context, after int64, d time.Duration) {
 }
 
 // Pending counts user messages whose turn has not reached a terminal status.
-func (s *Store) Pending() int {
+func (s *Store) Pending() int { return s.PendingF(nil) }
+
+// PendingF is Pending over the messages f selects.
+func (s *Store) PendingF(f Filter) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
 	for _, id := range s.order {
 		m := s.latest[id]
-		if m.Role == RoleUser && !Terminal(m.Status) {
+		if m.Role == RoleUser && !Terminal(m.Status) && f.match(m) {
 			n++
 		}
 	}

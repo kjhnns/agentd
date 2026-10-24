@@ -90,6 +90,11 @@ func (s *Store) Admit(msg Message, in channel.InboundMsg, room func() bool, offe
 	}
 	in.MsgID = msg.ID
 	msg.Role = RoleUser
+	// A message names its conversation; an unknown side conversation is
+	// created here (with its default title), in the same locked step.
+	if err := s.ensureConvLocked(convOf(msg), msg.Text); err != nil {
+		return Message{}, Rejected, errors.Join(ErrPersist, err)
+	}
 	if !room() {
 		// The queue is full. A request with an id can be retried and is
 		// stored rejected; one without (an old client) is stored failed, as
