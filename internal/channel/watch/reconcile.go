@@ -22,11 +22,12 @@ type CommittedTurn struct {
 // Reconcile settles every unfinished request after a daemon start (D5). It
 // runs before the HTTP surface serves and after the inbound consumer runs:
 //
-//   - a request with a committed turn (found by message id or request id) is
-//     answered from it: the stored result is delivered (only the missing
-//     final part when the long half is already stored), or a failed turn is
-//     failed. This is checked first for queued requests too, in case the
-//     "working" write was lost;
+//   - a request with a committed successful turn (found by message id or
+//     request id) is answered from it: the stored result is delivered (only
+//     the missing final part when the long half is already stored). When the
+//     delivery fails it stays unfinished for the next start; the answer is
+//     never replaced by a notice. This is checked first for queued requests
+//     too, in case the "working" write was lost;
 //   - queued with its stored payload: re-enqueued, in conversation order;
 //   - otherwise (working or needs_input without a committed turn, or queued
 //     without a payload, a row from before the payload was stored): failed
@@ -57,7 +58,10 @@ func (a *Adapter) Reconcile(ctx context.Context,
 				delivered++
 				continue
 			}
-			log.Printf("watch: reconcile %s: delivering the stored result failed: %v", m.ID, err)
+			// The answer exists; it must not be thrown away for a notice. The
+			// request stays unfinished and the next start tries again.
+			log.Printf("watch: reconcile %s: delivering the stored result failed (left for the next start): %v", m.ID, err)
+			continue
 		} else if !ok && m.Status == StatusQueued && m.Inbound != nil {
 			select {
 			case a.inbound <- in:

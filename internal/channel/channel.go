@@ -67,6 +67,8 @@ type OutboundMsg struct {
 	// this message (InboundMsg.MsgID). A channel that keeps a conversation
 	// attributes the reply to exactly that message instead of guessing.
 	InReplyTo string `json:"in_reply_to,omitempty"`
+	// Failure marks the failure notice of a turn (no answer was produced).
+	Failure bool `json:"failure,omitempty"`
 }
 
 // SendReceipt carries a real provider id, the acceptance artifact for a send.

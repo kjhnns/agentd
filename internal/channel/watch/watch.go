@@ -138,7 +138,9 @@ func (a *Adapter) SupportsMedia() bool                { return false }
 // attributed to the user message that started the turn (OutboundMsg.InReplyTo).
 func (a *Adapter) Send(ctx context.Context, m channel.OutboundMsg) (channel.SendReceipt, error) {
 	msg := Message{Role: RoleAgent, Kind: KindReply, Text: m.Text}
-	if m.Summary {
+	if m.Failure {
+		msg.Kind = KindFailure
+	} else if m.Summary {
 		msg.Kind = KindSummary
 	} else if m.Silent {
 		// The long half of a split reply: its summary is still to come.
@@ -793,7 +795,9 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 		RequestID: requestID,
 	}
 	in.Media = arts
-	stored, outcome, err := a.store.Admit(msg, in, func(in channel.InboundMsg) bool {
+	stored, outcome, err := a.store.Admit(msg, in, func() bool {
+		return len(a.inbound) < cap(a.inbound)
+	}, func(in channel.InboundMsg) bool {
 		select {
 		case a.inbound <- in:
 			return true

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -142,6 +143,98 @@ func TestRecapKeepsLegacyRecordsWrittenAfterARollback(t *testing.T) {
 	})
 	got, _ := ThreadRecap(path, "telegram:"+chat, RecapPolicy{}, time.Now().UTC())
 	for _, want := range []string{"new binary question", "new binary answer", "old binary question", "old binary answer"} {
+		if strings.Count(got, want) != 1 {
+			t.Fatalf("%q appears %d times:\n%s", want, strings.Count(got, want), got)
+		}
+	}
+}
+
+// silentStructured is structured but never reports a result.
+type silentStructured struct{ *echoAdapter }
+
+func (s *silentStructured) Capabilities() harness.Capabilities {
+	return harness.Capabilities{StructuredEvents: true}
+}
+func (s *silentStructured) Send(ctx context.Context, h harness.Handle, in harness.Input) error {
+	s.mu.Lock()
+	s.sends = append(s.sends, in.Text)
+	s.mu.Unlock()
+	return nil
+}
+
+// TestMissingResultIsAFailure (review round 2): a structured harness that
+// finished a turn without a readable result is a failed turn, never an
+// empty success delivered as "(no result)".
+func TestMissingResultIsAFailure(t *testing.T) {
+	old := drainWait
+	drainWait = 200 * time.Millisecond
+	defer func() { drainWait = old }()
+	a := &silentStructured{newEchoAdapter()}
+	mgr := NewManager(a, eventbus.New(), nil)
+	mgr.Policy = Policy{}
+	s, _ := mgr.Create(context.Background(), "", t.TempDir(), "", "t")
+	_, err := mgr.SendAndCollect(context.Background(), s.ID, "q", TurnOptions{Timeout: 5 * time.Second})
+	if !errors.Is(err, ErrNoResult) {
+		t.Fatalf("err = %v, want ErrNoResult", err)
+	}
+}
+
+// seqChannel records sends and acks in one ordered list.
+type seqChannel struct {
+	recordingChannel
+	mu3 sync.Mutex
+	log []string
+}
+
+func (c *seqChannel) Ack(chatID, msgID, reaction string) error {
+	c.mu3.Lock()
+	c.log = append(c.log, "ack:"+reaction)
+	c.mu3.Unlock()
+	return nil
+}
+func (c *seqChannel) Send(ctx context.Context, m channel.OutboundMsg) (channel.SendReceipt, error) {
+	c.mu3.Lock()
+	c.log = append(c.log, fmt.Sprintf("send:failure=%v", m.Failure))
+	c.mu3.Unlock()
+	return channel.SendReceipt{ID: "x"}, nil
+}
+
+// TestFailureNoticeGoesOutBeforeTheErrorGlyph (review round 2): the wrist
+// persists the status, so the notice is stored before "failed".
+func TestFailureNoticeGoesOutBeforeTheErrorGlyph(t *testing.T) {
+	a := &cancelAdapter{newEchoAdapter()}
+	mgr := NewManager(a, eventbus.New(), nil)
+	mgr.Policy = Policy{TurnTimeout: time.Second}
+	ch := &seqChannel{}
+	in := channel.InboundMsg{Channel: "watch", UserID: "c", MsgID: "m", Text: "cancel"}
+	if err := mgr.RouteInbound(context.Background(), ch, in, NewChatMap(LaneMain), t.TempDir(), ""); err == nil {
+		t.Fatal("want a failed turn")
+	}
+	want := []string{"ack:" + channel.ReactionWorking, "send:failure=true", "ack:" + channel.ReactionError}
+	if fmt.Sprint(ch.log) != fmt.Sprint(want) {
+		t.Fatalf("order = %v, want %v", ch.log, want)
+	}
+}
+
+// TestMarkedRecordsWithoutTheirTurnRecordStayInTheRecap (review round 2):
+// when the turn record could not be written, the inbound/outbound records of
+// that message are read instead.
+func TestMarkedRecordsWithoutTheirTurnRecordStayInTheRecap(t *testing.T) {
+	const chat = "42"
+	path := writeThread(t, []func(*runlog.Log){
+		func(l *runlog.Log) {
+			_ = l.Append("inbound", map[string]any{"channel": "telegram", "user_id": chat, "msg_id": "1", "text": "lost turn question", "rec": "turn", "ref": "r1"})
+		},
+		func(l *runlog.Log) {
+			_ = l.Append("outbound", map[string]string{"chat": chat, "session": "s", "msg_id": "2", "text": "lost turn answer", "rec": "turn", "ref": "r1"})
+		},
+		func(l *runlog.Log) {
+			_ = l.Append("inbound", map[string]any{"channel": "telegram", "user_id": chat, "msg_id": "3", "text": "kept question", "rec": "turn", "ref": "r2"})
+		},
+		turnRec(TurnRecord{TurnID: "t2", Chat: chat, Conv: ConvMain, MessageID: "3", Ref: "r2", UserText: "kept question", Result: "kept answer"}),
+	})
+	got, _ := ThreadRecap(path, "telegram:"+chat, RecapPolicy{}, time.Now().UTC())
+	for _, want := range []string{"lost turn question", "lost turn answer", "kept question", "kept answer"} {
 		if strings.Count(got, want) != 1 {
 			t.Fatalf("%q appears %d times:\n%s", want, strings.Count(got, want), got)
 		}

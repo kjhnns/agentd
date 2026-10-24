@@ -65,6 +65,11 @@ type Session struct {
 	// turnTerminal is closed by the pump when it stamps the current turn's
 	// terminal event (result or error).
 	turnTerminal chan struct{}
+	// turnOut, turnRes and turnGot are the pump's own record of the current
+	// turn: its last output, and its result once read (the bus can drop).
+	turnOut string
+	turnRes string
+	turnGot bool
 }
 
 // Status snapshots the session for the API.
@@ -350,6 +355,20 @@ func (m *Manager) pump(s *Session, h harness.Handle, gen uint64) {
 		s.mu.Lock()
 		if s.gen == gen {
 			e.TurnID = s.curTurn
+			if e.TurnID != "" {
+				switch e.Kind {
+				case eventbus.KindOutput:
+					s.turnOut = e.Text
+				case eventbus.KindResult:
+					if !s.turnGot {
+						s.turnGot = true
+						s.turnRes = e.Text
+						if s.turnRes == "" {
+							s.turnRes = s.turnOut
+						}
+					}
+				}
+			}
 			if e.TurnID != "" && s.turnTerminal != nil && (e.Kind == eventbus.KindResult || e.Kind == eventbus.KindError) {
 				close(s.turnTerminal)
 				s.turnTerminal = nil
@@ -964,6 +983,7 @@ const recTurn = "turn"
 type inboundRecord struct {
 	channel.InboundMsg
 	Rec string `json:"rec,omitempty"`
+	Ref string `json:"ref,omitempty"`
 }
 
 // mediaAttachments lists an inbound message's media as turn attachments.
@@ -982,8 +1002,12 @@ func mediaAttachments(in channel.InboundMsg) []TurnAttachment {
 // result back through the channel. It reuses one session per chat id (created on
 // first message). This is the end-to-end path.
 func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, chats *ChatMap, cwd, model string) (rerr error) {
+	// ref ties the inbound and outbound records of this message to its turn
+	// record, so the recap reads the turn record and skips them, and reads
+	// them when no turn record was written.
+	ref := newID()
 	if m.log != nil {
-		_ = m.log.Append("inbound", inboundRecord{InboundMsg: in, Rec: recTurn})
+		_ = m.log.Append("inbound", inboundRecord{InboundMsg: in, Rec: recTurn, Ref: ref})
 	}
 
 	// Silence is never an outcome. Every error exit below leaves the user with
@@ -991,23 +1015,30 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	// notice sends one short plain-text line whenever the turn failed AND no
 	// reply was delivered. Detached ctx: the notice must still go out when the
 	// turn died because its own context was cancelled.
+	//
+	// The notice goes out BEFORE the final (error) glyph: a channel that
+	// persists the status (the wrist) then never holds a failed request
+	// without its explanation.
 	sessionID := ""
 	replied := false
+	finalReaction := channel.ReactionError
+	reacted := false
+	var react func(string)
 	defer func() {
-		if rerr == nil || replied {
-			return
+		if rerr != nil && !replied {
+			text := failureNotice(in, rerr)
+			nctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			if _, err := ch.Send(nctx, channel.OutboundMsg{ChatID: in.UserID, Text: text, InReplyTo: in.MsgID, Failure: true}); err != nil {
+				log.Printf("session: failure notice to %s/%s failed: %v", in.Channel, in.UserID, err)
+			} else if m.log != nil {
+				_ = m.log.Append("outbound", map[string]string{
+					"session": sessionID, "chat": in.UserID, "text": text, "kind": "failure-notice", "rec": recTurn, "ref": ref,
+				})
+			}
+			cancel()
 		}
-		text := failureNotice(in, rerr)
-		nctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		if _, err := ch.Send(nctx, channel.OutboundMsg{ChatID: in.UserID, Text: text, InReplyTo: in.MsgID}); err != nil {
-			log.Printf("session: failure notice to %s/%s failed: %v", in.Channel, in.UserID, err)
-			return
-		}
-		if m.log != nil {
-			_ = m.log.Append("outbound", map[string]string{
-				"session": sessionID, "chat": in.UserID, "text": text, "kind": "failure-notice", "rec": recTurn,
-			})
+		if reacted {
+			react(finalReaction)
 		}
 	}()
 
@@ -1015,7 +1046,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	// contract: an adapter that cannot react no-ops, and a reaction failure
 	// never changes the turn's outcome. The receipt glyph (👀) is set by the
 	// adapter at receipt; this function owns the rest of the chain.
-	react := func(emoji string) {
+	react = func(emoji string) {
 		if in.MsgID == "" || emoji == "" {
 			return
 		}
@@ -1027,8 +1058,6 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	// The working glyph is set when RunTurn owns the session (OnStart). Every
 	// exit below flips it to the done or error glyph via the deferred final
 	// reaction.
-	finalReaction := channel.ReactionError
-	reacted := false
 	var result string
 	for attempt := 0; ; attempt++ {
 		id, err := m.sessionForChat(ctx, chats, in.UserID, cwd, model)
@@ -1037,10 +1066,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 			return err
 		}
 		sessionID = id
-		if !reacted {
-			reacted = true
-			defer func() { react(finalReaction) }()
-		}
+		reacted = true
 		// One turn, owned and collected by RunTurn: the needs-input glyph is
 		// the only channel-specific piece, delivered through the event hook.
 		res, err := m.RunTurn(ctx, TurnRequest{
@@ -1049,6 +1075,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 			UserText:    in.Text,
 			RequestID:   in.RequestID,
 			MessageID:   in.MsgID,
+			Ref:         ref,
 			Chat:        in.UserID,
 			Conv:        ConvMain,
 			Attachments: mediaAttachments(in),
@@ -1087,7 +1114,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		result = res.Text
 		break
 	}
-	if err := m.deliverReply(ctx, ch, in, sessionID, result, false, &replied); err != nil {
+	if err := m.deliverReply(ctx, ch, in, sessionID, ref, result, false, &replied); err != nil {
 		return err
 	}
 	finalReaction = channel.ReactionDone
@@ -1098,7 +1125,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 // wrist: the proposed replies come off, a long answer goes out as the full
 // text first (silent) and then the summary. Both halves name the inbound
 // message (InReplyTo). replied is set once any part was delivered.
-func (m *Manager) deliverReply(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, sessionID, result string, finalOnly bool, replied *bool) error {
+func (m *Manager) deliverReply(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, sessionID, ref, result string, finalOnly bool, replied *bool) error {
 	if result == "" {
 		result = "(no result)"
 	}
@@ -1124,7 +1151,7 @@ func (m *Manager) deliverReply(ctx context.Context, ch channel.Adapter, in chann
 		*replied = true
 		if m.log != nil {
 			_ = m.log.Append("outbound", map[string]string{
-				"session": sessionID, "chat": in.UserID, "msg_id": rcpt.ID, "text": text, "rec": recTurn,
+				"session": sessionID, "chat": in.UserID, "msg_id": rcpt.ID, "text": text, "rec": recTurn, "ref": ref,
 			})
 		}
 		return nil
@@ -1142,7 +1169,7 @@ func (m *Manager) deliverReply(ctx context.Context, ch channel.Adapter, in chann
 // finalOnly sends only the last part (the long half is already delivered).
 func (m *Manager) DeliverStored(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, sessionID, result string, finalOnly bool) error {
 	replied := false
-	if err := m.deliverReply(ctx, ch, in, sessionID, result, finalOnly, &replied); err != nil {
+	if err := m.deliverReply(ctx, ch, in, sessionID, "", result, finalOnly, &replied); err != nil {
 		return err
 	}
 	if in.MsgID != "" {

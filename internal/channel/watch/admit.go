@@ -14,6 +14,7 @@ package watch
 
 import (
 	"errors"
+	"log"
 
 	"github.com/kjhnns/agentd/internal/channel"
 )
@@ -61,8 +62,13 @@ func (s *Store) lookupLocked(requestID string) (Message, bool) {
 // Admit stores a new user message (or re-admits a rejected request) and
 // offers its inbound payload to the queue, all under the store lock. msg must
 // carry Role, Kind, Text and its RequestID ("" = no idempotency); in is the
-// inbound payload (its MsgID is set here). offer must not block.
-func (s *Store) Admit(msg Message, in channel.InboundMsg, offer func(channel.InboundMsg) bool) (Message, AdmitOutcome, error) {
+// inbound payload (its MsgID is set here). room reports whether the queue
+// has space; offer must not block. Admit is the only sender to the queue
+// while the HTTP surface serves, so room() under the store lock guarantees
+// the offer: a full queue is decided BEFORE anything is written, and a
+// request is stored either queued (and offered) or rejected, never queued on
+// disk but rejected in the answer.
+func (s *Store) Admit(msg Message, in channel.InboundMsg, room func() bool, offer func(channel.InboundMsg) bool) (Message, AdmitOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.broken != nil {
@@ -83,23 +89,34 @@ func (s *Store) Admit(msg Message, in channel.InboundMsg, offer func(channel.Inb
 	}
 	in.MsgID = msg.ID
 	msg.Role = RoleUser
+	if !room() {
+		// The queue is full. A request with an id can be retried and is
+		// stored rejected; one without (an old client) is stored failed, as
+		// before. Nothing is queued, on disk or in memory.
+		msg.Status = StatusFailed
+		if msg.RequestID != "" {
+			msg.Status = StatusRejected
+		}
+		msg.Inbound = nil
+		stored, err := s.appendDurable(msg, true)
+		if err != nil {
+			return Message{}, Rejected, errors.Join(ErrPersist, err)
+		}
+		return stored, Rejected, nil
+	}
 	msg.Status = StatusQueued
 	msg.Inbound = &in
 	stored, err := s.appendDurable(msg, true)
 	if err != nil {
 		return Message{}, Rejected, errors.Join(ErrPersist, err)
 	}
-	if offer(in) {
-		return stored, Admitted, nil
+	if !offer(in) {
+		// Cannot happen while Admit is the only sender (room was checked
+		// under the lock). The request stays queued on disk and in memory, so
+		// the restart reconciliation runs it; the client sees it accepted.
+		log.Printf("watch: queue full after the room check; %s stays queued until the next start", stored.ID)
 	}
-	// The queue is full. A request with an id can be retried and is marked
-	// rejected; one without (an old client) fails, as before.
-	stored.Status = StatusFailed
-	if msg.RequestID != "" {
-		stored.Status = StatusRejected
-	}
-	stored.Inbound = nil
-	return s.appendLocked(stored), Rejected, nil
+	return stored, Admitted, nil
 }
 
 // Unfinished returns the user messages whose turn is not finished (queued,

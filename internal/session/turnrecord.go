@@ -35,6 +35,7 @@ type TurnRecord struct {
 	TurnID            string           `json:"turn_id"`
 	RequestID         string           `json:"request_id,omitempty"`
 	MessageID         string           `json:"message_id,omitempty"`
+	Ref               string           `json:"ref,omitempty"`
 	Chat              string           `json:"chat,omitempty"`
 	Conv              string           `json:"conv,omitempty"`
 	ConversationEpoch uint64           `json:"conversation_epoch"`
@@ -115,6 +116,7 @@ func (m *Manager) writeTurnRecord(s *Session, req TurnRequest, res TurnResult, e
 		TurnID:            res.TurnID,
 		RequestID:         req.RequestID,
 		MessageID:         req.MessageID,
+		Ref:               req.Ref,
 		Chat:              req.Chat,
 		Conv:              conv,
 		ConversationEpoch: m.conversationEpoch(req.Chat, conv),

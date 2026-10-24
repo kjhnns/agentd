@@ -71,6 +71,11 @@ func (l *turnLock) Unlock() {
 	}
 }
 
+// ErrNoResult means a structured harness finished a turn without a result
+// the pump could read: the answer is unknown, which is a failure, never an
+// empty success.
+var ErrNoResult = errors.New("the harness reported no result for the turn")
+
 // ErrSessionGone means the session was reclaimed or removed while the turn
 // waited for it. The caller resolves (or creates) the session again.
 var ErrSessionGone = errors.New("session is gone")
@@ -92,8 +97,11 @@ type TurnRequest struct {
 	// UserText is what the user wrote, for the turn record. "" = Text.
 	UserText string
 	// Identity of the message that started the turn (all optional).
-	RequestID   string
-	MessageID   string
+	RequestID string
+	MessageID string
+	// Ref ties the turn record to the inbound/outbound run-log records of
+	// the same message (RouteInbound).
+	Ref         string
 	Chat        string
 	Conv        string
 	Attachments []TurnAttachment
@@ -178,6 +186,7 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 	s.mu.Lock()
 	s.curTurn = turnID
 	s.turnTerminal = terminal
+	s.turnOut, s.turnRes, s.turnGot = "", "", false
 	s.running = true
 	s.status = harness.StatusThinking
 	handle := s.handle
@@ -199,6 +208,7 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 	var text string
 	var turnErr error
 	sendDone := false
+	gotResult := false
 	if req.NoCollect {
 		select {
 		case turnErr = <-sendErr:
@@ -211,7 +221,7 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 		if structured {
 			termC = terminal
 		}
-		text, turnErr, sendDone = m.collect(ctx, s, turnID, termC, events, sendErr, req.Options)
+		text, turnErr, sendDone, gotResult = m.collect(ctx, s, turnID, termC, events, sendErr, req.Options)
 	}
 	switch {
 	case !sendDone || ctx.Err() != nil || errors.Is(turnErr, context.Canceled) || errors.Is(turnErr, context.DeadlineExceeded):
@@ -236,6 +246,19 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 			log.Printf("session %s: turn %s: terminal event not drained after %s; replacing the process to fence it", id, turnID, drainWait)
 			if err := m.replaceProcessLocked(context.Background(), s, "undrained turn"); err != nil {
 				log.Printf("session %s: replace after an undrained turn failed: %v", id, err)
+			}
+		}
+		if turnErr == nil && !req.NoCollect && !gotResult {
+			// The bus is lossy (a full subscriber drops events); the pump's
+			// own record of the turn is not. No result there either means
+			// the answer is unknown: a failure, not an empty success.
+			s.mu.Lock()
+			got, res := s.turnGot, s.turnRes
+			s.mu.Unlock()
+			if got {
+				text = res
+			} else {
+				turnErr = fmt.Errorf("session %s: %w", id, ErrNoResult)
 			}
 		}
 	}
@@ -330,11 +353,10 @@ func (m *Manager) abortTurn(s *Session, handle harness.Handle, sendErr <-chan er
 
 // collect drains the bus for ONE turn. It returns the user-visible result,
 // the turn error, and whether the harness send has returned.
-func (m *Manager) collect(ctx context.Context, s *Session, turnID string, terminal <-chan struct{}, events <-chan eventbus.Event, sendErr <-chan error, opt TurnOptions) (string, error, bool) {
+func (m *Manager) collect(ctx context.Context, s *Session, turnID string, terminal <-chan struct{}, events <-chan eventbus.Event, sendErr <-chan error, opt TurnOptions) (text string, err error, sendDone, gotResult bool) {
 	id := s.ID
 	started := time.Now()
 	var result, lastOutput string
-	gotResult := false
 	steps := 0
 	lastStep := ""
 	lastProgress := started
@@ -401,7 +423,7 @@ func (m *Manager) collect(ctx context.Context, s *Session, turnID string, termin
 	// abandon builds the timeout error. The PARTIAL work is not thrown away: the
 	// last streamed output and a count of completed steps ride along so the user
 	// is told what was accomplished instead of getting a bare error.
-	abandon := func(ceiling bool) (string, error, bool) {
+	abandon := func(ceiling bool) (string, error, bool, bool) {
 		te := &TurnTimeoutError{
 			SessionID: id,
 			Ceiling:   ceiling,
@@ -415,7 +437,7 @@ func (m *Manager) collect(ctx context.Context, s *Session, turnID string, termin
 		if ceiling {
 			te.Budget = opt.Ceiling
 		}
-		return lastOutput, te, false
+		return lastOutput, te, false, gotResult
 	}
 
 	for {
@@ -424,7 +446,7 @@ func (m *Manager) collect(ctx context.Context, s *Session, turnID string, termin
 			handle(e)
 		case err := <-sendErr:
 			if err != nil {
-				return "", err, true
+				return "", err, true, gotResult
 			}
 			// Send returning can race the bus delivery of the turn's events;
 			// drain until the result event lands so the reply is not built
@@ -444,18 +466,18 @@ func (m *Manager) collect(ctx context.Context, s *Session, turnID string, termin
 					terminal = nil
 					grace = time.After(resultGrace)
 				case <-grace:
-					return result, nil, true
+					return result, nil, true, gotResult
 				case <-ctx.Done():
-					return "", ctx.Err(), true
+					return "", ctx.Err(), true, gotResult
 				}
 			}
-			return result, nil, true
+			return result, nil, true, gotResult
 		case <-quietC:
 			return abandon(false)
 		case <-ceilingC:
 			return abandon(true)
 		case <-ctx.Done():
-			return "", ctx.Err(), false
+			return "", ctx.Err(), false, gotResult
 		}
 	}
 }

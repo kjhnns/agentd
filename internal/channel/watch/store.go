@@ -15,6 +15,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -250,12 +251,7 @@ func (s *Store) replay() (int, int, error) {
 		line, rerr := readLine(r, maxLineBytes)
 		if line != nil {
 			var m Message
-			if len(line) <= maxLineBytes && json.Unmarshal(line, &m) == nil && m.ID == "" && m.Evicted && m.Seq > 0 {
-				// The seq high-water mark compaction keeps (see compact).
-				if m.Seq > s.seq {
-					s.seq = m.Seq
-				}
-			} else if len(line) > maxLineBytes || json.Unmarshal(line, &m) != nil || m.ID == "" {
+			if len(line) > maxLineBytes || json.Unmarshal(line, &m) != nil || m.ID == "" {
 				skipped++
 			} else {
 				n++
@@ -324,15 +320,25 @@ func (s *Store) compact() error {
 		return err
 	}
 	w := bufio.NewWriter(f)
-	// The seq high-water mark first: the snapshot that holds the highest seq
-	// may be one compaction drops, and a seq that went down on reopen would
-	// make a client (which keeps max(cursor)) skip new messages. An id-less
-	// line: replay of an older binary skips it.
-	hw, _ := json.Marshal(Message{Seq: s.seq, Evicted: true})
-	w.Write(hw)
-	w.WriteByte('\n')
-	// The request index of messages no longer in the conversation goes next,
-	// marked evicted, so dedupe survives compaction and restart (D5b).
+	// The seq high-water mark: the snapshot that holds the highest seq may be
+	// one compaction drops, and a seq that went down on reopen would make a
+	// client (which keeps max(cursor)) skip new messages. The newest kept
+	// snapshot is written with the high-water seq instead, an ordinary record
+	// an older binary also counts (its change seq only moves forward).
+	if len(s.order) > 0 {
+		newest := s.order[0]
+		for _, id := range s.order {
+			if s.latest[id].Seq > s.latest[newest].Seq {
+				newest = id
+			}
+		}
+		if m := s.latest[newest]; m.Seq < s.seq {
+			m.Seq = s.seq
+			s.latest[newest] = m
+		}
+	}
+	// The request index of messages no longer in the conversation goes
+	// first, marked evicted, so dedupe survives compaction and restart (D5b).
 	for _, m := range s.evictedRequests() {
 		m.Evicted = true
 		b, _ := json.Marshal(m)
@@ -436,6 +442,9 @@ func (s *Store) appendDurable(m Message, strict bool) (Message, error) {
 // file is cut back to its previous size so a partial line cannot glue onto
 // the next record.
 func (s *Store) writeLocked(m Message) error {
+	if s.broken != nil {
+		return fmt.Errorf("watch store is in an uncertain state after a failed write (restart to recover): %w", s.broken)
+	}
 	if s.failWrite != nil {
 		if err := s.failWrite(); err != nil {
 			return err
@@ -448,29 +457,29 @@ func (s *Store) writeLocked(m Message) error {
 	if err != nil {
 		return err
 	}
-	var size int64 = -1
-	if st, err := s.f.Stat(); err == nil {
-		size = st.Size()
-	}
-	if _, err := s.f.Write(append(b, '\n')); err != nil {
-		if size >= 0 {
-			_ = s.f.Truncate(size)
-		}
+	st, err := s.f.Stat()
+	if err != nil {
 		return err
 	}
-	err = s.f.Sync()
-	if err == nil && s.failSync != nil {
-		err = s.failSync()
+	size := st.Size()
+	_, err = s.f.Write(append(b, '\n'))
+	if err == nil {
+		err = s.f.Sync()
+		if err == nil && s.failSync != nil {
+			err = s.failSync()
+		}
 	}
 	if err != nil {
-		// The line may be on disk although the sync failed: cut it back, or
-		// stop admitting when that is not possible either.
-		if size < 0 {
-			s.broken = err
-		} else if terr := s.f.Truncate(size); terr != nil {
+		// The line may be (partly) on disk: cut it back and sync that. When
+		// this fails too, the file state is uncertain and every further write
+		// is refused until a restart replays the file as it is.
+		if terr := s.f.Truncate(size); terr != nil {
 			s.broken = terr
 		} else if serr := s.f.Sync(); serr != nil {
 			s.broken = serr
+		}
+		if s.broken != nil {
+			log.Printf("watch store: rollback of a failed write failed: %v; refusing writes until restart", s.broken)
 		}
 		return err
 	}
@@ -552,10 +561,20 @@ func (s *Store) trimLocked() {
 	if len(s.order) <= s.maxIDs {
 		return
 	}
+	// Protected: an unfinished user message, any message answering one, and
+	// the record just written. When everything is protected the store
+	// overflows for a while and trims once those requests finish.
+	open := map[string]bool{}
+	for _, id := range s.order {
+		if inFlight(s.latest[id]) {
+			open[id] = true
+		}
+	}
 	keep := make([]string, 0, len(s.order))
 	excess := len(s.order) - s.maxIDs
 	for _, id := range s.order {
-		if excess > 0 && !inFlight(s.latest[id]) {
+		m := s.latest[id]
+		if excess > 0 && !open[id] && !open[m.ReplyTo] && m.Seq != s.seq {
 			delete(s.latest, id)
 			excess--
 			continue

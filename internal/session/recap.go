@@ -169,6 +169,7 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 	// in epoch 0.
 	epoch := uint64(0)
 	turnMsgs := map[string]bool{} // message ids a turn record covers
+	turnRefs := map[string]bool{} // inbound/outbound refs a turn record covers
 	if chatID != "" {
 		for _, rec := range recs {
 			switch rec.Type {
@@ -177,6 +178,9 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 				if json.Unmarshal(rec.Data, &tr) == nil && tr.Chat == chatID {
 					if tr.MessageID != "" {
 						turnMsgs[tr.MessageID] = true
+					}
+					if tr.Ref != "" {
+						turnRefs[tr.Ref] = true
 					}
 				}
 			case "conversation_start":
@@ -188,7 +192,15 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 			}
 		}
 	}
-	legacy := func(marker string) bool { return epoch == 0 && marker != recTurn }
+	// A record marked rec="turn" is skipped when its turn record exists (the
+	// turn record carries it); without one (the turn record write failed) it
+	// is read like a legacy record. Legacy records count only in epoch 0.
+	legacy := func(marker, ref string) bool {
+		if marker == recTurn && (ref == "" || turnRefs[ref]) {
+			return false
+		}
+		return epoch == 0
+	}
 
 	var out []recapMsg
 	for _, rec := range recs {
@@ -219,8 +231,9 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 				Text    string `json:"text"`
 				MsgID   string `json:"msg_id"`
 				Rec     string `json:"rec"`
+				Ref     string `json:"ref"`
 			}
-			if json.Unmarshal(rec.Data, &in) != nil || !legacy(in.Rec) {
+			if json.Unmarshal(rec.Data, &in) != nil || !legacy(in.Rec, in.Ref) {
 				continue
 			}
 			// The wrist shares the Telegram chat's session (share_session), so
@@ -240,11 +253,12 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 				Text    string `json:"text"`
 				MsgID   string `json:"msg_id"`
 				Rec     string `json:"rec"`
+				Ref     string `json:"ref"`
 			}
 			if json.Unmarshal(rec.Data, &ob) != nil {
 				continue
 			}
-			if chatID != "" && !legacy(ob.Rec) {
+			if chatID != "" && !legacy(ob.Rec, ob.Ref) {
 				continue
 			}
 			// Either anchor is sufficient: the chat id (survives session churn)
