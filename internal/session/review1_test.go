@@ -331,3 +331,17 @@ func TestNoFailedWithoutItsNotice(t *testing.T) {
 		}
 	}
 }
+
+// TestRecapKeepsTheSummaryOfALongAnswer (review round 6): the summary of a
+// split answer is its own recap entry, so a long body cannot cut it.
+func TestRecapKeepsTheSummaryOfALongAnswer(t *testing.T) {
+	const chat = "42"
+	long := strings.Repeat("detail ", 400)
+	path := writeThread(t, []func(*runlog.Log){
+		turnRec(TurnRecord{TurnID: "t1", Chat: chat, Conv: ConvMain, UserText: "plan?", Result: long + "\n" + SummaryMarker + "\nPick 1 or 2?"}),
+	})
+	got, _ := ThreadRecap(path, "telegram:"+chat, RecapPolicy{}, time.Now().UTC())
+	if !strings.Contains(got, "Pick 1 or 2?") {
+		t.Fatalf("summary lost:\n%s", got)
+	}
+}

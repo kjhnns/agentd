@@ -136,3 +136,26 @@ func TestReconcileReportsARecordedFailure(t *testing.T) {
 		t.Fatalf("found=%v status=%s", found, m.Status)
 	}
 }
+
+// TestUnfinishedIsInAdmissionOrder (review round 6): a re-admitted request
+// is re-enqueued after the requests admitted before its retry.
+func TestUnfinishedIsInAdmissionOrder(t *testing.T) {
+	a, st := newAdapter(t)
+	for i := 0; i < cap(a.inbound); i++ {
+		postJSON(t, a, `{"text":"fill"}`)
+	}
+	postJSON(t, a, `{"text":"A","request_id":"A"}`) // rejected
+	drainInbound(a)
+	for _, m := range st.Unfinished() {
+		_ = a.Ack("", m.ID, channel.ReactionDone)
+	}
+	postJSON(t, a, `{"text":"B","request_id":"B"}`)
+	postJSON(t, a, `{"text":"A","request_id":"A"}`) // re-admitted after B
+	var order []string
+	for _, m := range st.Unfinished() {
+		order = append(order, m.Text)
+	}
+	if strings.Join(order, ",") != "B,A" {
+		t.Fatalf("restart order = %v, want B,A", order)
+	}
+}

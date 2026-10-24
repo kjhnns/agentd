@@ -15,6 +15,7 @@ package watch
 import (
 	"errors"
 	"log"
+	"sort"
 
 	"github.com/kjhnns/agentd/internal/channel"
 )
@@ -120,8 +121,9 @@ func (s *Store) Admit(msg Message, in channel.InboundMsg, room func() bool, offe
 }
 
 // Unfinished returns the user messages whose turn is not finished (queued,
-// working, needs_input), in conversation order. Used by the restart
-// reconciliation.
+// working, needs_input), in admission order: by the seq of their current
+// snapshot (a queued request's snapshot is its admission, also for a
+// re-admitted one). Used by the restart reconciliation.
 func (s *Store) Unfinished() []Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -131,6 +133,7 @@ func (s *Store) Unfinished() []Message {
 			out = append(out, m)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
 	return out
 }
 

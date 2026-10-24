@@ -377,7 +377,10 @@ func (m *Manager) pump(s *Session, h harness.Handle, gen uint64) {
 				s.turnTerminal = nil
 			}
 		} else {
-			e.TurnID = ""
+			// A replaced process still draining: its events are stale for
+			// every reader (collector, web UI, session WebSocket, run-log).
+			s.mu.Unlock()
+			continue
 		}
 		s.mu.Unlock()
 		m.bus.Publish(e)

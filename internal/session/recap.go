@@ -219,7 +219,11 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 			out = append(out, recapMsg{TS: rec.TS, Role: "user", Text: tr.UserText, MsgID: tr.MessageID})
 			switch {
 			case tr.Error == "" && strings.TrimSpace(tr.Result) != "":
-				out = append(out, recapMsg{TS: rec.TS, Role: "agent", Text: recapResult(tr.Result)})
+				// A split answer is two entries, as the user got it, so the
+				// truncation of a long body cannot cut the summary.
+				for _, part := range recapResult(tr.Result) {
+					out = append(out, recapMsg{TS: rec.TS, Role: "agent", Text: part})
+				}
 			case tr.Error != "":
 				// The failure notice of this turn is skipped (its ref is
 				// covered); the turn record carries what the user was told.
@@ -299,15 +303,15 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 }
 
 // recapResult is the answer of a turn as the user saw it: without the
-// proposed-replies trailer and the marker line; a split reply keeps both
+// proposed-replies trailer and the marker line; a split reply is its two
 // halves (the summary can hold the question the user answers next).
-func recapResult(result string) string {
+func recapResult(result string) []string {
 	clean, _ := ExtractReplies(result)
 	body, summary := SplitReply(clean, 1<<20)
 	if summary != "" {
-		return body + "\n\n" + summary
+		return []string{body, summary}
 	}
-	return body
+	return []string{body}
 }
 
 // renderRecap turns reconstructed messages into the injected block, applying
