@@ -284,3 +284,31 @@ func TestFreshStartArtifactSurvivesACrashBeforeTheTurnRecord(t *testing.T) {
 		t.Fatalf("recap = %q", got)
 	}
 }
+
+// TestConversationStartCarriesEveryFirstTurnAttachment: a context_conv
+// attachment of the first turn is durable with the epoch too.
+func TestConversationStartCarriesEveryFirstTurnAttachment(t *testing.T) {
+	mgr, _, s, rl := sideManager(t)
+	_, err := mgr.RunTurn(context.Background(), TurnRequest{
+		SessionID: s.ID, Text: "q", Chat: sideChat, Conv: "c", Side: true,
+		Attachments: []TurnAttachment{{Kind: "conv", ID: "other", Path: "/a/other.jsonl"}},
+		OnFresh: func() (string, []TurnAttachment, error) {
+			return "P", []TurnAttachment{{Kind: "conv", ID: "c", Path: "/a/c.jsonl"}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs, _ := runlog.Replay(rl.Path())
+	for _, r := range recs {
+		if r.Type == "conversation_start" {
+			var cs conversationStart
+			_ = json.Unmarshal(r.Data, &cs)
+			if len(cs.Attachments) != 2 {
+				t.Fatalf("start attachments = %+v", cs.Attachments)
+			}
+			return
+		}
+	}
+	t.Fatal("no conversation_start")
+}

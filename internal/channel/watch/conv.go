@@ -146,18 +146,10 @@ func (s *Store) archiveLocked(m Message) error {
 	if !ValidConvID(conv) {
 		return fmt.Errorf("conversation id %q cannot name an archive file", conv)
 	}
-	if _, err := os.Stat(s.archiveDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(s.archiveDir, 0o700); err != nil {
-			return err
-		}
-		// The new directory entry must be durable before anything in it
-		// counts as archived.
-		if err := syncDir(filepath.Dir(s.archiveDir)); err != nil {
-			return err
-		}
+	if err := os.MkdirAll(s.archiveDir, 0o700); err != nil {
+		return err
 	}
 	path := filepath.Join(s.archiveDir, conv+".jsonl")
-	_, statErr := os.Stat(path)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -184,12 +176,16 @@ func (s *Store) archiveLocked(m Message) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if os.IsNotExist(statErr) {
-		// A new archive file: its directory entry must be durable before
-		// the eviction (and a later compaction) drops the live snapshot.
-		if err := syncDir(s.archiveDir); err != nil {
-			return err
-		}
+	// The directory entries (archive dir, archive file) must be durable
+	// before the eviction (and a later compaction) drops the live snapshot.
+	// Synced on every archive write, not only on creation, so a failed sync
+	// is retried instead of skipped. Eviction is rare (beyond 500 per
+	// conversation).
+	if err := syncDir(filepath.Dir(s.archiveDir)); err != nil {
+		return err
+	}
+	if err := syncDir(s.archiveDir); err != nil {
+		return err
 	}
 	s.archived[m.ID] = m.Seq
 	s.archivedConv[m.ID] = conv
@@ -395,7 +391,8 @@ func (s *Store) ensureConvLocked(id, firstText string) error {
 // (live, or evicted into the archive).
 func (s *Store) hasUserMessageLocked(id string) bool {
 	for _, oid := range s.order {
-		if m := s.latest[oid]; m.Role == RoleUser && convOf(m) == id {
+		// A rejected request was never admitted (the queue was full).
+		if m := s.latest[oid]; m.Role == RoleUser && convOf(m) == id && m.Status != StatusRejected {
 			return true
 		}
 	}
@@ -550,19 +547,24 @@ func (s *Store) Conversations(archived bool, before string, limit int) ([]ConvIn
 	if !archived && before == "" {
 		out = append(out, *rows[ConvMain])
 		room--
-		if room < 1 {
-			room = 1
-		}
 	}
 	next := ""
 	if len(list) > room {
 		list = list[:room]
-		last := list[len(list)-1]
-		next = encodeConvCursor(last.LastTS, last.ID)
+		if room == 0 {
+			// Only main fit: the next page starts at the first side row.
+			next = encodeConvCursor(cursorStart, "")
+		} else {
+			last := list[len(list)-1]
+			next = encodeConvCursor(last.LastTS, last.ID)
+		}
 	}
 	out = append(out, list...)
 	return out, next, nil
 }
+
+// cursorStart sorts before every real row (newest first).
+var cursorStart = time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
 
 func convLess(a, b ConvInfo) bool {
 	if !a.LastTS.Equal(b.LastTS) {
@@ -583,7 +585,7 @@ func decodeConvCursor(c string) (time.Time, string, error) {
 		raw = b
 	}
 	tsPart, id, ok := strings.Cut(string(raw), ",")
-	if !ok || !ValidConvID(id) {
+	if !ok || (id != "" && !ValidConvID(id)) {
 		return time.Time{}, "", ErrBadCursor
 	}
 	ts, err := time.Parse(time.RFC3339Nano, tsPart)

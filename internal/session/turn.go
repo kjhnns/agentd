@@ -358,7 +358,10 @@ func (m *Manager) maybeStartConversation(ctx context.Context, s *Session, req *T
 	if err := m.replaceProcess(ctx, s, "fresh conversation", false); err != nil {
 		return err
 	}
-	epoch, err := m.startConversation(req.Chat, conv, atts)
+	// Every attachment of the first turn (its own transcript and a
+	// context_conv) is durable with the epoch.
+	startAtts := append(append([]TurnAttachment(nil), req.Attachments...), atts...)
+	epoch, err := m.startConversation(req.Chat, conv, startAtts)
 	if err != nil {
 		// The process is fresh but the epoch did not move: replace it again
 		// with the recap of the epoch that is still current, so the window

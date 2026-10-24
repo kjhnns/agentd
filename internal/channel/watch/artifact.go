@@ -46,6 +46,9 @@ func (a *Adapter) WithArtifacts(dir string, forbidden ...string) error {
 	if err := os.Chmod(abs, 0o700); err != nil {
 		return err
 	}
+	if err := syncDir(filepath.Dir(abs)); err != nil {
+		return err
+	}
 	canon, err := filepath.EvalSymlinks(abs)
 	if err != nil {
 		return err
@@ -159,6 +162,11 @@ func (a *Adapter) ExportConv(conv, excludeMsgID string) (channel.ConvArtifact, b
 	}
 	if cerr := f.Close(); werr == nil {
 		werr = cerr
+	}
+	if werr == nil {
+		// The directory entry too: a durable conversation_start may point
+		// at this file.
+		werr = syncDir(a.artifactDir)
 	}
 	if werr != nil {
 		_ = os.Remove(path)

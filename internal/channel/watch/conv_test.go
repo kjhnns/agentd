@@ -241,3 +241,30 @@ func TestUpsertConvValidation(t *testing.T) {
 		t.Fatalf("unknown: %v", err)
 	}
 }
+
+// TestConversationsPagingLimitOne: the limit is honoured with main on the
+// first page; the cursor then starts at the first side conversation.
+func TestConversationsPagingLimitOne(t *testing.T) {
+	st, _ := OpenStore("")
+	for _, id := range []string{"x1", "x2"} {
+		if _, err := st.UpsertConv(id, ConvPatch{}, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var seen []string
+	cursor := ""
+	for i := 0; i < 5; i++ {
+		rows, next, err := st.Conversations(false, cursor, 1)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("page %d: %v %v", i, rows, err)
+		}
+		seen = append(seen, rows[0].ID)
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	if len(seen) != 3 || seen[0] != "main" {
+		t.Fatalf("pages = %v", seen)
+	}
+}

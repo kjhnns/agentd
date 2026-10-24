@@ -398,3 +398,20 @@ func TestReviewRound1Fixes(t *testing.T) {
 		}
 	})
 }
+
+// TestRejectedFirstMessageDoesNotPinTheTitle: a request refused for a full
+// queue was never admitted; the next admitted one names the conversation.
+func TestRejectedFirstMessageDoesNotPinTheTitle(t *testing.T) {
+	a, st := newAdapter(t)
+	for len(a.inbound) < cap(a.inbound) {
+		a.inbound <- channel.InboundMsg{}
+	}
+	if code, _, _ := postJSON(t, a, `{"text":"Discard this","conv":"r1","request_id":"rr"}`); code != http.StatusServiceUnavailable {
+		t.Fatalf("code = %d", code)
+	}
+	drainInbound(a)
+	postJSON(t, a, `{"text":"Actual question","conv":"r1"}`)
+	if info, _ := st.ConvInfo("r1"); info.Title != "Actual question" {
+		t.Fatalf("title = %q", info.Title)
+	}
+}
