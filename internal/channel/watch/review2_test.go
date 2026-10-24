@@ -159,3 +159,44 @@ func TestUnfinishedIsInAdmissionOrder(t *testing.T) {
 		t.Fatalf("restart order = %v, want B,A", order)
 	}
 }
+
+// TestPagingAfterCompaction (review round 7): after a compaction the file
+// holds snapshots in conversation order; paging from a cursor must still
+// return every later change and not report a reset.
+func TestPagingAfterCompaction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "watch.jsonl")
+	st, _ := OpenStore(path)
+	a := st.Append(Message{Role: RoleSystem, Kind: KindNotice, Text: "A"})
+	st.Append(Message{Role: RoleSystem, Kind: KindNotice, Text: "B"})
+	c := st.Append(Message{Role: RoleSystem, Kind: KindNotice, Text: "C"})
+	st.Append(Message{Role: RoleSystem, Kind: KindNotice, Text: "D"})
+	st.Update(a.ID, func(m *Message) bool { m.Text = "A2"; return true }) // A is now the newest change
+	st.Close()
+	st1, err := openStore(path, 1) // compacts: A first in the file, with the highest seq
+	if err != nil {
+		t.Fatal(err)
+	}
+	st1.Close()
+	st2, err := OpenStore(path) // replays the compacted file
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	cursor := c.Seq
+	for i := 0; i < 5; i++ {
+		msgs, next, reset, more := st2.SincePage(cursor, 1)
+		if reset {
+			t.Fatalf("reset after compaction at cursor %d", cursor)
+		}
+		for _, m := range msgs {
+			seen[m.Text] = true
+		}
+		cursor = next
+		if !more {
+			break
+		}
+	}
+	if !seen["D"] || !seen["A2"] {
+		t.Fatalf("seen = %v, want D and A2", seen)
+	}
+}

@@ -185,6 +185,10 @@ func openStoreWith(path string, compactAt, maxIDs int) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The change history must be in seq order: a compacted file holds the
+	// snapshots in conversation order, and the reset floor of SincePage is
+	// the first entry's seq.
+	sort.SliceStable(s.log, func(i, j int) bool { return s.log[i].Seq < s.log[j].Seq })
 	if skipped > 0 {
 		log.Printf("watch store: skipped %d unreadable or oversized line(s) in %s", skipped, path)
 	}
@@ -359,7 +363,16 @@ func (s *Store) compact() error {
 		return err
 	}
 	f.Close()
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	// Make the rename itself durable before any append lands in the new file.
+	dir, err := os.Open(filepath.Dir(s.path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 // Close releases the file.
