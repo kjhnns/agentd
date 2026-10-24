@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/kjhnns/agentd/internal/channel"
@@ -106,5 +107,32 @@ func TestCompactedFileKeepsTheHighWaterForAnOlderReader(t *testing.T) {
 	}
 	if max < n.Seq {
 		t.Fatalf("an older reader sees high-water %d, want >= %d", max, n.Seq)
+	}
+}
+
+// TestReconcileReportsARecordedFailure (review round 5): a committed failed
+// turn whose notice was lost gets its recorded cause, not "interrupted".
+func TestReconcileReportsARecordedFailure(t *testing.T) {
+	a, st := newAdapter(t)
+	_, w, _ := postJSON(t, a, `{"text":"q","request_id":"r"}`)
+	drainInbound(a)
+	_ = a.Ack("", w.ID, channel.ReactionWorking)
+	a.Reconcile(context.Background(),
+		func(string, string) (CommittedTurn, bool) {
+			return CommittedTurn{Error: "turn timed out", Result: "two trains found"}, true
+		},
+		func(context.Context, channel.InboundMsg, string, string, bool) error { return nil })
+	msgs, _, _ := st.Tail(10)
+	found := false
+	for _, m := range msgs {
+		if m.Kind == KindFailure && m.ReplyTo == w.ID {
+			found = true
+			if m.Text == InterruptedNotice || !strings.Contains(m.Text, "turn timed out") || !strings.Contains(m.Text, "two trains found") {
+				t.Fatalf("notice = %q", m.Text)
+			}
+		}
+	}
+	if m, _ := st.Get(w.ID); !found || m.Status != StatusFailed {
+		t.Fatalf("found=%v status=%s", found, m.Status)
 	}
 }

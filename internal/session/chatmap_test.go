@@ -59,8 +59,8 @@ func emitOnHandle(s *Session, e eventbus.Event) {
 	h.events <- e
 }
 
-// TestDispatchInOrder (review round 4): messages are handled strictly in
-// their queue order even though each runs on its own goroutine.
+// TestDispatchInOrder (review rounds 4 and 5): messages are handled
+// strictly in their queue order.
 func TestDispatchInOrder(t *testing.T) {
 	in := make(chan channel.InboundMsg, 50)
 	for i := 0; i < 50; i++ {

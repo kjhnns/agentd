@@ -299,10 +299,14 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 }
 
 // recapResult is the answer of a turn as the user saw it: without the
-// proposed-replies trailer, and the full body when the reply was split.
+// proposed-replies trailer and the marker line; a split reply keeps both
+// halves (the summary can hold the question the user answers next).
 func recapResult(result string) string {
 	clean, _ := ExtractReplies(result)
-	body, _ := SplitReply(clean, 1<<20)
+	body, summary := SplitReply(clean, 1<<20)
+	if summary != "" {
+		return body + "\n\n" + summary
+	}
 	return body
 }
 

@@ -3,6 +3,7 @@ package watch
 import (
 	"context"
 	"log"
+	"strings"
 
 	"github.com/kjhnns/agentd/internal/channel"
 )
@@ -65,6 +66,17 @@ func (a *Adapter) Reconcile(ctx context.Context,
 			// request stays unfinished and the next start tries again.
 			log.Printf("watch: reconcile %s: delivering the stored result failed (left for the next start): %v", m.ID, err)
 			continue
+		} else if ok && t.Error != "" && !a.hasFailure(m.ID) {
+			// The turn failed and its notice was lost in the restart: tell
+			// the recorded cause and any partial work, not "interrupted".
+			text := "This request failed: " + t.Error
+			if p := strings.TrimSpace(t.Result); p != "" {
+				text += "\n\nHere is what I had so far:\n" + p
+			}
+			if _, err := a.store.AppendDurable(Message{Role: RoleAgent, Kind: KindFailure, Text: text, ReplyTo: m.ID}); err != nil {
+				log.Printf("watch: reconcile %s: failure notice not stored: %v", m.ID, err)
+				continue
+			}
 		} else if !ok && m.Status == StatusQueued && m.Inbound != nil {
 			select {
 			case a.inbound <- in:
