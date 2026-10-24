@@ -312,3 +312,29 @@ func TestConversationStartCarriesEveryFirstTurnAttachment(t *testing.T) {
 	}
 	t.Fatal("no conversation_start")
 }
+
+// TestFailedFreshProcessStartRestoresTheOldConversation: when the fresh
+// process does not start, the old conversation gets a live process back
+// (with its recap) and its next message runs.
+func TestFailedFreshProcessStartRestoresTheOldConversation(t *testing.T) {
+	mgr, a, s, _ := sideManager(t)
+	if _, err := sideTurn(mgr, s, "a", "alpha question"); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	a.failStarts = 1
+	a.mu.Unlock()
+	if _, err := sideTurn(mgr, s, "b", "to b"); err == nil {
+		t.Fatal("the switch succeeded without a process")
+	}
+	if mgr.activeConversation(sideChat) != "a" {
+		t.Fatal("active moved")
+	}
+	starts := a.startedConfigs()
+	if !strings.Contains(starts[len(starts)-1].SystemPrompt, "alpha question") {
+		t.Fatal("the restored process has no recap of the old conversation")
+	}
+	if res, err := sideTurn(mgr, s, "a", "alpha again"); err != nil || res.Text != "re:alpha again" {
+		t.Fatalf("old conversation after a failed switch: %q %v", res.Text, err)
+	}
+}

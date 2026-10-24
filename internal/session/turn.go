@@ -356,6 +356,12 @@ func (m *Manager) maybeStartConversation(ctx context.Context, s *Session, req *T
 	// persisted only once the process runs, so a failed start leaves the old
 	// conversation and epoch active.
 	if err := m.replaceProcess(ctx, s, "fresh conversation", false); err != nil {
+		// The old process is gone: restore one with the recap of the epoch
+		// that is still current, so the next message of the old
+		// conversation finds a live process.
+		if rerr := m.replaceProcess(ctx, s, "restore after a failed fresh start", true); rerr != nil {
+			log.Printf("session %s: restore after a failed fresh start: %v", s.ID, rerr)
+		}
 		return err
 	}
 	// Every attachment of the first turn (its own transcript and a

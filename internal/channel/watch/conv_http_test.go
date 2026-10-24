@@ -415,3 +415,21 @@ func TestRejectedFirstMessageDoesNotPinTheTitle(t *testing.T) {
 		t.Fatalf("title = %q", info.Title)
 	}
 }
+
+// TestAnnouncingPutDoesNotSetTheTitle: the app announces a conversation
+// with PUT {} (or an empty title) before its first message; only a
+// non-empty title counts as set.
+func TestAnnouncingPutDoesNotSetTheTitle(t *testing.T) {
+	a, st := newAdapter(t)
+	for id, body := range map[string]string{"p1": `{}`, "p2": `{"title":""}`, "p3": `{"title":"   "}`, "p4": `{"title":"Named"}`} {
+		if rec := do(t, a.Handler(), http.MethodPut, "/watch/conversations/"+id, "wt", bytes.NewBufferString(body), "application/json"); rec.Code != 200 {
+			t.Fatalf("put %s: %d", id, rec.Code)
+		}
+		postJSON(t, a, `{"text":"first   words\nhere","conv":"`+id+`"}`)
+	}
+	for id, want := range map[string]string{"p1": "first words here", "p2": "first words here", "p3": "first words here", "p4": "Named"} {
+		if info, _ := st.ConvInfo(id); info.Title != want {
+			t.Fatalf("%s title = %q, want %q", id, info.Title, want)
+		}
+	}
+}

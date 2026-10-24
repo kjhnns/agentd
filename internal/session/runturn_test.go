@@ -25,6 +25,8 @@ type echoAdapter struct {
 	// keepOpen leaves a torn-down handle's event channel open, as a pump of
 	// a replaced process that still drains would see it.
 	keepOpen bool
+	// failStarts makes the next N Start calls fail.
+	failStarts int
 }
 
 func newEchoAdapter() *echoAdapter { return &echoAdapter{gates: map[string]chan struct{}{}} }
@@ -51,6 +53,11 @@ func (a *echoAdapter) Pressure(harness.Handle) harness.ContextPressure {
 }
 func (a *echoAdapter) Start(ctx context.Context, cfg harness.SessionConfig) (harness.Handle, error) {
 	a.mu.Lock()
+	if a.failStarts > 0 {
+		a.failStarts--
+		a.mu.Unlock()
+		return nil, errors.New("start failed")
+	}
 	a.started = append(a.started, cfg)
 	a.mu.Unlock()
 	return &scriptedHandle{id: cfg.SessionID, events: make(chan eventbus.Event, 64)}, nil

@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -98,6 +99,16 @@ func (s *Store) loadArchiveIndex() error {
 			return err
 		}
 	}
+	// What a crashed run wrote may still be only in the page cache (its
+	// sync failed and the eviction stopped). The index is trusted for
+	// eviction only once the files and the directory are durable; otherwise
+	// it is dropped and a snapshot is simply archived again (the export
+	// merges by id).
+	if err := syncDir(s.archiveDir); err != nil {
+		log.Printf("watch store: archive dir not durable (%v); archiving again as needed", err)
+		s.archived = map[string]int64{}
+		s.archivedConv = map[string]string{}
+	}
 	return nil
 }
 
@@ -107,6 +118,10 @@ func (s *Store) indexArchiveFile(path, conv string) error {
 		return err
 	}
 	defer f.Close()
+	if err := f.Sync(); err != nil {
+		log.Printf("watch store: archive %s not durable (%v); its snapshots are archived again as needed", path, err)
+		return nil
+	}
 	r := bufio.NewReaderSize(f, 64*1024)
 	for {
 		line, rerr := readLine(r, maxLineBytes)

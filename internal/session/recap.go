@@ -216,8 +216,8 @@ func threadTranscript(logPath, title string) ([]recapMsg, []TurnAttachment, erro
 	epoch := uint64(0)
 	activeConv := ConvMain
 	var startArts []TurnAttachment // attached by the current epoch's fresh start
-	turnMsgs := map[string]bool{} // message ids a turn record covers
-	turnRefs := map[string]bool{} // inbound/outbound refs a turn record covers
+	turnMsgs := map[string]bool{}  // message ids a turn record covers
+	turnRefs := map[string]bool{}  // inbound/outbound refs a turn record covers
 	if chatID != "" {
 		for _, rec := range recs {
 			switch rec.Type {
