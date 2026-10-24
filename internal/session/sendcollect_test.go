@@ -47,7 +47,12 @@ func (a *scriptedAdapter) Attach(ctx context.Context, existing string) (harness.
 	return &scriptedHandle{id: existing, events: make(chan eventbus.Event, 16)}, nil
 }
 func (a *scriptedAdapter) Teardown(h harness.Handle) error {
-	close(h.(*scriptedHandle).events)
+	// The event channel stays open: a test's emitter goroutine may still
+	// write to it after RunTurn replaced an abandoned turn's process, and a
+	// real adapter owns its channel itself. The old pump simply idles.
+	a.mu.Lock()
+	h.(*scriptedHandle).dead = true
+	a.mu.Unlock()
 	return nil
 }
 func (a *scriptedAdapter) Events(h harness.Handle) <-chan eventbus.Event {

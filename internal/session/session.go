@@ -132,6 +132,10 @@ type Manager struct {
 	// ilocks holds the per-workspace interactive locks (see locks.go).
 	ilockMu sync.Mutex
 	ilocks  map[string]*turnLock
+
+	// gcBeforeLock is a test hook: it runs in the GC sweep between reading a
+	// session's state and taking its locks.
+	gcBeforeLock func(*Session)
 }
 
 // Policy is the session-lifecycle + context-reset tuning (mirrors config

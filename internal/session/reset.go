@@ -206,26 +206,49 @@ func (m *Manager) gcSweep(ctx context.Context) {
 		s.mu.Lock()
 		handle := s.handle
 		last := s.lastActivity
+		gen := s.gen
 		s.mu.Unlock()
 
 		// Dead-process recovery: a fresh start from artifacts in place (a dead
 		// process cannot be checkpoint-flushed; the last committed artifacts are
 		// the recovery point). fresh-from-artifacts is always the safe fallback.
-		if s.adapter.Status(handle) == harness.StatusDead {
-			if unlock, ok := m.tryLockSession(s); ok {
-				m.recoverDead(ctx, s)
-				unlock()
-			}
+		dead := s.adapter.Status(handle) == harness.StatusDead
+		idle := m.Policy.IdleTimeout > 0 && time.Since(last) >= m.Policy.IdleTimeout
+		if !dead && !idle {
 			continue
 		}
-
-		if m.Policy.IdleTimeout > 0 && time.Since(last) >= m.Policy.IdleTimeout {
-			if unlock, ok := m.tryLockSession(s); ok {
+		if m.gcBeforeLock != nil {
+			m.gcBeforeLock(s)
+		}
+		unlock, ok := m.tryLockSession(s)
+		if !ok {
+			continue
+		}
+		// What was read above may be stale: a turn, a reset or a recovery can
+		// have run between the read and the lock. Act only when the session is
+		// still a member, on the same process generation and handle, with the
+		// same last activity, and the condition still holds.
+		if m.gcStillValid(s, handle, last, gen) {
+			switch {
+			case dead && s.adapter.Status(handle) == harness.StatusDead:
+				m.recoverDead(ctx, s)
+			case !dead && idle && time.Since(last) >= m.Policy.IdleTimeout:
 				m.reclaimIdle(ctx, s)
-				unlock()
 			}
 		}
+		unlock()
 	}
+}
+
+// gcStillValid re-checks, under the session's locks, what the sweep read
+// before taking them.
+func (m *Manager) gcStillValid(s *Session, handle harness.Handle, last time.Time, gen uint64) bool {
+	if cur, ok := m.Get(s.ID); !ok || cur != s {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.gen == gen && s.handle == handle && s.lastActivity.Equal(last)
 }
 
 // recoverDead restarts a dead session's process fresh from the workspace
