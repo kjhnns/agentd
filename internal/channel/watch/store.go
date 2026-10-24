@@ -19,6 +19,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -431,40 +432,47 @@ func (s *Store) Page(beforeID string, limit int) (msgs []Message, hasMore bool, 
 }
 
 // Since returns the newest snapshot of every message touched after seq
-// `after` (oldest first, at most limit). after <= 0 means "the tail of the
-// conversation" (the last limit distinct messages). reset is true when after
-// is older than what the in-memory log still covers: the caller gets the tail
-// and must replace, not merge, its local copy.
-func (s *Store) Since(after int64, limit int) (msgs []Message, latest int64, reset bool) {
+// `after` (oldest change first, at most limit) and the cursor to ask from
+// next. after <= 0 means "the tail of the conversation" (the last limit
+// distinct messages). reset is true when after is older than what the
+// in-memory log still covers: the caller gets the tail and must replace, not
+// merge, its local copy. See SincePage for the paging contract.
+func (s *Store) Since(after int64, limit int) (msgs []Message, cursor int64, reset bool) {
+	msgs, cursor, reset, _ = s.SincePage(after, limit)
+	return msgs, cursor, reset
+}
+
+// SincePage pages over the CHANGES after seq `after` (D3). Every message's
+// newest snapshot carries the seq of its last change; the snapshots changed
+// after `after` are sorted by that seq and the first limit are returned. The
+// cursor is the seq of the last returned snapshot when more remain (more is
+// true), else the store's high-water seq. A client that asks again from the
+// cursor therefore never skips a change: the old code returned the global
+// high-water seq even when the page was cut, and a message whose change sat
+// behind the cut was never seen.
+func (s *Store) SincePage(after int64, limit int) (msgs []Message, cursor int64, reset, more bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	limit = clampLimit(limit)
-	latest = s.seq
 	if after <= 0 {
 		out, _ := s.tailLocked(limit)
-		return out, latest, false
+		return out, s.seq, false, false
 	}
 	if len(s.log) > 0 && after < s.log[0].Seq-1 {
 		out, _ := s.tailLocked(limit)
-		return out, latest, true
+		return out, s.seq, true, false
 	}
-	seen := map[string]bool{}
-	out := []Message{}
-	for _, m := range s.log {
-		if m.Seq <= after || seen[m.ID] {
-			continue
-		}
-		cur, ok := s.latest[m.ID]
-		if !ok {
-			continue
-		}
-		seen[m.ID] = true
-		out = append(out, cur)
-		if len(out) >= limit {
-			break
+	changed := []Message{}
+	for _, id := range s.order {
+		if m := s.latest[id]; m.Seq > after {
+			changed = append(changed, m)
 		}
 	}
-	return out, latest, false
+	sort.Slice(changed, func(i, j int) bool { return changed[i].Seq < changed[j].Seq })
+	if len(changed) > limit {
+		return changed[:limit], changed[limit-1].Seq, false, true
+	}
+	return changed, s.seq, false, false
 }
 
 // Wait blocks until an append lands with seq > after, ctx ends, or d elapses.

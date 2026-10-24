@@ -480,10 +480,11 @@ func (a *Adapter) handleFetch(w http.ResponseWriter, r *http.Request) {
 	before := q.Get("before")
 
 	var (
-		msgs    []Message
-		latest  int64
-		reset   bool
-		hasMore bool
+		msgs        []Message
+		latest      int64
+		reset       bool
+		hasMore     bool
+		moreChanges bool
 	)
 	switch {
 	case before != "":
@@ -496,7 +497,7 @@ func (a *Adapter) handleFetch(w http.ResponseWriter, r *http.Request) {
 			}
 			a.store.Wait(r.Context(), after, d)
 		}
-		msgs, latest, reset = a.store.Since(after, limit)
+		msgs, latest, reset, moreChanges = a.store.SincePage(after, limit)
 		if reset {
 			// The client is being handed a fresh tail, so tell it whether
 			// older messages are still pageable.
@@ -508,13 +509,17 @@ func (a *Adapter) handleFetch(w http.ResponseWriter, r *http.Request) {
 	if msgs == nil {
 		msgs = []Message{}
 	}
+	// latest_seq is the cursor to ask from next. On an incremental read it is
+	// the seq of the last returned change when the page was cut
+	// (has_more_changes), so paging never skips a change (D3).
 	writeJSON(w, http.StatusOK, map[string]any{
-		"messages":    msgs,
-		"latest_seq":  latest,
-		"reset":       reset,
-		"has_more":    hasMore,
-		"pending":     a.store.Pending(),
-		"server_time": a.now(),
+		"messages":         msgs,
+		"latest_seq":       latest,
+		"reset":            reset,
+		"has_more":         hasMore,
+		"has_more_changes": moreChanges,
+		"pending":          a.store.Pending(),
+		"server_time":      a.now(),
 	})
 }
 
