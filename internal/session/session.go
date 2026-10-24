@@ -1029,6 +1029,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 			SessionID:   id,
 			Text:        m.RenderTurn(in),
 			UserText:    in.Text,
+			RequestID:   in.RequestID,
 			MessageID:   in.MsgID,
 			Chat:        in.UserID,
 			Conv:        ConvMain,
@@ -1055,7 +1056,18 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		result = res.Text
 		break
 	}
-	id := sessionID
+	if err := m.deliverReply(ctx, ch, in, sessionID, result, &replied); err != nil {
+		return err
+	}
+	finalReaction = channel.ReactionDone
+	return nil
+}
+
+// deliverReply sends a turn's result through the channel, shaped for the
+// wrist: the proposed replies come off, a long answer goes out as the full
+// text first (silent) and then the summary. Both halves name the inbound
+// message (InReplyTo). replied is set once any part was delivered.
+func (m *Manager) deliverReply(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, sessionID, result string, replied *bool) error {
 	if result == "" {
 		result = "(no result)"
 	}
@@ -1078,10 +1090,10 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		if serr != nil {
 			return serr
 		}
-		replied = true
+		*replied = true
 		if m.log != nil {
 			_ = m.log.Append("outbound", map[string]string{
-				"session": id, "chat": in.UserID, "msg_id": rcpt.ID, "text": text,
+				"session": sessionID, "chat": in.UserID, "msg_id": rcpt.ID, "text": text,
 			})
 		}
 		return nil
@@ -1091,9 +1103,18 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 			return err
 		}
 	}
-	if err := send(summaryOrWhole(body, summary), false, summary != ""); err != nil {
+	return send(summaryOrWhole(body, summary), false, summary != "")
+}
+
+// DeliverStored delivers the committed result of a turn whose reply was lost
+// in a restart (the wrist's reconciliation, D5) and marks the message done.
+func (m *Manager) DeliverStored(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, sessionID, result string) error {
+	replied := false
+	if err := m.deliverReply(ctx, ch, in, sessionID, result, &replied); err != nil {
 		return err
 	}
-	finalReaction = channel.ReactionDone
+	if in.MsgID != "" {
+		_ = ch.Ack(in.UserID, in.MsgID, channel.ReactionDone)
+	}
 	return nil
 }

@@ -22,6 +22,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/kjhnns/agentd/internal/channel"
 )
 
 // Message is one entry of the wrist conversation. A user message carries the
@@ -41,6 +43,29 @@ type Message struct {
 	// role, last message of a reply only). Old rows load without it.
 	Replies   []string  `json:"replies,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// RequestID is the client's idempotency key (its outbox item id) on a
+	// user message (D5). A repeat of the same request answers this message.
+	RequestID string `json:"request_id,omitempty"`
+	// Inbound is the full inbound payload of a user message, persisted at
+	// admission so a restart can re-enqueue a queued request. Never served to
+	// clients (see Public).
+	Inbound *channel.InboundMsg `json:"inbound,omitempty"`
+}
+
+// Public is the message as clients see it: without the persisted inbound
+// payload (media paths stay on the server).
+func (m Message) Public() Message {
+	m.Inbound = nil
+	return m
+}
+
+// publicAll maps Public over a page.
+func publicAll(msgs []Message) []Message {
+	out := make([]Message, len(msgs))
+	for i, m := range msgs {
+		out[i] = m.Public()
+	}
+	return out
 }
 
 // Roles, kinds and statuses. Strings on the wire so the client stays trivial.
@@ -61,10 +86,21 @@ const (
 	StatusNeedsInput = "needs_input"
 	StatusDone       = "done"
 	StatusFailed     = "failed"
+	// StatusRejected: the request was stored but the inbound queue was full.
+	// It is retryable: a repeat with the same request_id re-admits it.
+	StatusRejected = "rejected"
 )
 
-// Terminal reports whether a user-message status will not change again.
-func Terminal(status string) bool { return status == StatusDone || status == StatusFailed }
+// Terminal reports whether a user-message status will not change again
+// without a new request (a rejected request changes only on a retry).
+func Terminal(status string) bool {
+	return status == StatusDone || status == StatusFailed || status == StatusRejected
+}
+
+// inFlight reports a user message whose turn is not finished.
+func inFlight(m Message) bool {
+	return m.Role == RoleUser && (m.Status == StatusQueued || m.Status == StatusWorking || m.Status == StatusNeedsInput)
+}
 
 // Store is the append-only conversation log. Every append (a new message OR a
 // status update, which is re-appended as a full snapshot with a fresh seq)
@@ -81,6 +117,8 @@ type Store struct {
 	latest map[string]Message // newest snapshot per id
 	order  []string           // ids in first-seen order
 	wake   chan struct{}      // closed + replaced on every append (long-poll wakeup)
+	// failWrite is a test hook that fails the next persisted write.
+	failWrite func() error
 
 	maxLog    int // in-memory append log bound
 	maxIDs    int // distinct messages kept
@@ -101,12 +139,16 @@ const (
 func OpenStore(path string) (*Store, error) { return openStore(path, 5000) }
 
 func openStore(path string, compactAt int) (*Store, error) {
+	return openStoreWith(path, compactAt, 500)
+}
+
+func openStoreWith(path string, compactAt, maxIDs int) (*Store, error) {
 	s := &Store{
 		path:      path,
 		latest:    map[string]Message{},
 		wake:      make(chan struct{}),
 		maxLog:    4000,
-		maxIDs:    500,
+		maxIDs:    maxIDs,
 		compactAt: compactAt,
 	}
 	if path == "" {
@@ -234,6 +276,7 @@ func (s *Store) absorb(m Message) {
 	if m.Seq > s.seq {
 		s.seq = m.Seq
 	}
+
 	if _, seen := s.latest[m.ID]; !seen {
 		s.order = append(s.order, m.ID)
 	}
@@ -286,7 +329,8 @@ func newID() string {
 }
 
 // Append stores a NEW message (an empty ID gets one), assigns its seq and
-// returns the stored copy.
+// returns the stored copy. A write error is logged; the message stays in
+// memory (callers that must know use admit).
 func (s *Store) Append(m Message) Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -297,6 +341,18 @@ func (s *Store) Append(m Message) Message {
 }
 
 func (s *Store) appendLocked(m Message) Message {
+	out, err := s.appendDurable(m, false)
+	if err != nil {
+		log.Printf("watch store: append %s: %v", m.ID, err)
+	}
+	return out
+}
+
+// appendDurable writes the snapshot (fsync) and then applies it in memory.
+// With strict, a write or fsync error leaves the store unchanged (memory and
+// file) and is returned; otherwise the snapshot is applied anyway and the
+// error only reported.
+func (s *Store) appendDurable(m Message, strict bool) (Message, error) {
 	if len(m.Text) > maxTextBytes {
 		// Cut on a rune boundary and say so, rather than persist a record the
 		// replay would have to skip (which would lose the message entirely).
@@ -311,22 +367,53 @@ func (s *Store) appendLocked(m Message) Message {
 		m.TS = now
 	}
 	m.UpdatedAt = now
-	s.seq++
-	m.Seq = s.seq
+	m.Seq = s.seq + 1
+	werr := s.writeLocked(m)
+	if werr != nil && strict {
+		return Message{}, werr
+	}
+	s.seq = m.Seq
 	if _, seen := s.latest[m.ID]; !seen {
 		s.order = append(s.order, m.ID)
 	}
 	s.latest[m.ID] = m
 	s.log = append(s.log, m)
 	s.trimLocked()
-	if s.f != nil {
-		b, _ := json.Marshal(m)
-		_, _ = s.f.Write(append(b, '\n'))
-		_ = s.f.Sync()
-	}
 	close(s.wake)
 	s.wake = make(chan struct{})
-	return m
+	return m, werr
+}
+
+// writeLocked appends one JSONL line and fsyncs it. On a failed write the
+// file is cut back to its previous size so a partial line cannot glue onto
+// the next record.
+func (s *Store) writeLocked(m Message) error {
+	if s.failWrite != nil {
+		if err := s.failWrite(); err != nil {
+			return err
+		}
+	}
+	if s.f == nil {
+		return nil
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	var size int64 = -1
+	if st, err := s.f.Stat(); err == nil {
+		size = st.Size()
+	}
+	if _, err := s.f.Write(append(b, '\n')); err != nil {
+		if size >= 0 {
+			_ = s.f.Truncate(size)
+		}
+		return err
+	}
+	if err := s.f.Sync(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // trimLocked bounds memory: the append log and the distinct-id set.

@@ -815,6 +815,18 @@ func serve(args []string) {
 				}()
 			}
 		}(wch, sessMap)
+
+		// Restart reconciliation (D5): every request the last run left
+		// unfinished is re-enqueued, answered from its committed turn record,
+		// or failed with a notice. Runs before the HTTP surface serves.
+		wch.Reconcile(ctx,
+			func(msgID, reqID string) (watch.CommittedTurn, bool) {
+				tr, _, ok := mgr.FindTurn(msgID, reqID)
+				return watch.CommittedTurn{SessionID: tr.Session, Result: tr.Result, Error: tr.Error}, ok
+			},
+			func(dctx context.Context, in channel.InboundMsg, sid, result string) error {
+				return mgr.DeliverStored(dctx, wch, in, sid, result)
+			})
 	}
 	log.Printf("agentd: notification hub has %d sink(s)", hub.Count())
 

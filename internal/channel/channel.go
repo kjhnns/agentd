@@ -26,6 +26,9 @@ type InboundMsg struct {
 	Text    string           `json:"text"`     // message text / caption (UNTRUSTED input)
 	Media   []media.Artifact `json:"media"`    // ingested artifacts; may be empty
 	ReplyTo string           `json:"reply_to"` // id of the message being replied to
+	// RequestID is the client's idempotency key (the wrist's request_id),
+	// carried into the turn record. Empty for channels without one.
+	RequestID string `json:"request_id,omitempty"`
 }
 
 // Lifecycle reaction emoji. These are the visible progress feedback a user gets

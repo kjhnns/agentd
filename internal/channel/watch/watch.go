@@ -192,6 +192,9 @@ func (a *Adapter) Ack(chatID, msgID, reaction string) error {
 			return false // never regress a finished turn
 		}
 		m.Status = status
+		if Terminal(status) {
+			m.Inbound = nil // the payload is only needed until the turn ends
+		}
 		return true
 	})
 	return nil
@@ -506,9 +509,7 @@ func (a *Adapter) handleFetch(w http.ResponseWriter, r *http.Request) {
 	default:
 		msgs, hasMore, latest = a.store.Tail(limit)
 	}
-	if msgs == nil {
-		msgs = []Message{}
-	}
+	msgs = publicAll(msgs)
 	// latest_seq is the cursor to ask from next. On an incremental read it is
 	// the seq of the last returned change when the page was cut
 	// (has_more_changes), so paging never skips a change (D3).
@@ -618,8 +619,9 @@ const maxPostFiles = 6
 // is QUEUED; the reply arrives later through fetch.
 func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 	var (
-		text string
-		arts []media.Artifact
+		text      string
+		arts      []media.Artifact
+		requestID string
 	)
 	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	switch {
@@ -636,6 +638,16 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 		text = strings.TrimSpace(r.FormValue("text"))
 		if len(text) > maxInboundText {
 			writeErr(w, http.StatusRequestEntityTooLarge, "text too long")
+			return
+		}
+		requestID = strings.TrimSpace(r.FormValue("request_id"))
+		if !validRequestID(requestID) {
+			writeErr(w, http.StatusBadRequest, "bad request_id")
+			return
+		}
+		// A repeat answers the original receipt before anything is ingested
+		// again (no second transcription, no second copy of the photos).
+		if a.answerDuplicate(w, requestID) {
 			return
 		}
 		var headers []*multipart.FileHeader
@@ -700,7 +712,8 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 		}
 	default:
 		var body struct {
-			Text string `json:"text"`
+			Text      string `json:"text"`
+			RequestID string `json:"request_id"`
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxInboundText+(4<<10))
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -710,6 +723,14 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 		text = strings.TrimSpace(body.Text)
 		if len(text) > maxInboundText {
 			writeErr(w, http.StatusRequestEntityTooLarge, "text too long")
+			return
+		}
+		requestID = strings.TrimSpace(body.RequestID)
+		if !validRequestID(requestID) {
+			writeErr(w, http.StatusBadRequest, "bad request_id")
+			return
+		}
+		if a.answerDuplicate(w, requestID) {
 			return
 		}
 	}
@@ -737,21 +758,38 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 			msg.Text = joinText(text, "[file: "+art.Name+"]")
 		}
 	}
-	stored := a.store.Append(msg)
-
+	msg.RequestID = requestID
 	in := channel.InboundMsg{
-		Channel: "watch",
-		UserID:  a.userID,
-		MsgID:   stored.ID,
-		Sender:  "watch",
-		TS:      a.now().Unix(),
-		Text:    text,
+		Channel:   "watch",
+		UserID:    a.userID,
+		Sender:    "watch",
+		TS:        a.now().Unix(),
+		Text:      text,
+		RequestID: requestID,
 	}
 	in.Media = arts
-	select {
-	case a.inbound <- in:
-	default:
-		a.store.Update(stored.ID, func(m *Message) bool { m.Status = StatusFailed; return true })
+	stored, outcome, err := a.store.Admit(msg, in, func(in channel.InboundMsg) bool {
+		select {
+		case a.inbound <- in:
+			return true
+		default:
+			return false
+		}
+	})
+	switch {
+	case err != nil:
+		// Nothing was stored: the client may simply send it again.
+		log.Printf("watch: %v", err)
+		removeImages(arts)
+		writeErr(w, http.StatusServiceUnavailable, "could not store the message, try again")
+		return
+	case outcome == Duplicate:
+		// A concurrent repeat was admitted first: this copy's files belong to
+		// no turn.
+		removeImages(arts)
+		writeJSON(w, http.StatusAccepted, map[string]any{"message": stored.Public(), "pending": a.store.Pending(), "duplicate": true})
+		return
+	case outcome == Rejected:
 		// The photos of a message that starts no turn would stay on disk
 		// until the retention sweep, one more copy for every retry.
 		removeImages(arts)
@@ -759,7 +797,35 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.echo("⌚ You: "+stored.Text, false)
-	writeJSON(w, http.StatusAccepted, map[string]any{"message": stored, "pending": a.store.Pending()})
+	writeJSON(w, http.StatusAccepted, map[string]any{"message": stored.Public(), "pending": a.store.Pending()})
+}
+
+// maxRequestID bounds a client idempotency key.
+const maxRequestID = 128
+
+// validRequestID accepts an empty id (an old client) or up to maxRequestID
+// printable ASCII characters without spaces.
+func validRequestID(id string) bool {
+	if len(id) > maxRequestID {
+		return false
+	}
+	for _, c := range id {
+		if c <= ' ' || c > '~' {
+			return false
+		}
+	}
+	return true
+}
+
+// answerDuplicate answers a repeat of a known, not rejected request with its
+// original receipt. It reports whether it answered.
+func (a *Adapter) answerDuplicate(w http.ResponseWriter, requestID string) bool {
+	prev, ok := a.store.LookupRequest(requestID)
+	if !ok || prev.Status == StatusRejected {
+		return false
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"message": prev.Public(), "pending": a.store.Pending(), "duplicate": true})
+	return true
 }
 
 // errBadFilePart marks an uploaded part that could not be opened (the 400 of
