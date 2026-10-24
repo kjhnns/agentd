@@ -1007,7 +1007,22 @@ func mediaAttachments(in channel.InboundMsg) []TurnAttachment {
 // RouteInbound wires a channel inbound message to a session and sends the harness
 // result back through the channel. It reuses one session per chat id (created on
 // first message). This is the end-to-end path.
-func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, chats *ChatMap, cwd, model string) (rerr error) {
+func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, chats *ChatMap, cwd, model string) error {
+	return m.routeInbound(ctx, ch, in, chats, cwd, model, routeOpts{conv: ConvMain})
+}
+
+// routeOpts are the conversation options of one routed message (R4).
+type routeOpts struct {
+	conv string
+	// side routes the turn to the side session (TurnRequest.Side).
+	side    bool
+	onFresh func() (string, []TurnAttachment, error)
+	// prepare runs once before the turn, after the failure notice is armed:
+	// the context_conv export. Its prefix goes in front of the turn text.
+	prepare func() (string, []TurnAttachment, error)
+}
+
+func (m *Manager) routeInbound(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, chats *ChatMap, cwd, model string, opts routeOpts) (rerr error) {
 	// ref ties the inbound and outbound records of this message to its turn
 	// record, so the recap reads the turn record and skips them, and reads
 	// them when no turn record was written.
@@ -1071,6 +1086,19 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	// The working glyph is set when RunTurn owns the session (OnStart). Every
 	// exit below flips it to the done or error glyph via the deferred final
 	// reaction.
+	text := m.RenderTurn(in)
+	atts := mediaAttachments(in)
+	if opts.prepare != nil {
+		prefix, more, err := opts.prepare()
+		if err != nil {
+			reacted = true // the deferred handler sends the notice, then the error glyph
+			return err
+		}
+		if prefix != "" {
+			text = prefix + "\n\n" + text
+		}
+		atts = append(atts, more...)
+	}
 	var result string
 	committed := false
 	for attempt := 0; ; attempt++ {
@@ -1085,14 +1113,16 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		// the only channel-specific piece, delivered through the event hook.
 		res, err := m.RunTurn(ctx, TurnRequest{
 			SessionID:   id,
-			Text:        m.RenderTurn(in),
+			Text:        text,
 			UserText:    in.Text,
 			RequestID:   in.RequestID,
 			MessageID:   in.MsgID,
 			Ref:         ref,
 			Chat:        in.UserID,
-			Conv:        ConvMain,
-			Attachments: mediaAttachments(in),
+			Conv:        opts.conv,
+			Side:        opts.side,
+			OnFresh:     opts.onFresh,
+			Attachments: atts,
 			// The working glyph goes up when the turn owns the session; a
 			// message queued behind another turn stays "queued" until then, so
 			// a restart re-enqueues it instead of calling it interrupted.

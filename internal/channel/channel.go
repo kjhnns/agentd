@@ -105,3 +105,27 @@ type Adapter interface {
 type DurableAcker interface {
 	AckDurable(chatID, msgID, reaction string) error
 }
+
+// ConvArtifact is an exported conversation transcript (R4, plan section 5):
+// a JSON Lines file outside the workspace that a turn points at.
+type ConvArtifact struct {
+	Conv     string
+	Title    string
+	Path     string // canonical absolute path
+	Messages int
+	// Pointer is the ONE line the turn gets instead of the transcript.
+	Pointer string
+}
+
+// ConvExporter exports a channel's conversation as an artifact. The wrist
+// implements it; the session layer calls it when a side conversation
+// starts fresh into a thread that already has messages, and for
+// InboundMsg.ContextConv.
+type ConvExporter interface {
+	// ExportConv writes conv's transcript without the message excludeMsgID
+	// (the one being answered) and without unfinished requests. ok is false
+	// when there is nothing to export.
+	ExportConv(conv, excludeMsgID string) (art ConvArtifact, ok bool, err error)
+	// NoteAttachment records the artifact on the user message msgID.
+	NoteAttachment(msgID string, art ConvArtifact) error
+}

@@ -59,6 +59,8 @@ type Adapter struct {
 	now        func() time.Time
 	usage      *usageReader
 	codexUsage *usageReader
+	// artifactDir is where conversation artifacts are exported (R4).
+	artifactDir string
 }
 
 // New builds a watch adapter gated by its own bearer token (NOT the API

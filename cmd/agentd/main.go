@@ -801,15 +801,29 @@ func serve(args []string) {
 				log.Printf("agentd: watch mirror=true but no Telegram channel; mirror off")
 			}
 		}
+		// Side conversations (R4): one side session per instance, keyed
+		// session.SideChat in its own lane-side map, in the same workspace as
+		// main. Artifacts of earlier conversations go to the state dir, never
+		// into a git-autocommitted workspace. No config key: it rides the
+		// watch channel, shared or own session alike.
+		sideMap := session.NewChatMap(session.LaneSide)
+		wsRoot := ""
+		if mgr.Workspaces != nil {
+			wsRoot = mgr.Workspaces.Root
+		}
+		if err := wch.WithArtifacts(filepath.Join(cfg.Server.StateDir, "watch-artifacts"), wsRoot); err != nil {
+			log.Printf("agentd: watch artifacts disabled (%v); continuing an earlier conversation will fail with a notice", err)
+		}
 		srv.MountPublic("/watch/", wch.Handler())
 		hub.Register(wch)
-		log.Printf("agentd: watch channel started (routes /watch/*, shared_session=%v, mirror=%v)", shared, c.Mirror)
+		log.Printf("agentd: watch channel started (routes /watch/*, shared_session=%v, mirror=%v, conversations=on)", shared, c.Mirror)
 
 		// In order: the wrist's messages share one session, and the restart
-		// reconciliation re-enqueues queued requests in their order.
+		// reconciliation re-enqueues queued requests in their order. Main
+		// and side turns run one after the other anyway (one workspace).
 		go func(ch *watch.Adapter, m *session.ChatMap) {
 			session.DispatchInOrder(ch.Inbound(), func(in channel.InboundMsg) {
-				if err := mgr.RouteInbound(ctx, ch, in, m, cwd, model); err != nil {
+				if err := mgr.RouteConversation(ctx, ch, in, m, sideMap, cwd, model, ch); err != nil {
 					log.Printf("agentd: watch route inbound error: %v", err)
 				}
 			})
