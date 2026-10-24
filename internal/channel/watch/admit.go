@@ -36,7 +36,7 @@ const (
 var ErrPersist = errors.New("watch store: could not persist the message")
 
 // LookupRequest returns the newest snapshot of the message a request_id
-// produced.
+// produced, also when the message itself was evicted.
 func (s *Store) LookupRequest(requestID string) (Message, bool) {
 	if requestID == "" {
 		return Message{}, false
@@ -47,12 +47,14 @@ func (s *Store) LookupRequest(requestID string) (Message, bool) {
 }
 
 func (s *Store) lookupLocked(requestID string) (Message, bool) {
-	for _, id := range s.order {
-		if m := s.latest[id]; m.RequestID == requestID && m.Role == RoleUser {
-			return m, true
-		}
+	m, ok := s.reqs[requestID]
+	if !ok {
+		return Message{}, false
 	}
-	return Message{}, false
+	if cur, live := s.latest[m.ID]; live && cur.Seq >= m.Seq {
+		m = cur
+	}
+	return m, true
 }
 
 // Admit stores a new user message (or re-admits a rejected request) and

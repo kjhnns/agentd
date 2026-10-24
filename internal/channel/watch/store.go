@@ -50,12 +50,17 @@ type Message struct {
 	// admission so a restart can re-enqueue a queued request. Never served to
 	// clients (see Public).
 	Inbound *channel.InboundMsg `json:"inbound,omitempty"`
+	// Evicted marks a snapshot that compaction kept ONLY for the request_id
+	// index (D5b): replay indexes it but does not put it back into the
+	// conversation.
+	Evicted bool `json:"evicted,omitempty"`
 }
 
 // Public is the message as clients see it: without the persisted inbound
 // payload (media paths stay on the server).
 func (m Message) Public() Message {
 	m.Inbound = nil
+	m.Evicted = false
 	return m
 }
 
@@ -97,7 +102,9 @@ func Terminal(status string) bool {
 	return status == StatusDone || status == StatusFailed || status == StatusRejected
 }
 
-// inFlight reports a user message whose turn is not finished.
+// inFlight reports a user-message status whose turn is not finished: such a
+// message is never evicted by trim or compaction (D5b), so the restart
+// reconciliation and the status updates always find it.
 func inFlight(m Message) bool {
 	return m.Role == RoleUser && (m.Status == StatusQueued || m.Status == StatusWorking || m.Status == StatusNeedsInput)
 }
@@ -117,6 +124,9 @@ type Store struct {
 	latest map[string]Message // newest snapshot per id
 	order  []string           // ids in first-seen order
 	wake   chan struct{}      // closed + replaced on every append (long-poll wakeup)
+	// reqs is the request_id index (D5b): request id -> newest snapshot of
+	// its message, kept when the message itself is evicted.
+	reqs map[string]Message
 	// failWrite is a test hook that fails the next persisted write.
 	failWrite func() error
 
@@ -146,6 +156,7 @@ func openStoreWith(path string, compactAt, maxIDs int) (*Store, error) {
 	s := &Store{
 		path:      path,
 		latest:    map[string]Message{},
+		reqs:      map[string]Message{},
 		wake:      make(chan struct{}),
 		maxLog:    4000,
 		maxIDs:    maxIDs,
@@ -276,7 +287,10 @@ func (s *Store) absorb(m Message) {
 	if m.Seq > s.seq {
 		s.seq = m.Seq
 	}
-
+	s.indexRequest(m)
+	if m.Evicted {
+		return // kept for the request index only
+	}
 	if _, seen := s.latest[m.ID]; !seen {
 		s.order = append(s.order, m.ID)
 	}
@@ -293,6 +307,14 @@ func (s *Store) compact() error {
 		return err
 	}
 	w := bufio.NewWriter(f)
+	// The request index of messages no longer in the conversation goes first,
+	// marked evicted, so dedupe survives compaction and restart (D5b).
+	for _, m := range s.evictedRequests() {
+		m.Evicted = true
+		b, _ := json.Marshal(m)
+		w.Write(b)
+		w.WriteByte('\n')
+	}
 	for _, id := range s.order {
 		b, _ := json.Marshal(s.latest[id])
 		w.Write(b)
@@ -368,6 +390,7 @@ func (s *Store) appendDurable(m Message, strict bool) (Message, error) {
 	}
 	m.UpdatedAt = now
 	m.Seq = s.seq + 1
+	m.Evicted = false
 	werr := s.writeLocked(m)
 	if werr != nil && strict {
 		return Message{}, werr
@@ -377,6 +400,7 @@ func (s *Store) appendDurable(m Message, strict bool) (Message, error) {
 		s.order = append(s.order, m.ID)
 	}
 	s.latest[m.ID] = m
+	s.indexRequest(m)
 	s.log = append(s.log, m)
 	s.trimLocked()
 	close(s.wake)
@@ -416,14 +440,70 @@ func (s *Store) writeLocked(m Message) error {
 	return nil
 }
 
-// trimLocked bounds memory: the append log and the distinct-id set.
+// indexRequest records the newest snapshot of a request's message.
+func (s *Store) indexRequest(m Message) {
+	if m.RequestID == "" || m.Role != RoleUser {
+		return
+	}
+	if cur, ok := s.reqs[m.RequestID]; ok && cur.Seq > m.Seq {
+		return
+	}
+	s.reqs[m.RequestID] = m
+}
+
+// maxEvictedRequests bounds the request index entries kept for messages that
+// left the conversation (newest first).
+const maxEvictedRequests = 2000
+
+// evictedRequests returns the indexed snapshots whose message is no longer
+// in the conversation, newest maxEvictedRequests, oldest first.
+func (s *Store) evictedRequests() []Message {
+	out := []Message{}
+	for _, m := range s.reqs {
+		if _, live := s.latest[m.ID]; !live {
+			out = append(out, m)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	if len(out) > maxEvictedRequests {
+		out = out[len(out)-maxEvictedRequests:]
+	}
+	return out
+}
+
+// trimLocked bounds memory: the append log and the distinct-id set. A user
+// message whose turn is still in flight is never evicted (D5b); the request
+// index keeps the snapshot of an evicted request.
 func (s *Store) trimLocked() {
 	if len(s.log) > s.maxLog {
 		s.log = append([]Message(nil), s.log[len(s.log)-s.maxLog/2:]...)
 	}
-	for len(s.order) > s.maxIDs {
-		delete(s.latest, s.order[0])
-		s.order = s.order[1:]
+	if len(s.order) <= s.maxIDs {
+		return
+	}
+	keep := make([]string, 0, len(s.order))
+	excess := len(s.order) - s.maxIDs
+	for _, id := range s.order {
+		if excess > 0 && !inFlight(s.latest[id]) {
+			delete(s.latest, id)
+			excess--
+			continue
+		}
+		keep = append(keep, id)
+	}
+	s.order = keep
+	if len(s.reqs) > 2*maxEvictedRequests+s.maxIDs {
+		// Bound the in-memory index too: drop the oldest evicted entries.
+		ev := s.evictedRequests()
+		keepEv := map[string]bool{}
+		for _, m := range ev {
+			keepEv[m.RequestID] = true
+		}
+		for rid, m := range s.reqs {
+			if _, live := s.latest[m.ID]; !live && !keepEv[rid] {
+				delete(s.reqs, rid)
+			}
+		}
 	}
 }
 
@@ -621,7 +701,7 @@ func (s *Store) Attribute() (Message, bool) {
 // replayCount reads the JSONL file and returns its parseable line count
 // (tests: proves compaction without poking at file internals).
 func (s *Store) replayCount() (int, error) {
-	probe := &Store{path: s.path, latest: map[string]Message{}, wake: make(chan struct{}), maxLog: 1 << 20, maxIDs: 1 << 20}
+	probe := &Store{path: s.path, latest: map[string]Message{}, reqs: map[string]Message{}, wake: make(chan struct{}), maxLog: 1 << 20, maxIDs: 1 << 20}
 	n, _, err := probe.replay()
 	return n, err
 }

@@ -177,3 +177,65 @@ func TestRestartReconciliation(t *testing.T) {
 		t.Fatal("the lost turn has no failure notice")
 	}
 }
+
+// TestRequestIndexOutlivesEviction is the D5b regression: the store dropped
+// an evicted message from its lookup map, so a retry of an old request
+// (receipt lost long ago) ran the turn again. The request index keeps it
+// across eviction, compaction and a restart.
+func TestRequestIndexOutlivesEviction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "watch.jsonl")
+	st, err := openStoreWith(path, 1000, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := New("wt", st)
+	_, orig, _ := postJSON(t, a, `{"text":"old question","request_id":"keep-me"}`)
+	_ = a.Ack("", orig.ID, channel.ReactionDone)
+	for i := 0; i < 5; i++ {
+		st.Append(Message{Role: RoleSystem, Kind: KindNotice, Text: "n" + strconv.Itoa(i)})
+	}
+	if _, live := st.Get(orig.ID); live {
+		t.Fatal("setup: the message was not evicted")
+	}
+	drainInbound(a)
+	if code, m, dup := postJSON(t, a, `{"text":"old question","request_id":"keep-me"}`); code != http.StatusAccepted || !dup || m.ID != orig.ID {
+		t.Fatalf("retry after eviction: %d %+v dup=%v", code, m, dup)
+	}
+	st.Close()
+
+	// Compaction (more lines than compactAt) and a restart.
+	st2, err := openStoreWith(path, 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := st2.replayCount(); n > 3+1 {
+		t.Fatalf("compaction kept %d lines", n)
+	}
+	b := New("wt", st2)
+	if code, m, dup := postJSON(t, b, `{"text":"old question","request_id":"keep-me"}`); code != http.StatusAccepted || !dup || m.ID != orig.ID {
+		t.Fatalf("retry after compaction and restart: %d %+v dup=%v", code, m, dup)
+	}
+	if len(drainInbound(b)) != 0 {
+		t.Fatal("a retry of an evicted request queued a second turn")
+	}
+	if msgs, _, _ := st2.Tail(50); len(msgs) != 3 {
+		t.Fatalf("conversation after reopen has %d messages, want 3 (the evicted request stays out)", len(msgs))
+	}
+}
+
+// TestTrimNeverEvictsAnUnfinishedRequest: a queued or working message stays
+// in the store however many messages follow it.
+func TestTrimNeverEvictsAnUnfinishedRequest(t *testing.T) {
+	st, _ := openStoreWith("", 1000, 3)
+	a := New("wt", st)
+	_, q, _ := postJSON(t, a, `{"text":"still queued","request_id":"q"}`)
+	for i := 0; i < 10; i++ {
+		st.Append(Message{Role: RoleSystem, Kind: KindNotice, Text: "n"})
+	}
+	if m, ok := st.Get(q.ID); !ok || m.Status != StatusQueued {
+		t.Fatal("trim evicted a queued request")
+	}
+	if len(st.Unfinished()) != 1 {
+		t.Fatal("reconciliation would not find the queued request")
+	}
+}
