@@ -135,13 +135,23 @@ func (a *Adapter) Inbound() <-chan channel.InboundMsg { return a.inbound }
 func (a *Adapter) SupportsMedia() bool                { return false }
 
 // Send stores the turn's reply (or its failure notice) as an agent message
-// attributed to the user message that started the turn.
+// attributed to the user message that started the turn (OutboundMsg.InReplyTo).
 func (a *Adapter) Send(ctx context.Context, m channel.OutboundMsg) (channel.SendReceipt, error) {
 	msg := Message{Role: RoleAgent, Kind: KindReply, Text: m.Text}
 	if m.Summary {
 		msg.Kind = KindSummary
 	}
-	if u, ok := a.store.Attribute(); ok {
+	// The originating message travels with the reply (D2). Only a reply that
+	// does not name one (an old caller) falls back to the store's guess.
+	u, ok := Message{}, false
+	if m.InReplyTo != "" {
+		u, ok = a.store.Get(m.InReplyTo)
+		ok = ok && u.Role == RoleUser
+	}
+	if !ok && m.InReplyTo == "" {
+		u, ok = a.store.Attribute()
+	}
+	if ok {
 		msg.ReplyTo = u.ID
 		if u.Status == StatusFailed {
 			msg.Kind = KindFailure

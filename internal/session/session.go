@@ -978,7 +978,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		text := failureNotice(in, rerr)
 		nctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		if _, err := ch.Send(nctx, channel.OutboundMsg{ChatID: in.UserID, Text: text}); err != nil {
+		if _, err := ch.Send(nctx, channel.OutboundMsg{ChatID: in.UserID, Text: text, InReplyTo: in.MsgID}); err != nil {
 			log.Printf("session: failure notice to %s/%s failed: %v", in.Channel, in.UserID, err)
 			return
 		}
@@ -1066,7 +1066,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 	}
 	body, summary := SplitReply(result, m.Reply.SummaryBudget)
 	send := func(text string, silent, summary bool) error {
-		out := channel.OutboundMsg{ChatID: in.UserID, Text: text, Silent: silent, Summary: summary}
+		out := channel.OutboundMsg{ChatID: in.UserID, Text: text, Silent: silent, Summary: summary, InReplyTo: in.MsgID}
 		if !silent {
 			out.Replies = replies
 		}

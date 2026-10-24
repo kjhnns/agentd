@@ -387,3 +387,17 @@ func TestRouteInboundLeavesOtherChannelsAndTheOffSwitchAlone(t *testing.T) {
 		}
 	}
 }
+
+// TestRouteInboundNamesTheOriginatingMessage (D2): every reply half carries
+// the inbound message id, so the channel attributes it exactly.
+func TestRouteInboundNamesTheOriginatingMessage(t *testing.T) {
+	sent, _ := routeWithReply(t, 200, strings.Repeat("long ", 60)+"\n"+SummaryMarker+"\nshort")
+	if len(sent) != 2 {
+		t.Fatalf("sent %d messages", len(sent))
+	}
+	for _, m := range sent {
+		if m.InReplyTo != "m1" {
+			t.Fatalf("message %q has in_reply_to %q, want m1", m.Text, m.InReplyTo)
+		}
+	}
+}

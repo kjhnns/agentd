@@ -60,6 +60,10 @@ type OutboundMsg struct {
 	// channel that has no use for them ignores the field; they are never part
 	// of Text.
 	Replies []string `json:"replies,omitempty"`
+	// InReplyTo is the provider id of the inbound message whose turn produced
+	// this message (InboundMsg.MsgID). A channel that keeps a conversation
+	// attributes the reply to exactly that message instead of guessing.
+	InReplyTo string `json:"in_reply_to,omitempty"`
 }
 
 // SendReceipt carries a real provider id, the acceptance artifact for a send.
