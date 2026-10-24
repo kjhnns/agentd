@@ -191,8 +191,9 @@ func (m *Manager) StartGC(ctx context.Context) {
 }
 
 // gcSweep enforces idle_timeout and reclaims dead sessions once. It never blocks
-// on a running turn: it TryLocks each session's turnMu and skips a busy one
-// (its idleness will be re-checked next tick).
+// on a running turn: it TryLocks each session's locks (the interactive lock of
+// a main or side session, then turnMu) and skips a busy one (its idleness will
+// be re-checked next tick).
 func (m *Manager) gcSweep(ctx context.Context) {
 	m.mu.RLock()
 	snapshot := make([]*Session, 0, len(m.sessions))
@@ -211,17 +212,17 @@ func (m *Manager) gcSweep(ctx context.Context) {
 		// process cannot be checkpoint-flushed; the last committed artifacts are
 		// the recovery point). fresh-from-artifacts is always the safe fallback.
 		if s.adapter.Status(handle) == harness.StatusDead {
-			if s.turnMu.TryLock() {
+			if unlock, ok := m.tryLockSession(s); ok {
 				m.recoverDead(ctx, s)
-				s.turnMu.Unlock()
+				unlock()
 			}
 			continue
 		}
 
 		if m.Policy.IdleTimeout > 0 && time.Since(last) >= m.Policy.IdleTimeout {
-			if s.turnMu.TryLock() {
+			if unlock, ok := m.tryLockSession(s); ok {
 				m.reclaimIdle(ctx, s)
-				s.turnMu.Unlock()
+				unlock()
 			}
 		}
 	}

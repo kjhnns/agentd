@@ -128,6 +128,10 @@ type Manager struct {
 	// Continue on a past session) starts with the same parameters.
 	DefaultCwd   string
 	DefaultModel string
+
+	// ilocks holds the per-workspace interactive locks (see locks.go).
+	ilockMu sync.Mutex
+	ilocks  map[string]*turnLock
 }
 
 // Policy is the session-lifecycle + context-reset tuning (mirrors config
@@ -358,19 +362,34 @@ func (m *Manager) Get(id string) (*Session, bool) {
 // FindByWorkspace returns the live session homed in the named workspace, if
 // any ("" resolves to the store default). Used by the scheduler to REUSE the
 // warm session for a job run (single-active-session per workspace): the job
-// turn then serializes behind any in-progress interactive turn via turnMu.
+// turn then serializes behind any in-progress interactive turn. It never
+// returns a side session (a job must not run inside a side conversation) and
+// prefers a main session; among sessions of one lane the oldest wins, so the
+// choice is deterministic rather than map order.
 func (m *Manager) FindByWorkspace(name string) (*Session, bool) {
 	if name == "" && m.Workspaces != nil {
 		name = m.Workspaces.Default
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	var best *Session
+	rank := func(s *Session) int {
+		if s.Lane == LaneMain {
+			return 0
+		}
+		return 1
+	}
 	for _, s := range m.sessions {
-		if s.Workspace == name && s.Workspace != "" {
-			return s, true
+		if s.Workspace != name || s.Workspace == "" || s.Lane == LaneSide {
+			continue
+		}
+		if best == nil || rank(s) < rank(best) ||
+			(rank(s) == rank(best) && (s.Created.Before(best.Created) ||
+				(s.Created.Equal(best.Created) && s.ID < best.ID))) {
+			best = s
 		}
 	}
-	return nil, false
+	return best, best != nil
 }
 
 // List returns a status snapshot of every session.
