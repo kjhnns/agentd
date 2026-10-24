@@ -54,6 +54,7 @@ func (s *Store) lookupLocked(requestID string) (Message, bool) {
 	if cur, live := s.latest[m.ID]; live && cur.Seq >= m.Seq {
 		m = cur
 	}
+	m.Inbound = nil
 	return m, true
 }
 
@@ -64,6 +65,9 @@ func (s *Store) lookupLocked(requestID string) (Message, bool) {
 func (s *Store) Admit(msg Message, in channel.InboundMsg, offer func(channel.InboundMsg) bool) (Message, AdmitOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.broken != nil {
+		return Message{}, Rejected, errors.Join(ErrPersist, s.broken)
+	}
 	if msg.RequestID != "" {
 		if prev, ok := s.lookupLocked(msg.RequestID); ok {
 			if prev.Status != StatusRejected {
@@ -113,15 +117,20 @@ func (s *Store) Unfinished() []Message {
 	return out
 }
 
-// HasReply reports whether an agent message answering id is stored.
-func (s *Store) HasReply(id string) bool {
+// ReplyState reports what of an answer to id is stored: any part, and the
+// final part (an unsplit reply or the summary; not the long half alone).
+func (s *Store) ReplyState(id string) (anyPart, final bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, oid := range s.order {
 		m := s.latest[oid]
-		if m.Role == RoleAgent && m.ReplyTo == id && m.Kind != KindFailure {
-			return true
+		if m.Role != RoleAgent || m.ReplyTo != id || m.Kind == KindFailure {
+			continue
+		}
+		anyPart = true
+		if m.Part != PartBody {
+			final = true
 		}
 	}
-	return false
+	return anyPart, final
 }

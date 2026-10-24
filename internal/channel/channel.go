@@ -89,3 +89,11 @@ type Adapter interface {
 	// implementations are best-effort and log their own failures.
 	Ack(chatID, msgID, reaction string) error
 }
+
+// DurableAcker is implemented by a channel that persists the lifecycle status
+// of an inbound message (the wrist). AckDurable is Ack that reports a failed
+// write, so the session layer can refuse to start a turn whose "working"
+// state is not on disk.
+type DurableAcker interface {
+	AckDurable(chatID, msgID, reaction string) error
+}

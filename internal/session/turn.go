@@ -101,8 +101,10 @@ type TurnRequest struct {
 	Options TurnOptions
 	// OnStart, when set, is called once the turn owns the session (after the
 	// queue wait), before the harness gets the text. RouteInbound sets the
-	// working glyph here, so a message that only waits stays "queued".
-	OnStart func()
+	// working glyph here, so a message that only waits stays "queued". An
+	// error ends the turn before the harness sees it (the wrist could not
+	// persist "working").
+	OnStart func() error
 	// NoCollect returns as soon as the harness finished the send, without
 	// collecting a result (the legacy Send). The turn still owns the lock
 	// for the whole send.
@@ -119,6 +121,14 @@ type TurnResult struct {
 // abortWait bounds how long an abandoned turn is awaited after the interrupt
 // (and again after its context is cancelled) before the lock is released.
 var abortWait = 10 * time.Second
+
+// drainWait bounds how long a finished turn waits for the pump to stamp its
+// terminal event (result or error) before the lock is released. The pump
+// stamps the turn id when it READS an event, so releasing earlier would let
+// a lagging pump stamp this turn's events with the next turn's id. When the
+// bound passes the process is replaced, which fences the stale events by
+// generation.
+var drainWait = 30 * time.Second
 
 // lockTurn takes the locks a turn needs, in the fixed order (see locks.go),
 // and returns the release function.
@@ -157,12 +167,17 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 		_ = m.log.Append("input", map[string]string{"session": id, "text": req.Text})
 	}
 	if req.OnStart != nil {
-		req.OnStart()
+		if err := req.OnStart(); err != nil {
+			return TurnResult{}, fmt.Errorf("session %s: turn not started: %w", id, err)
+		}
 	}
 
 	turnID := newID()
+	terminal := make(chan struct{})
+	structured := s.adapter.Capabilities().StructuredEvents
 	s.mu.Lock()
 	s.curTurn = turnID
+	s.turnTerminal = terminal
 	s.running = true
 	s.status = harness.StatusThinking
 	handle := s.handle
@@ -192,17 +207,43 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 			turnErr = ctx.Err()
 		}
 	} else {
-		text, turnErr, sendDone = m.collect(ctx, s, turnID, events, sendErr, req.Options)
+		var termC <-chan struct{}
+		if structured {
+			termC = terminal
+		}
+		text, turnErr, sendDone = m.collect(ctx, s, turnID, termC, events, sendErr, req.Options)
 	}
-	if !sendDone {
-		// The turn was abandoned (timeout, ceiling, cancel). Interrupt it and
-		// wait for its end before anyone else may use the session.
-		m.abortTurn(s, handle, sendErr, cancelSend)
+	switch {
+	case !sendDone || ctx.Err() != nil || errors.Is(turnErr, context.Canceled) || errors.Is(turnErr, context.DeadlineExceeded):
+		// The turn was abandoned (timeout, ceiling) or cancelled. A harness
+		// send that returned on its context does not stop the harness turn,
+		// so interrupt it, wait for its end and replace the process before
+		// anyone else may use the session.
+		m.abortTurn(s, handle, sendErr, sendDone, cancelSend)
+	case turnErr != nil && s.adapter.Status(handle) == harness.StatusDead:
+		// The process died under the turn (or was marked dead for an auth
+		// failure): recover it now, so the next queued turn finds a live one.
+		if err := m.replaceProcessLocked(context.Background(), s, "dead after turn"); err != nil {
+			log.Printf("session %s: recovery after a failed turn: %v", id, err)
+		}
+	case structured:
+		// The harness finished the turn. Wait until the pump has stamped its
+		// terminal event, so no event of this turn can be stamped with the
+		// next turn's id.
+		select {
+		case <-terminal:
+		case <-time.After(drainWait):
+			log.Printf("session %s: turn %s: terminal event not drained after %s; replacing the process to fence it", id, turnID, drainWait)
+			if err := m.replaceProcessLocked(context.Background(), s, "undrained turn"); err != nil {
+				log.Printf("session %s: replace after an undrained turn failed: %v", id, err)
+			}
+		}
 	}
 
 	now := time.Now().UTC()
 	s.mu.Lock()
 	s.curTurn = ""
+	s.turnTerminal = nil
 	s.running = false
 	s.status = s.adapter.Status(s.handle)
 	if turnErr != nil {
@@ -261,16 +302,18 @@ func (m *Manager) afterTurn(s *Session, req TurnRequest, res TurnResult, err err
 // with the old turn would hand its late answer to the next one. The old
 // pump's events carry no turn id once the generation advanced. Caller holds
 // the session's locks.
-func (m *Manager) abortTurn(s *Session, handle harness.Handle, sendErr <-chan error, cancelSend context.CancelFunc) {
+func (m *Manager) abortTurn(s *Session, handle harness.Handle, sendErr <-chan error, sendDone bool, cancelSend context.CancelFunc) {
 	if err := s.adapter.Interrupt(handle); err != nil {
 		log.Printf("session %s: interrupt of an abandoned turn failed: %v", s.ID, err)
 	}
 	cancelSend()
-	ended := false
-	select {
-	case <-sendErr:
-		ended = true
-	case <-time.After(abortWait):
+	ended := sendDone
+	if !ended {
+		select {
+		case <-sendErr:
+			ended = true
+		case <-time.After(abortWait):
+		}
 	}
 	if err := m.replaceProcessLocked(context.Background(), s, "abandoned turn"); err != nil {
 		log.Printf("session %s: replace after an abandoned turn failed: %v", s.ID, err)
@@ -287,7 +330,7 @@ func (m *Manager) abortTurn(s *Session, handle harness.Handle, sendErr <-chan er
 
 // collect drains the bus for ONE turn. It returns the user-visible result,
 // the turn error, and whether the harness send has returned.
-func (m *Manager) collect(ctx context.Context, s *Session, turnID string, events <-chan eventbus.Event, sendErr <-chan error, opt TurnOptions) (string, error, bool) {
+func (m *Manager) collect(ctx context.Context, s *Session, turnID string, terminal <-chan struct{}, events <-chan eventbus.Event, sendErr <-chan error, opt TurnOptions) (string, error, bool) {
 	id := s.ID
 	started := time.Now()
 	var result, lastOutput string
@@ -384,13 +427,22 @@ func (m *Manager) collect(ctx context.Context, s *Session, turnID string, events
 				return "", err, true
 			}
 			// Send returning can race the bus delivery of the turn's events;
-			// drain briefly until the result event lands so the reply is not
-			// built from a partial turn. Still under ownership.
-			grace := time.After(resultGrace)
+			// drain until the result event lands so the reply is not built
+			// from a partial turn. Still under ownership. With a structured
+			// harness the pump signals when it stamped the terminal event
+			// (up to drainWait); the bus delivery follows within the grace.
+			wait := resultGrace
+			if terminal != nil {
+				wait = drainWait
+			}
+			grace := time.After(wait)
 			for !gotResult {
 				select {
 				case e := <-events:
 					handle(e)
+				case <-terminal:
+					terminal = nil
+					grace = time.After(resultGrace)
 				case <-grace:
 					return result, nil, true
 				case <-ctx.Done():

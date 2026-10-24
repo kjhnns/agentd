@@ -161,22 +161,20 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 		}
 	}
 
-	// D6: from a chat's first `turn` record on, the turn records are the
-	// transcript (written under turn ownership, both channels of a shared
-	// session, keyed by conversation epoch). Inbound/outbound records are the
-	// legacy source, used only for epoch 0 and only before that boundary.
-	boundary := len(recs)
+	// D6: the turn records are the transcript (written under turn
+	// ownership, both channels of a shared session, keyed by conversation
+	// epoch). Inbound/outbound records written beside them carry rec="turn"
+	// and are skipped. Unmarked inbound/outbound records are the legacy
+	// source (before R2, or from an older binary after a rollback), used only
+	// in epoch 0.
 	epoch := uint64(0)
 	turnMsgs := map[string]bool{} // message ids a turn record covers
 	if chatID != "" {
-		for i, rec := range recs {
+		for _, rec := range recs {
 			switch rec.Type {
 			case "turn":
 				var tr TurnRecord
 				if json.Unmarshal(rec.Data, &tr) == nil && tr.Chat == chatID {
-					if boundary == len(recs) {
-						boundary = i
-					}
 					if tr.MessageID != "" {
 						turnMsgs[tr.MessageID] = true
 					}
@@ -190,10 +188,10 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 			}
 		}
 	}
-	legacy := func(i int) bool { return epoch == 0 && i < boundary }
+	legacy := func(marker string) bool { return epoch == 0 && marker != recTurn }
 
 	var out []recapMsg
-	for i, rec := range recs {
+	for _, rec := range recs {
 		switch rec.Type {
 		case "turn":
 			if chatID == "" {
@@ -212,7 +210,7 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 			}
 
 		case "inbound":
-			if chatID == "" || !legacy(i) {
+			if chatID == "" {
 				continue
 			}
 			var in struct {
@@ -220,8 +218,9 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 				UserID  string `json:"user_id"`
 				Text    string `json:"text"`
 				MsgID   string `json:"msg_id"`
+				Rec     string `json:"rec"`
 			}
-			if json.Unmarshal(rec.Data, &in) != nil {
+			if json.Unmarshal(rec.Data, &in) != nil || !legacy(in.Rec) {
 				continue
 			}
 			// The wrist shares the Telegram chat's session (share_session), so
@@ -235,16 +234,17 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 			out = append(out, recapMsg{TS: rec.TS, Role: "user", Text: in.Text, MsgID: in.MsgID})
 
 		case "outbound":
-			if chatID != "" && !legacy(i) {
-				continue
-			}
 			var ob struct {
 				Chat    string `json:"chat"`
 				Session string `json:"session"`
 				Text    string `json:"text"`
 				MsgID   string `json:"msg_id"`
+				Rec     string `json:"rec"`
 			}
 			if json.Unmarshal(rec.Data, &ob) != nil {
+				continue
+			}
+			if chatID != "" && !legacy(ob.Rec) {
 				continue
 			}
 			// Either anchor is sufficient: the chat id (survives session churn)

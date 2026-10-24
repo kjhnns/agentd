@@ -824,8 +824,8 @@ func serve(args []string) {
 				tr, _, ok := mgr.FindTurn(msgID, reqID)
 				return watch.CommittedTurn{SessionID: tr.Session, Result: tr.Result, Error: tr.Error}, ok
 			},
-			func(dctx context.Context, in channel.InboundMsg, sid, result string) error {
-				return mgr.DeliverStored(dctx, wch, in, sid, result)
+			func(dctx context.Context, in channel.InboundMsg, sid, result string, finalOnly bool) error {
+				return mgr.DeliverStored(dctx, wch, in, sid, result, finalOnly)
 			})
 	}
 	log.Printf("agentd: notification hub has %d sink(s)", hub.Count())

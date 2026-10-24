@@ -314,7 +314,8 @@ func (m *Manager) installHandle(s *Session, h harness.Handle, now time.Time) uin
 	defer s.mu.Unlock()
 	s.handle = h
 	s.gen++
-	s.curTurn = ""
+	// curTurn stays: a turn that replaces its own process (abandoned or
+	// undrained) still owns the session; RunTurn clears it at the end.
 	s.turns = 0
 	s.handleStart = now
 	s.lastActivity = now

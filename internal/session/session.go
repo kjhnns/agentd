@@ -62,6 +62,9 @@ type Session struct {
 	// curTurn is the id of the turn that owns the session (RunTurn), stamped
 	// by the pump on every event it reads. Empty between turns.
 	curTurn string
+	// turnTerminal is closed by the pump when it stamps the current turn's
+	// terminal event (result or error).
+	turnTerminal chan struct{}
 }
 
 // Status snapshots the session for the API.
@@ -347,6 +350,10 @@ func (m *Manager) pump(s *Session, h harness.Handle, gen uint64) {
 		s.mu.Lock()
 		if s.gen == gen {
 			e.TurnID = s.curTurn
+			if e.TurnID != "" && s.turnTerminal != nil && (e.Kind == eventbus.KindResult || e.Kind == eventbus.KindError) {
+				close(s.turnTerminal)
+				s.turnTerminal = nil
+			}
 		} else {
 			e.TurnID = ""
 		}
@@ -947,6 +954,18 @@ func timeoutDetail(err error) string {
 	return s
 }
 
+// recTurn marks inbound and outbound run-log records written by a binary that
+// also writes turn records: the recap reads the turn record instead of them.
+// Records without it are legacy (before R2, or written by an older binary
+// after a rollback) and the recap still reads them in epoch 0.
+const recTurn = "turn"
+
+// inboundRecord is the payload of an `inbound` run-log record.
+type inboundRecord struct {
+	channel.InboundMsg
+	Rec string `json:"rec,omitempty"`
+}
+
 // mediaAttachments lists an inbound message's media as turn attachments.
 func mediaAttachments(in channel.InboundMsg) []TurnAttachment {
 	if len(in.Media) == 0 {
@@ -964,7 +983,7 @@ func mediaAttachments(in channel.InboundMsg) []TurnAttachment {
 // first message). This is the end-to-end path.
 func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, chats *ChatMap, cwd, model string) (rerr error) {
 	if m.log != nil {
-		_ = m.log.Append("inbound", in)
+		_ = m.log.Append("inbound", inboundRecord{InboundMsg: in, Rec: recTurn})
 	}
 
 	// Silence is never an outcome. Every error exit below leaves the user with
@@ -987,7 +1006,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		}
 		if m.log != nil {
 			_ = m.log.Append("outbound", map[string]string{
-				"session": sessionID, "chat": in.UserID, "text": text, "kind": "failure-notice",
+				"session": sessionID, "chat": in.UserID, "text": text, "kind": "failure-notice", "rec": recTurn,
 			})
 		}
 	}()
@@ -1036,7 +1055,16 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 			// The working glyph goes up when the turn owns the session; a
 			// message queued behind another turn stays "queued" until then, so
 			// a restart re-enqueues it instead of calling it interrupted.
-			OnStart: func() { react(channel.ReactionWorking) },
+			OnStart: func() error {
+				// A channel that persists its status (the wrist) must record
+				// "working" durably before the harness runs: otherwise a
+				// restart would re-run a turn that already started.
+				if dc, ok := ch.(channel.DurableAcker); ok && in.MsgID != "" {
+					return dc.AckDurable(in.UserID, in.MsgID, channel.ReactionWorking)
+				}
+				react(channel.ReactionWorking)
+				return nil
+			},
 			Options: TurnOptions{
 				Timeout: m.Policy.turnTimeout(),
 				Ceiling: m.Policy.turnCeiling(),
@@ -1059,7 +1087,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		result = res.Text
 		break
 	}
-	if err := m.deliverReply(ctx, ch, in, sessionID, result, &replied); err != nil {
+	if err := m.deliverReply(ctx, ch, in, sessionID, result, false, &replied); err != nil {
 		return err
 	}
 	finalReaction = channel.ReactionDone
@@ -1070,7 +1098,7 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 // wrist: the proposed replies come off, a long answer goes out as the full
 // text first (silent) and then the summary. Both halves name the inbound
 // message (InReplyTo). replied is set once any part was delivered.
-func (m *Manager) deliverReply(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, sessionID, result string, replied *bool) error {
+func (m *Manager) deliverReply(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, sessionID, result string, finalOnly bool, replied *bool) error {
 	if result == "" {
 		result = "(no result)"
 	}
@@ -1096,12 +1124,12 @@ func (m *Manager) deliverReply(ctx context.Context, ch channel.Adapter, in chann
 		*replied = true
 		if m.log != nil {
 			_ = m.log.Append("outbound", map[string]string{
-				"session": sessionID, "chat": in.UserID, "msg_id": rcpt.ID, "text": text,
+				"session": sessionID, "chat": in.UserID, "msg_id": rcpt.ID, "text": text, "rec": recTurn,
 			})
 		}
 		return nil
 	}
-	if summary != "" {
+	if summary != "" && !finalOnly {
 		if err := send(body, true, false); err != nil {
 			return err
 		}
@@ -1111,9 +1139,10 @@ func (m *Manager) deliverReply(ctx context.Context, ch channel.Adapter, in chann
 
 // DeliverStored delivers the committed result of a turn whose reply was lost
 // in a restart (the wrist's reconciliation, D5) and marks the message done.
-func (m *Manager) DeliverStored(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, sessionID, result string) error {
+// finalOnly sends only the last part (the long half is already delivered).
+func (m *Manager) DeliverStored(ctx context.Context, ch channel.Adapter, in channel.InboundMsg, sessionID, result string, finalOnly bool) error {
 	replied := false
-	if err := m.deliverReply(ctx, ch, in, sessionID, result, &replied); err != nil {
+	if err := m.deliverReply(ctx, ch, in, sessionID, result, finalOnly, &replied); err != nil {
 		return err
 	}
 	if in.MsgID != "" {

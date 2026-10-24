@@ -140,6 +140,9 @@ func (a *Adapter) Send(ctx context.Context, m channel.OutboundMsg) (channel.Send
 	msg := Message{Role: RoleAgent, Kind: KindReply, Text: m.Text}
 	if m.Summary {
 		msg.Kind = KindSummary
+	} else if m.Silent {
+		// The long half of a split reply: its summary is still to come.
+		msg.Part = PartBody
 	}
 	// The originating message travels with the reply (D2). Only a reply that
 	// does not name one (an old caller) falls back to the store's guess.
@@ -155,12 +158,20 @@ func (a *Adapter) Send(ctx context.Context, m channel.OutboundMsg) (channel.Send
 		msg.ReplyTo = u.ID
 		if u.Status == StatusFailed {
 			msg.Kind = KindFailure
+			msg.Part = ""
 		}
+	} else if m.InReplyTo != "" {
+		msg.ReplyTo = m.InReplyTo // exact identity even when the question was evicted
 	}
 	if msg.Kind != KindFailure && len(m.Replies) > 0 {
 		msg.Replies = append([]string{}, m.Replies...)
 	}
-	stored := a.store.Append(msg)
+	// Durable or an error: a reply that is not on disk must not be followed
+	// by a "done" that is (the turn then fails and says so instead).
+	stored, err := a.store.AppendDurable(msg)
+	if err != nil {
+		return channel.SendReceipt{}, err
+	}
 	// Silence carries into the mirror too: the long half of a split reply must
 	// not raise a Telegram push either, or the user gets the truncated one.
 	a.echo("⌚ "+m.Text, m.Silent)
@@ -171,6 +182,17 @@ func (a *Adapter) Send(ctx context.Context, m channel.OutboundMsg) (channel.Send
 // is what makes the wrist show queued / working / done / failed without a
 // second signalling path.
 func (a *Adapter) Ack(chatID, msgID, reaction string) error {
+	_ = a.ack(msgID, reaction)
+	return nil
+}
+
+// AckDurable is Ack that reports a failed write (channel.DurableAcker). The
+// session layer calls it for "working" before the harness runs.
+func (a *Adapter) AckDurable(chatID, msgID, reaction string) error {
+	return a.ack(msgID, reaction)
+}
+
+func (a *Adapter) ack(msgID, reaction string) error {
 	status := ""
 	switch reaction {
 	case channel.ReactionWorking:
@@ -184,7 +206,7 @@ func (a *Adapter) Ack(chatID, msgID, reaction string) error {
 	default:
 		return nil
 	}
-	a.store.Update(msgID, func(m *Message) bool {
+	_, _, err := a.store.UpdateDurable(msgID, func(m *Message) bool {
 		if m.Role != RoleUser || m.Status == status {
 			return false
 		}
@@ -197,7 +219,10 @@ func (a *Adapter) Ack(chatID, msgID, reaction string) error {
 		}
 		return true
 	})
-	return nil
+	if err != nil {
+		log.Printf("watch: status %s for %s not persisted: %v", status, msgID, err)
+	}
+	return err
 }
 
 // ---- notify.Sink ----

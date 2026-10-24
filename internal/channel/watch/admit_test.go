@@ -153,7 +153,7 @@ func TestRestartReconciliation(t *testing.T) {
 			}
 			return CommittedTurn{}, false
 		},
-		func(ctx context.Context, in channel.InboundMsg, sid, result string) error {
+		func(ctx context.Context, in channel.InboundMsg, sid, result string, finalOnly bool) error {
 			delivered = append(delivered, in.MsgID+"="+result)
 			_, err := b.Send(ctx, channel.OutboundMsg{Text: result, InReplyTo: in.MsgID})
 			return err

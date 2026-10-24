@@ -46,6 +46,10 @@ type Message struct {
 	// RequestID is the client's idempotency key (its outbox item id) on a
 	// user message (D5). A repeat of the same request answers this message.
 	RequestID string `json:"request_id,omitempty"`
+	// Part is "body" on the long half of a split reply (its summary follows).
+	// The restart reconciliation uses it to tell a complete reply from one
+	// cut by the restart.
+	Part string `json:"part,omitempty"`
 	// Inbound is the full inbound payload of a user message, persisted at
 	// admission so a restart can re-enqueue a queued request. Never served to
 	// clients (see Public).
@@ -85,6 +89,8 @@ const (
 	KindFailure = "failure"
 	KindNotice  = "notice"
 	KindSummary = "summary" // the short half of a split reply; the long half precedes it
+
+	PartBody = "body"
 
 	StatusQueued     = "queued"
 	StatusWorking    = "working"
@@ -127,8 +133,14 @@ type Store struct {
 	// reqs is the request_id index (D5b): request id -> newest snapshot of
 	// its message, kept when the message itself is evicted.
 	reqs map[string]Message
-	// failWrite is a test hook that fails the next persisted write.
+	// failWrite and failSync are test hooks: they fail the next persisted
+	// write before it happens, or its fsync after the line was written.
 	failWrite func() error
+	failSync  func() error
+	// broken is set when a failed write could not be rolled back: the file
+	// may hold a record memory does not, so admission stops until a restart
+	// (whose replay sees the file as it is).
+	broken error
 
 	maxLog    int // in-memory append log bound
 	maxIDs    int // distinct messages kept
@@ -238,7 +250,12 @@ func (s *Store) replay() (int, int, error) {
 		line, rerr := readLine(r, maxLineBytes)
 		if line != nil {
 			var m Message
-			if len(line) > maxLineBytes || json.Unmarshal(line, &m) != nil || m.ID == "" {
+			if len(line) <= maxLineBytes && json.Unmarshal(line, &m) == nil && m.ID == "" && m.Evicted && m.Seq > 0 {
+				// The seq high-water mark compaction keeps (see compact).
+				if m.Seq > s.seq {
+					s.seq = m.Seq
+				}
+			} else if len(line) > maxLineBytes || json.Unmarshal(line, &m) != nil || m.ID == "" {
 				skipped++
 			} else {
 				n++
@@ -307,7 +324,14 @@ func (s *Store) compact() error {
 		return err
 	}
 	w := bufio.NewWriter(f)
-	// The request index of messages no longer in the conversation goes first,
+	// The seq high-water mark first: the snapshot that holds the highest seq
+	// may be one compaction drops, and a seq that went down on reopen would
+	// make a client (which keeps max(cursor)) skip new messages. An id-less
+	// line: replay of an older binary skips it.
+	hw, _ := json.Marshal(Message{Seq: s.seq, Evicted: true})
+	w.Write(hw)
+	w.WriteByte('\n')
+	// The request index of messages no longer in the conversation goes next,
 	// marked evicted, so dedupe survives compaction and restart (D5b).
 	for _, m := range s.evictedRequests() {
 		m.Evicted = true
@@ -434,10 +458,53 @@ func (s *Store) writeLocked(m Message) error {
 		}
 		return err
 	}
-	if err := s.f.Sync(); err != nil {
+	err = s.f.Sync()
+	if err == nil && s.failSync != nil {
+		err = s.failSync()
+	}
+	if err != nil {
+		// The line may be on disk although the sync failed: cut it back, or
+		// stop admitting when that is not possible either.
+		if size < 0 {
+			s.broken = err
+		} else if terr := s.f.Truncate(size); terr != nil {
+			s.broken = terr
+		} else if serr := s.f.Sync(); serr != nil {
+			s.broken = serr
+		}
 		return err
 	}
 	return nil
+}
+
+// AppendDurable is Append that fails, storing nothing, when the record
+// cannot be written and synced.
+func (s *Store) AppendDurable(m Message) (Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if m.ID == "" {
+		m.ID = newID()
+	}
+	return s.appendDurable(m, true)
+}
+
+// UpdateDurable is Update that fails, changing nothing, when the new
+// snapshot cannot be written and synced.
+func (s *Store) UpdateDurable(id string, fn func(m *Message) bool) (Message, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.latest[id]
+	if !ok {
+		return Message{}, false, nil
+	}
+	if !fn(&m) {
+		return m, false, nil
+	}
+	out, err := s.appendDurable(m, true)
+	if err != nil {
+		return Message{}, false, err
+	}
+	return out, true, nil
 }
 
 // indexRequest records the newest snapshot of a request's message.
@@ -448,15 +515,22 @@ func (s *Store) indexRequest(m Message) {
 	if cur, ok := s.reqs[m.RequestID]; ok && cur.Seq > m.Seq {
 		return
 	}
+	// The receipt, not the payload: no inbound copy, and a long text is cut
+	// (the client already holds what it sent).
+	m.Inbound = nil
+	if r := []rune(m.Text); len(r) > receiptTextMax {
+		m.Text = string(r[:receiptTextMax]) + "\u2026"
+	}
 	s.reqs[m.RequestID] = m
 }
 
-// maxEvictedRequests bounds the request index entries kept for messages that
-// left the conversation (newest first).
-const maxEvictedRequests = 2000
+// receiptTextMax bounds the text kept in a request index entry.
+const receiptTextMax = 512
 
 // evictedRequests returns the indexed snapshots whose message is no longer
-// in the conversation, newest maxEvictedRequests, oldest first.
+// in the conversation, oldest first. The index is not bounded: dedupe must
+// outlive the conversation's retention. Each entry is small (see
+// indexRequest).
 func (s *Store) evictedRequests() []Message {
 	out := []Message{}
 	for _, m := range s.reqs {
@@ -465,9 +539,6 @@ func (s *Store) evictedRequests() []Message {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
-	if len(out) > maxEvictedRequests {
-		out = out[len(out)-maxEvictedRequests:]
-	}
 	return out
 }
 
@@ -492,19 +563,6 @@ func (s *Store) trimLocked() {
 		keep = append(keep, id)
 	}
 	s.order = keep
-	if len(s.reqs) > 2*maxEvictedRequests+s.maxIDs {
-		// Bound the in-memory index too: drop the oldest evicted entries.
-		ev := s.evictedRequests()
-		keepEv := map[string]bool{}
-		for _, m := range ev {
-			keepEv[m.RequestID] = true
-		}
-		for rid, m := range s.reqs {
-			if _, live := s.latest[m.ID]; !live && !keepEv[rid] {
-				delete(s.reqs, rid)
-			}
-		}
-	}
 }
 
 // Update applies fn to the newest snapshot of id and, when fn reports a
