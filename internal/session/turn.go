@@ -208,7 +208,6 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 	var text string
 	var turnErr error
 	sendDone := false
-	gotResult := false
 	if req.NoCollect {
 		select {
 		case turnErr = <-sendErr:
@@ -221,7 +220,7 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 		if structured {
 			termC = terminal
 		}
-		text, turnErr, sendDone, gotResult = m.collect(ctx, s, turnID, termC, events, sendErr, req.Options)
+		text, turnErr, sendDone, _ = m.collect(ctx, s, turnID, termC, events, sendErr, req.Options)
 	}
 	switch {
 	case !sendDone || ctx.Err() != nil || errors.Is(turnErr, context.Canceled) || errors.Is(turnErr, context.DeadlineExceeded):
@@ -248,10 +247,12 @@ func (m *Manager) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, err
 				log.Printf("session %s: replace after an undrained turn failed: %v", id, err)
 			}
 		}
-		if turnErr == nil && !req.NoCollect && !gotResult {
-			// The bus is lossy (a full subscriber drops events); the pump's
-			// own record of the turn is not. No result there either means
-			// the answer is unknown: a failure, not an empty success.
+		if turnErr == nil && !req.NoCollect {
+			// The answer is the pump's own record of the turn, not what the
+			// bus delivered: the bus is lossy (a full subscriber drops
+			// events, e.g. the final output before a blank result). No result
+			// there means the answer is unknown: a failure, not an empty
+			// success.
 			s.mu.Lock()
 			got, res := s.turnGot, s.turnRes
 			s.mu.Unlock()

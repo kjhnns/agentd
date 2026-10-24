@@ -54,7 +54,10 @@ func (a *Adapter) Reconcile(ctx context.Context,
 				err = deliver(ctx, in, t.SessionID, t.Result, anyPart)
 			}
 			if err == nil {
-				a.setStatus(m.ID, StatusDone)
+				if serr := a.setStatus(m.ID, StatusDone); serr != nil {
+					log.Printf("watch: reconcile %s: done not persisted (left for the next start): %v", m.ID, serr)
+					continue
+				}
 				delivered++
 				continue
 			}
@@ -77,7 +80,10 @@ func (a *Adapter) Reconcile(ctx context.Context,
 				continue
 			}
 		}
-		a.setStatus(m.ID, StatusFailed)
+		if serr := a.setStatus(m.ID, StatusFailed); serr != nil {
+			log.Printf("watch: reconcile %s: failed not persisted (left for the next start): %v", m.ID, serr)
+			continue
+		}
 		failed++
 	}
 	if requeued+delivered+failed > 0 {
@@ -86,8 +92,9 @@ func (a *Adapter) Reconcile(ctx context.Context,
 	return
 }
 
-func (a *Adapter) setStatus(id, status string) {
-	a.store.Update(id, func(m *Message) bool {
+// setStatus writes a status durably; on an error nothing changed.
+func (a *Adapter) setStatus(id, status string) error {
+	_, _, err := a.store.UpdateDurable(id, func(m *Message) bool {
 		if m.Status == status {
 			return false
 		}
@@ -97,6 +104,7 @@ func (a *Adapter) setStatus(id, status string) {
 		}
 		return true
 	})
+	return err
 }
 
 func (a *Adapter) hasFailure(id string) bool {

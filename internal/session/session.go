@@ -1114,12 +1114,39 @@ func (m *Manager) RouteInbound(ctx context.Context, ch channel.Adapter, in chann
 		result = res.Text
 		break
 	}
-	if err := m.deliverReply(ctx, ch, in, sessionID, ref, result, false, &replied); err != nil {
-		return err
+	err := m.deliverReply(ctx, ch, in, sessionID, ref, result, false, &replied)
+	if err != nil {
+		if _, durable := ch.(channel.DurableAcker); durable {
+			// The answer exists (its turn record is committed); only the
+			// delivery failed. Retry it, then leave the request unfinished:
+			// no notice and no "failed", so the restart reconciliation
+			// delivers the stored answer instead of it being lost.
+			for _, wait := range deliveryRetries {
+				select {
+				case <-time.After(wait):
+				case <-ctx.Done():
+				}
+				if err = m.deliverReply(ctx, ch, in, sessionID, ref, result, replied, &replied); err == nil {
+					break
+				}
+			}
+			if err != nil {
+				log.Printf("session: delivery to %s/%s failed after retries; left unfinished for the restart recovery: %v", in.Channel, in.MsgID, err)
+				reacted = false // no final glyph: the request stays working
+				replied = true  // no failure notice: the answer exists
+				return err
+			}
+		} else {
+			return err
+		}
 	}
 	finalReaction = channel.ReactionDone
 	return nil
 }
+
+// deliveryRetries are the waits before re-delivering a committed answer to a
+// channel that persists the conversation (the wrist).
+var deliveryRetries = []time.Duration{time.Second, 5 * time.Second}
 
 // deliverReply sends a turn's result through the channel, shaped for the
 // wrist: the proposed replies come off, a long answer goes out as the full

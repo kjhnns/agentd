@@ -26,9 +26,10 @@ type Record struct {
 
 // Log is a thread-safe append-only JSONL writer with fsync-per-record.
 type Log struct {
-	mu   sync.Mutex
-	f    *os.File
-	path string
+	mu     sync.Mutex
+	f      *os.File
+	path   string
+	broken error // a failed append could not be rolled back
 }
 
 // Open opens (creating parent dirs as needed) the JSONL file for appending.
@@ -135,13 +136,37 @@ func (l *Log) Append(recordType string, payload any) error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.broken != nil {
+		return fmt.Errorf("runlog refuses appends after a failed rollback: %w", l.broken)
+	}
+	st, err := l.f.Stat()
+	if err != nil {
+		return fmt.Errorf("runlog stat: %w", err)
+	}
+	size := st.Size()
 	if _, err := l.f.Write(append(line, '\n')); err != nil {
+		l.rollback(size)
 		return fmt.Errorf("runlog write: %w", err)
 	}
 	if err := l.f.Sync(); err != nil {
+		l.rollback(size)
 		return fmt.Errorf("runlog fsync: %w", err)
 	}
 	return nil
+}
+
+// rollback cuts a failed append back to the previous size, so its bytes
+// cannot glue onto the next record. When that fails, appends stop. Caller
+// holds l.mu.
+func (l *Log) rollback(size int64) {
+	if err := l.f.Truncate(size); err != nil {
+		l.broken = err
+	} else if err := l.f.Sync(); err != nil {
+		l.broken = err
+	}
+	if l.broken != nil {
+		log.Printf("runlog: rollback of a failed append failed: %v; refusing appends", l.broken)
+	}
 }
 
 // Close closes the underlying file.

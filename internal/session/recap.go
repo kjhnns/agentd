@@ -217,8 +217,17 @@ func threadMessages(logPath, title string) ([]recapMsg, error) {
 				continue
 			}
 			out = append(out, recapMsg{TS: rec.TS, Role: "user", Text: tr.UserText, MsgID: tr.MessageID})
-			if tr.Error == "" && strings.TrimSpace(tr.Result) != "" {
+			switch {
+			case tr.Error == "" && strings.TrimSpace(tr.Result) != "":
 				out = append(out, recapMsg{TS: rec.TS, Role: "agent", Text: recapResult(tr.Result)})
+			case tr.Error != "":
+				// The failure notice of this turn is skipped (its ref is
+				// covered); the turn record carries what the user was told.
+				text := "(this request failed: " + tr.Error + ")"
+				if p := strings.TrimSpace(tr.Result); p != "" {
+					text += "\nPartial work shown to the user:\n" + p
+				}
+				out = append(out, recapMsg{TS: rec.TS, Role: "agent", Text: text})
 			}
 
 		case "inbound":

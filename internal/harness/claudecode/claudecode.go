@@ -454,16 +454,34 @@ func (h *handle) readLoop() {
 			if e.TS.IsZero() {
 				e.TS = time.Now().UTC()
 			}
-			select {
-			case h.events <- e:
-			default:
+			terminal := e.Kind == eventbus.KindResult || e.Kind == eventbus.KindError
+			if terminal {
+				// The turn's answer must not be dropped on a full queue: the
+				// session layer reads it from here. Wait (bounded) for room.
+				t := time.NewTimer(terminalSendWait)
+				select {
+				case h.events <- e:
+				case <-t.C:
+					log.Printf("session %s: event queue full for %s; terminal event dropped", h.id, terminalSendWait)
+				}
+				t.Stop()
+			} else {
+				select {
+				case h.events <- e:
+				default:
+				}
 			}
-			if e.Kind == eventbus.KindResult || e.Kind == eventbus.KindError {
+			if terminal {
 				h.signalWaiter(e)
 			}
 		}
 	}
 }
+
+// terminalSendWait bounds how long the read loop waits for room in the
+// event queue to deliver a turn's result or error (other events are dropped
+// at once when the queue is full).
+const terminalSendWait = 10 * time.Second
 
 // signalWaiter delivers a turn-terminating event to a waiting Send, if any.
 func (h *handle) signalWaiter(e eventbus.Event) {

@@ -240,3 +240,69 @@ func TestMarkedRecordsWithoutTheirTurnRecordStayInTheRecap(t *testing.T) {
 		}
 	}
 }
+
+// flakyDurable is a durable channel whose Send fails a set number of times.
+type flakyDurable struct {
+	seqChannel
+	fail int
+}
+
+func (f *flakyDurable) AckDurable(chatID, msgID, reaction string) error {
+	return f.Ack(chatID, msgID, reaction)
+}
+func (f *flakyDurable) Send(ctx context.Context, m channel.OutboundMsg) (channel.SendReceipt, error) {
+	f.mu3.Lock()
+	defer f.mu3.Unlock()
+	if f.fail > 0 {
+		f.fail--
+		f.log = append(f.log, "send:err")
+		return channel.SendReceipt{}, errors.New("disk full")
+	}
+	f.log = append(f.log, fmt.Sprintf("send:failure=%v", m.Failure))
+	return channel.SendReceipt{ID: "x"}, nil
+}
+
+// TestDeliveryFailureOfACommittedAnswer (review round 3): when only the
+// delivery of a successful turn fails, the wrist request is retried and,
+// if it still fails, left unfinished (no failure notice, no "failed"), so
+// the restart reconciliation delivers the stored answer.
+func TestDeliveryFailureOfACommittedAnswer(t *testing.T) {
+	old := deliveryRetries
+	deliveryRetries = []time.Duration{time.Millisecond, time.Millisecond}
+	defer func() { deliveryRetries = old }()
+	mgr := NewManager(newEchoAdapter(), eventbus.New(), nil)
+	mgr.Policy = Policy{TurnTimeout: time.Second}
+	in := channel.InboundMsg{Channel: "watch", UserID: "c", MsgID: "m", Text: "q"}
+
+	ch := &flakyDurable{fail: 1}
+	if err := mgr.RouteInbound(context.Background(), ch, in, NewChatMap(LaneMain), t.TempDir(), ""); err != nil {
+		t.Fatalf("one failed delivery is retried: %v", err)
+	}
+	if fmt.Sprint(ch.log) != fmt.Sprint([]string{"ack:" + channel.ReactionWorking, "send:err", "send:failure=false", "ack:" + channel.ReactionDone}) {
+		t.Fatalf("log = %v", ch.log)
+	}
+
+	ch = &flakyDurable{fail: 10}
+	_ = mgr.RouteInbound(context.Background(), ch, in, NewChatMap(LaneMain), t.TempDir(), "")
+	for _, e := range ch.log {
+		if e == "send:failure=true" || e == "ack:"+channel.ReactionError {
+			t.Fatalf("a committed answer was turned into a failure: %v", ch.log)
+		}
+	}
+}
+
+// TestRecapShowsAFailedTurnOnce (review round 3): the failure notice of a
+// turn is skipped (its ref is covered), so the turn record renders it.
+func TestRecapShowsAFailedTurnOnce(t *testing.T) {
+	const chat = "42"
+	path := writeThread(t, []func(*runlog.Log){
+		turnRec(TurnRecord{TurnID: "t1", Chat: chat, Conv: ConvMain, Ref: "r1", UserText: "book it", Result: "found two trains", Error: "turn timed out"}),
+		func(l *runlog.Log) {
+			_ = l.Append("outbound", map[string]string{"chat": chat, "session": "s", "text": "I stopped working on that message", "kind": "failure-notice", "rec": "turn", "ref": "r1"})
+		},
+	})
+	got, _ := ThreadRecap(path, "telegram:"+chat, RecapPolicy{}, time.Now().UTC())
+	if strings.Count(got, "this request failed: turn timed out") != 1 || !strings.Contains(got, "found two trains") || strings.Contains(got, "I stopped working") {
+		t.Fatalf("recap:\n%s", got)
+	}
+}
