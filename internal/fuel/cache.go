@@ -44,6 +44,7 @@ type Cache struct {
 	// onChange is called (outside the cache lock) when a refresh brings
 	// other food rows for a date that was loaded before, or other Body
 	// composition rows ("body").
+	onImport func([]Value, string, string)
 	onChange func(date string)
 	bodyFP   string
 }
@@ -93,6 +94,9 @@ func (c *Cache) RefreshDay(ctx context.Context, date string) error {
 	vals, err := c.vars.ByDate(rctx, date)
 	if err != nil {
 		return err
+	}
+	if c.onImport != nil {
+		c.onImport(vals, c.ids.Food, date)
 	}
 	dc := &dayCache{fetched: c.now(), ok: true}
 	seen := map[string]bool{}
@@ -333,6 +337,9 @@ func (c *Cache) RefreshBody(ctx context.Context) error {
 	vals, err := c.vars.All(rctx)
 	if err != nil {
 		return err
+	}
+	if c.onImport != nil {
+		c.onImport(vals, c.ids.Food, "")
 	}
 	var body []Value
 	rec := map[string][]Value{}

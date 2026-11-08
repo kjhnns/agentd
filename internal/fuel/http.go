@@ -117,6 +117,14 @@ func (s *Service) gate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if r.URL.Path == "/fuel/admin/store-status" {
+			if !s.authed(r) {
+				writeErr(w, errf(http.StatusUnauthorized, "unauthorized", false, "missing or wrong token"))
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
 		role := s.tokenRole(r)
 		// The web app (spec 23): a session cookie stands for the app token.
 		// A request with an Authorization header is judged by the bearer alone.
@@ -183,10 +191,12 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("GET /fuel/feed", s.handleFeed)
 	mux.HandleFunc("GET /fuel/photo/{id}", s.handlePhoto)
 	mux.HandleFunc("GET /fuel/snapshot", s.handleSnapshot)
+	mux.HandleFunc("GET /fuel/gauges.png", s.handleGauges)
 	mux.HandleFunc("GET /fuel/recent", s.handleRecent)
 	mux.HandleFunc("GET /fuel/frequent", s.handleFrequent)
 	mux.HandleFunc("POST /fuel/relog", s.turnBound(s.handleRelog))
 	mux.HandleFunc("GET /fuel/day", s.handleDay)
+	mux.HandleFunc("GET /fuel/admin/store-status", s.handleStoreStatus)
 	// v7 (spec 18.4, 18.5 and section 19): records, calibration, the week.
 	mux.HandleFunc("GET /fuel/week", s.handleWeek)
 	// Section 20: the write operations of the chat without a model call.

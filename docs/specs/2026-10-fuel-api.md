@@ -1277,3 +1277,92 @@ On a flight the Wi-Fi often allows only messaging. The app is then offline (its 
 24.4 Marking and duplicate guard. The entry and its user feed line carry `via: "telegram"` (feed wire key `via`, omitted otherwise; never accepted from the wire). The chat history of a turn marks such lines "[via Telegram]". An APP message (no via) whose `local_time` is within 3 h of a Telegram message's time gets a TELEGRAM FALLBACK block in the turn: those messages, and the rule that a message describing the same food and amount is most likely the offline outbox resending it, so the agent logs nothing and asks once. The existing likely_duplicate check of `/fuel/items` (minutes) stays as it is.
 
 24.5 Not in scope: an offline estimate on the phone; the joe_pa Telegram bot is unchanged.
+
+## 25. Local SQLite store (hybrid, then Variables export retired)
+
+Owner decision, 2026-11-08: use option B of the SQLite evaluation, with a hybrid transition. Variables logging is retired only after backups and the remaining clients are ready. This section changes storage ownership in phases; it does not change the food, correction, record or HTTP shapes of earlier sections.
+
+### 25.1 Configuration and H1 implementation boundary
+
+The rollout configuration contract is:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `store_path` | `<state_dir>/fuel.sqlite` | Local database on persistent storage. Its directory and WAL sidecars belong to fueld. A path change is a migration, not a way to select an empty replacement. |
+| `store_mode` | `"off"` | H1 accepts `"off"` and `"shadow"`. The later `"hybrid"` and `"local"` phases remain reserved and fail startup, as do unknown values. |
+
+`off` keeps the existing Variables and JSONL paths. `shadow` adds SQLite copies and comparison without changing answers or authority. `hybrid` makes SQLite authoritative for fueld reads and local mutations, exports fueld-owned writes to Variables asynchronously, and imports foreign Variables writes. `local` turns off food logging export and foreign food import after the H4 final sync. Body and strength sources with other owners need an explicit inbound policy; they are not silently cut off with food logging.
+
+H1 now connects `internal/fuel/sqlstore` to fueld in shadow mode. Deploy the new binary first with the existing config. Verify the nightly complete backup and off-box copy before adding `store_mode = "shadow"` and, optionally, `store_path`. Restart fueld and inspect the bearer-only `GET /fuel/admin/store-status`. Unknown config keys are still rejected. Before rolling back to an older binary, remove **both** new keys, including `store_mode = "off"`. With the new binary, selecting `off` disables the worker and leaves the SQLite files in place. Existing `go 1.22` and food HTTP contracts remain unchanged.
+
+The store uses WAL, foreign keys, a 5 s busy timeout and `synchronous=FULL` on every connection. Migrations and schema version changes commit together. Opening a newer unknown schema fails without running migrations. Food rows retain their entire JSON object, including null versus missing versus zero nutrients, intake fields, lever keys, correction/revision payloads, and move links. Indexed columns hold a stable local ID, `source` (`fueld` or `variables_import`), Variables value ID when known, `op_id`, local sequence, `record_date`, and `created_at`. Storage source is distinct from the JSON payload's existing `source` key.
+
+Local sequences order rows across clock differences. Updating an imported value preserves its local ID and sequence. Imported rows are idempotent by Variables value ID and create no export obligation. Known export echoes retain the fueld payload, adopt the authoritative Variables creation timestamp, and can acquire their value-ID alias by `op_id`. Additional physical values with that `op_id` remain imported rows. A value ID assigned to a different operation fails explicitly for reconciliation. Do not collapse distinct physical Variables rows merely because they share an `op_id`; preserve aliases and apply the existing logical-operation deduplication rules when reducing imported history.
+
+The schema also reserves operations, append-only journal events (including entries, items, fraction choices and request identities), idempotency responses with expiry, feed lines, record operations including voids, the export outbox, and import cursors. H1 exposes row/outbox and idempotency methods, legacy-envelope mirroring, status, backup and integrity checks. A bounded service worker copies legacy outcomes and imports Variables food history. Authoritative service transaction bundles, export workers, deletion reconciliation, and reducers using local sequences arrive with the later integration. A fueld food row and its outbox obligation already commit in one SQLite transaction. H2 must extend that boundary to all affected rows, operations/journal, idempotency and feed/record state for a request, including both halves of a move.
+
+### 25.2 Backup gate for every phase
+
+Before enabling shadow writes, configure a nightly backup job and verify its timer, successful runs and off-box destination. Take a consistent SQLite snapshot with the online backup API (a `VACUUM INTO` snapshot is acceptable if a future driver lacks that API). Never copy only a live database file while WAL may contain committed pages. The H1 `Backup(ctx, destPath)` uses the online API, checks integrity and foreign keys, and produces a synced standalone snapshot at a new path. It does not back up photos/configuration or schedule/copy backups itself.
+
+Each nightly backup set includes that snapshot, all referenced photos, configuration and required target/staple files, plus the existing JSONL files while rollback still needs them. Protect credentials in the backup as on the live host. Copy the complete set off the box and retain the pre-cutover sets and final Variables export. Record snapshot time, schema/binary version, photo coverage, integrity result and off-box copy result. A database snapshot without the matching photos and configuration is incomplete. Coordinate the snapshot and photo capture so no referenced file can be pruned between them; files added later may be included harmlessly.
+
+Run and record a restore drill **before H2 and again before H4** using an off-box set in an isolated instance. Check integrity and foreign keys, load the actual configuration and photos, compare representative daily totals, revisions, corrections/moves, record views, feed pagination and idempotent retries, and exercise pending export recovery without contacting production. An unverified timer, missing off-box set, failed drill, or unexplained comparison blocks the transition. Nightly frequency implies up to a day of loss after a total host failure; take an additional backup immediately before each authority change.
+
+### 25.3 H1: store and shadow writes
+
+Entry criteria: the store passes migration, atomicity/crash, import, ordering, idempotency and backup/restore tests. The nightly complete-set backup and off-box copy are operational before shadow mode is enabled. Instrument Variables calls and shadow failures so lag and mismatches are visible.
+
+In `shadow`, Variables and the existing JSONL stores retain their authority. Copy successful writes and imported history into SQLite, preserving IDs, timestamps, pending operations, feed order, idempotency and records. Backfill **all** food history, not only the 35-day cache. Establish the initial sequence in legacy reducer order, with a deterministic tie-break, then append new local sequences. A shadow outbox is compared/reconciled against the legacy write result; it must not independently POST a second copy. Compare daily totals, revisions, corrections, moves and record views. A shadow failure leaves a visible gap for replay and blocks promotion; it does not change the legacy result.
+
+Rollback: set `off`, stop shadow workers, and keep the failed database and diagnostics for investigation. Legacy writes remain authoritative. Rebuild the shadow from a complete legacy snapshot plus the subsequent delta before trying again. Enabling shadow writes requires `store_mode = "shadow"`.
+
+#### H1 wiring and operational status
+
+Reads and responses stay on Variables, the cache and JSONL. Hooks copy every food operation through the shared POST path, including log, items, fix, undo, move, relog and compensation. Successful POSTs bind the Variables value ID. Uncertain POSTs leave a pending shadow row. A definitive rejection creates no new food row. Journal events also preserve entries, items, fraction choices and request identities. Idempotency responses retain their seven-day expiry. Feed copies retain their legacy sequence. Record operations include attempts, outcomes and voids. Complete legacy JSONL files replay on startup with stable journal event keys, without duplicating feed or journal lines.
+
+The worker imports food rows from date refreshes and the existing full-history `All` read at startup and on the body-history refresh loop. This includes rows older than the 35-day cache. The initial full batch interleaves journal-owned food rows with foreign Variables rows in creation-time and value-ID order. Pending rows without a value ID use their operation ID as the tie-break. Later Variables batches use the same deterministic ordering. Updates preserve local identity and sequence. Known echoes acknowledge pending outbox entries without a POST. Failed operations remove unconfirmed food rows and their export obligations, including during startup replay; confirmed remote rows remain for reconciliation. Conflicting identities are counted and logged. The legacy timestamp reducer remains the comparison authority in H1. A failed initial full scan leaves backfill incomplete and blocks promotion.
+
+A single worker serializes SQLite work. Request hooks enqueue without waiting for SQLite or logging I/O. The queue is capped at 1,024 jobs and 16 MiB of serialized payloads. Jobs use two-second contexts, with a separate context per imported row. SQLite also retains its five-second busy timeout. Queue overflow, oversized batches, open errors and write errors increment a process-lifetime error counter. The worker logs failures and continues. Shutdown drains the queue for up to five seconds before cancellation. Legacy files and Variables remain the replay sources. Any dropped work or unexplained mismatch blocks H2 and requires a complete replay and comparison. Shadow mode performs no exports or deletion reconciliation.
+
+`GET /fuel/admin/store-status` requires the app bearer token. Browser cookies and the agent token do not grant access. The route works during startup and when targets are invalid. It reads the worker's cached status, so it does not wait on SQLite. The JSON fields are:
+
+| Field | Meaning |
+| --- | --- |
+| `mode` | `off` or `shadow`. |
+| `available` | The last SQLite status read succeeded. |
+| `counts` | Counts for `food_rows`, `operations`, `journal`, `idem`, `feed`, `records`, `export_outbox`, plus `pending` outbox entries and `imported` food rows. |
+| `last_write` | Persisted time of the last completed shadow job, or null. |
+| `error_count` | Failures and dropped jobs since this process started. Logs retain diagnostics across restarts. |
+| `queue_depth` | Waiting jobs. An active job is not included. |
+| `last_backup` | Persisted completion time of the last successful `sqlstore.Backup`, or null. It does not certify photos, configuration or off-box copying. |
+
+Status refreshes after the queue drains and once per second while idle. A busy or failed worker can leave counts stale. A successful external backup must use the store's `Backup` method to update `last_backup`. H1 does not install or operate the nightly backup job.
+
+### 25.4 H2: SQLite authority with Variables export and foreign import
+
+Entry criteria: full history and local-state import is complete, shadow comparisons agree, unresolved/pending operations have an explicit migration disposition, and crash/restart, duplicate requests, lost POST replies, external-ID corrections, moves, export backlog and disk-full checks pass. Complete the first off-box restore drill. Verify that `scripts/food-log`, the agentd main agent, and the Variables app can still write through the inbound importer. One-way export is insufficient at this phase.
+
+Briefly stop all writers for the final delta, compare again, take a backup, and switch to `hybrid`. Reads and successful fueld mutations now commit locally. Variables outages delay export/import but do not invalidate a committed local meal. Expose importer freshness and export backlog so stale foreign data is visible. Preserve legacy value-ID aliases for old nightly proposals and corrections. Keep remote uncertain-write reconciliation in the exporter: read by `op_id` before retrying a lost POST reply, retain its durable obligation, then atomically bind the returned value ID and mark export done.
+
+While the three foreign writers remain, import their new and changed rows idempotently by value ID. Preserve original timestamps and correction links; allocate sequence on first import only. Suppress export echoes by known value IDs and fueld `op_id`. Foreign changes must not silently overwrite a fueld-owned row: use an explicit correction or surface a conflict. Import genuinely foreign edits with their existing ownership, and reconcile deletions only from a successfully completed authoritative scan, never from a failed/partial read. Commit a cursor only with the complete imported batch. The current Variables API has no guaranteed change cursor, so use overlapping date reads and periodic full-history reconciliation to catch historical changes and deletions. Deletion/tombstone and batch-cursor behavior must be implemented before H2; the H1 row upsert alone does not supply it. Body measurements and strength retain their explicitly assigned external ownership, and only fueld-owned records are exported.
+
+Rollback: quiesce local and foreign writers, finish inbound reconciliation, drain exports (including uncertain operations), rebuild compatible legacy journal/idem/feed/records state and verify totals/aliases against Variables before selecting `off` and the old binary. If Variables cannot accept the backlog, keep SQLite authority while repairing it. Never switch binaries or restore the pre-cutover database alone after new local writes. Preserve the latest database and backups throughout rollback.
+
+### 25.5 H3: food-log and nightly review use the fueld API
+
+Entry criteria: H2 is stable with visible bounded lag, ongoing verified nightly backups and working alias resolution. API clients pass read/write, correction, retry and outage checks. The nightly workflow can obtain its food and feed inputs from fueld without reading Variables or `feed.jsonl` directly.
+
+Convert `scripts/food-log` to an API client, including commands used by the main agent and stored nightly proposals. Move nightly review reads, feed access and accepted corrections to fueld's API. Verify the main agent no longer bypasses it. Keep `hybrid`, export and foreign import while the Variables app or another verified writer remains. Audit those remaining writers and migrate or disable food writes before H4; do not mistake absence of recent writes for their removal.
+
+Rollback: revert a client to its previous Variables path only while the H2 importer is enabled and tested, then reconcile its delta. Keep SQLite authoritative and preserve all committed local writes. A storage-authority rollback still requires the complete H2 procedure.
+
+### 25.6 H4: retire Variables logging
+
+Entry criteria: food-log, nightly review, the main agent and the Variables app have no remaining direct food writes. All consumers use the fueld API or an explicitly read-only archive. Finish inbound reconciliation, resolve identity conflicts, drain the export outbox, compare final totals and aliases, and keep the **last full Variables export** with a timestamp and checksums. Verify nightly snapshot + photos + configuration coverage, off-box copies and retention. Complete the second restore drill before switching.
+
+Set `local`: food export is off, Variables food logging is retired, and the last full export is kept read-only. Disable write access or remove food write actions in the Variables app/scripts so a stray write cannot become silent divergent history. Historical Variables views are an archive, not current Fuel data. Keep separate inbound policies for externally owned body/strength data. Continue nightly backups and periodic restore drills as the local database now holds new food history exclusively.
+
+Rollback: prefer restoring/repairing the local service from its complete backup set, replaying any available later local transactions. To resume `hybrid`, stop writers, take a fresh snapshot, explicitly re-enable Variables writes/export, enqueue all fueld changes since export was disabled, reconcile aliases and foreign history, and verify parity before allowing foreign writers again. Do not overwrite new local history with the read-only final export. A return to legacy authority requires the H2 drain and legacy-state reconstruction as well.
+
+24.6 Macro charts (2026-11-08). `telegram_gauges = true|false` defaults to true. After a completed log or correction, the text reply is followed by a native `sendPhoto` multipart PNG replying to the original Telegram message, with a one-line plain-text summary and protein total. `/gauges` sends today's chart without a log or model turn; the flag disables both automatic and command charts. Render or upload failures are logged once and never fail or retry the food log. `GET /fuel/gauges.png` serves today's PNG through the same auth gate as snapshot (app bearer, scoped agent read, or enabled web session), independently of the Telegram flag. The shared renderer uses snapshot budgets in Protein, Sat fat, Fibre, Energy, Carbs order when present, a white 1080 px canvas at 2x, embedded Go fonts, a light gray track, gray prior intake, near-black positive meal delta with a 1.5 pt gap, a thin target marker, and muted red excess for cap/budget or over status (never for a floor). Negative corrections reduce totals without a positive delta segment; missing targets and unknown amounts are labeled. Backdated logs show today's totals without highlighting the earlier meal.

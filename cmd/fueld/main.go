@@ -133,13 +133,14 @@ func newBot(cfg fuel.DaemonConfig, svc *fuel.Service) (*fuel.TelegramBot, error)
 	}
 	user, _ := strconv.ParseInt(cfg.TelegramAllowUser, 10, 64)
 	return fuel.NewTelegramBot(fuel.TelegramOptions{
-		Token:     tok,
-		AllowUser: user,
-		API:       strings.TrimRight(cfg.TelegramAPI, "/"),
-		AppToken:  fuel.ResolveSecret(cfg.Token),
-		Handler:   svc.Handler(),
-		Ready:     svc.Ready,
-		StateDir:  cfg.StateDir,
+		DisableGauges: !cfg.TelegramGauges,
+		Token:         tok,
+		AllowUser:     user,
+		API:           strings.TrimRight(cfg.TelegramAPI, "/"),
+		AppToken:      fuel.ResolveSecret(cfg.Token),
+		Handler:       svc.Handler(),
+		Ready:         svc.Ready,
+		StateDir:      cfg.StateDir,
 	}), nil
 }
 
@@ -222,6 +223,8 @@ func build(cfg fuel.DaemonConfig) (*fuel.Service, error) {
 		TargetsFile:  cfg.TargetsFile,
 		StaplesFile:  cfg.StaplesFile,
 		StateDir:     cfg.StateDir,
+		StorePath:    cfg.StorePath,
+		StoreMode:    cfg.StoreMode,
 		StravaDir:    cfg.StravaDir,
 		TestMode:     cfg.TestMode,
 		Web:          fuel.WebOptions{Enabled: cfg.WebEnabled, PublicOrigin: cfg.PublicOrigin, InsecureTestCookie: cfg.WebInsecureTestCookie},

@@ -38,6 +38,8 @@ type Options struct {
 	TargetsFile string
 	StaplesFile string
 	StateDir    string
+	StorePath   string
+	StoreMode   string
 	StravaDir   string
 	TestMode    bool
 	Now         func() time.Time
@@ -70,6 +72,7 @@ type Options struct {
 // Service is the fast path. Construct with New, then Start, then Handler.
 type Service struct {
 	o       Options
+	shadow  *shadowStore
 	journal *Journal
 	idem    *Idem
 	feed    *Feed
@@ -148,6 +151,9 @@ type inflightReq struct {
 
 // Validate checks the static configuration (spec 1 and 2).
 func (o Options) Validate() error {
+	if o.StoreMode != "" && o.StoreMode != "off" && o.StoreMode != "shadow" {
+		return errors.New("fuel: store_mode must be off or shadow")
+	}
 	switch {
 	case o.Token == "":
 		return errors.New("fuel: token resolves to empty")
@@ -231,6 +237,13 @@ func New(o Options) (*Service, error) {
 	}
 	o.defaults()
 	o.StateDir = expandHome(o.StateDir)
+	if o.StoreMode == "" {
+		o.StoreMode = "off"
+	}
+	if o.StorePath == "" {
+		o.StorePath = filepath.Join(o.StateDir, "fuel.sqlite")
+	}
+	o.StorePath = expandHome(o.StorePath)
 	if err := os.MkdirAll(o.StateDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -298,6 +311,9 @@ func New(o Options) (*Service, error) {
 			s.staples = st
 			log.Printf("fuel: %d staple(s) loaded", len(st))
 		}
+	}
+	if o.StoreMode == "shadow" {
+		s.initShadow()
 	}
 	return s, nil
 }
@@ -420,6 +436,9 @@ func (s *Service) loadTargets() (*Targets, error) {
 func (s *Service) Close() {
 	s.Stop()
 	s.writers.Wait()
+	if s.shadow != nil {
+		s.shadow.close()
+	}
 	_ = s.journal.Close()
 	_ = s.idem.Close()
 	_ = s.feed.Close()
@@ -465,6 +484,10 @@ func (s *Service) Resolve(ctx context.Context) error {
 	s.ids = ids
 	s.cache = newCache(s.o.Vars, ids, s.journal, s.o.Now)
 	s.cache.readTO = s.o.VarTimeout
+	if s.shadow != nil {
+		s.shadow.target.Store(ids.Food)
+		s.cache.onImport = s.shadow.importRows
+	}
 	s.cache.publish = &s.stateMu
 	// A refresh that brings other rows for a past day, or other Body
 	// composition rows, makes the calibration run again (18.5 step 1): an
@@ -595,6 +618,13 @@ func (s *Service) today() string {
 }
 
 func (s *Service) hydrate(ctx context.Context) {
+	// Shadow starts with the full history batch before parallel day refreshes.
+	// The existing All read supplies it without an extra Variables request.
+	if s.shadow != nil {
+		if err := s.cache.RefreshBody(ctx); err != nil {
+			log.Printf("fuel: hydrate body composition: %v", err)
+		}
+	}
 	today := s.today()
 	sem := make(chan struct{}, 6)
 	var wg sync.WaitGroup
@@ -611,8 +641,10 @@ func (s *Service) hydrate(ctx context.Context) {
 		}()
 	}
 	wg.Wait()
-	if err := s.cache.RefreshBody(ctx); err != nil {
-		log.Printf("fuel: hydrate body composition: %v", err)
+	if s.shadow == nil {
+		if err := s.cache.RefreshBody(ctx); err != nil {
+			log.Printf("fuel: hydrate body composition: %v", err)
+		}
 	}
 	log.Printf("fuel: cache hydrated (35 days of food log, body composition)")
 }
@@ -764,6 +796,11 @@ func (s *Service) postOp(ctx context.Context, op Op, preJournaled bool) string {
 	cancel()
 	now := s.o.Now()
 	var pe *PostError
+	if s.shadow != nil && (err == nil || !errors.As(err, &pe)) {
+		cp := op
+		cp.ValueID, cp.DoneAt = vid, now
+		s.shadow.food(cp)
+	}
 	switch {
 	case err == nil:
 		s.markDone(op.ID, vid, attempts, now)
@@ -1551,7 +1588,7 @@ func (s *Service) snapInputFor(date string) (snapInput, error) {
 	}
 	steps := s.steps.Snapshot()
 	in.ax = &activityInput{
-		steps:   func(d string) (int, bool) { n, ok := steps[d]; return n, ok },
+		steps: func(d string) (int, bool) { n, ok := steps[d]; return n, ok },
 		session: func(d string) (bool, bool) {
 			if !have[d] {
 				return false, false
@@ -1757,19 +1794,25 @@ func widgetBlock(name string, snap Snapshot, added map[string]*float64) (Block, 
 // addedOf sums the effective contributions per snapshot macro key.
 func addedOf(ms []Macros) map[string]*float64 {
 	out := map[string]*float64{}
+	// Include total carbohydrate for v7 charts as well as the v6 macro keys.
+	keys := make([]string, 0, len(macroDefs)+1)
 	for _, d := range macroDefs {
+		keys = append(keys, d.key)
+	}
+	keys = append(keys, "carbs_g")
+	for _, key := range keys {
 		var sum tenth
 		for i, m := range ms {
 			if i == 0 {
-				sum = m.Get(d.key)
+				sum = m.Get(key)
 			} else {
-				sum = sum.add(m.Get(d.key))
+				sum = sum.add(m.Get(key))
 			}
 		}
 		if len(ms) == 0 {
 			sum = known(0)
 		}
-		out[d.key] = sum.ptr()
+		out[key] = sum.ptr()
 	}
 	return out
 }

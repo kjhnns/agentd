@@ -204,6 +204,7 @@ type journalRec struct {
 // Everything else (entry status, fraction state, idempotency) is derived from
 // it on startup replay.
 type Journal struct {
+	shadow    func(int64, []byte)
 	mu        sync.Mutex
 	f         *os.File
 	entries   map[string]*Entry
@@ -289,13 +290,17 @@ func loadLines(path string, strict bool, fn func([]byte) error) error {
 	return nil
 }
 
-// OpenJournal replays journal.jsonl.
-func OpenJournal(path string) (*Journal, error) {
-	j := &Journal{
+func newJournalState() *Journal {
+	return &Journal{
 		entries: map[string]*Entry{}, items: map[string]*Item{}, ops: map[string]*Op{},
 		itemOps: map[string][]string{}, fractions: map[string]FractionChoice{}, doneByDay: map[string]int{},
 		idents: map[string]Identity{}, pairUndo: map[string]string{},
 	}
+}
+
+// OpenJournal replays journal.jsonl.
+func OpenJournal(path string) (*Journal, error) {
+	j := newJournalState()
 	err := loadLines(path, true, func(b []byte) error {
 		var r journalRec
 		if err := json.Unmarshal(b, &r); err != nil {
@@ -423,6 +428,9 @@ func (j *Journal) write(r journalRec) (applied bool, err error) {
 			j.broken = fmt.Errorf("%w: write failed and could not be cut back", ErrJournalBroken)
 		}
 		return false, werr
+	}
+	if j.shadow != nil {
+		j.shadow(j.size+int64(len(b)), b[:len(b)-1])
 	}
 	if serr := j.syncFn(j.f); serr != nil {
 		// The line may be on disk: treat it as written (so its identities
@@ -670,10 +678,11 @@ const idemRetention = 7 * 24 * time.Hour
 
 // Idem is the idempotency store (spec section 6).
 type Idem struct {
-	putMu sync.Mutex // serializes PutIfNoResponse
-	mu    sync.Mutex
-	f     *os.File
-	recs  map[string]*idemRec
+	shadow func([]byte)
+	putMu  sync.Mutex // serializes PutIfNoResponse
+	mu     sync.Mutex
+	f      *os.File
+	recs   map[string]*idemRec
 }
 
 // OpenIdem loads idem.jsonl, drops records older than 7 days and compacts.
@@ -743,6 +752,9 @@ func (s *Idem) Put(r idemRec) error {
 	}
 	if _, err := s.f.Write(append(b, '\n')); err != nil {
 		return err
+	}
+	if s.shadow != nil {
+		s.shadow(b)
 	}
 	if err := s.f.Sync(); err != nil {
 		return err
@@ -817,6 +829,7 @@ type FeedItem struct {
 
 // Feed is the append-only conversation store.
 type Feed struct {
+	shadow func([]byte)
 	mu     sync.Mutex
 	f      *os.File
 	items  []FeedItem
@@ -895,6 +908,9 @@ func (fd *Feed) Append(it FeedItem) (FeedItem, error) {
 			fd.broken = true
 		}
 		return it, err
+	}
+	if fd.shadow != nil {
+		fd.shadow(b[:len(b)-1])
 	}
 	fd.size += int64(len(b))
 	// Written: keep it (its seq is used) even if the fsync fails.

@@ -302,11 +302,34 @@ type harness struct {
 
 const testToken = "tok-0123456789abcdef"
 
+type harnessTransport struct{ handler http.Handler }
+
+func (tr harnessTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if err := r.Context().Err(); err != nil {
+		return nil, err
+	}
+	w := httptest.NewRecorder()
+	tr.handler.ServeHTTP(w, r)
+	return w.Result(), nil
+}
+
 func newHarness(t *testing.T, mut ...func(*Options)) *harness {
+	return newHarnessMode(t, false, mut...)
+}
+
+// The same HTTP fake and service harness can run without listening sockets.
+func newHarnessMode(t *testing.T, inProcess bool, mut ...func(*Options)) *harness {
 	t.Helper()
 	fv := newFakeVars()
-	srv := httptest.NewServer(fv)
-	t.Cleanup(srv.Close)
+	vars := &VariablesHTTP{Key: "vkey"}
+	if inProcess {
+		vars.Base = "http://127.0.0.1"
+		vars.Client = &http.Client{Transport: harnessTransport{fv}}
+	} else {
+		srv := httptest.NewServer(fv)
+		t.Cleanup(srv.Close)
+		vars.Base, vars.Client = srv.URL, loopbackClient()
+	}
 	// 12:00 in Zurich on 2026-10-01.
 	clk := &clock{t: time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)}
 	fv.now = clk.Now
@@ -314,7 +337,7 @@ func newHarness(t *testing.T, mut ...func(*Options)) *harness {
 	fm := &fakeModel{fn: func(ModelInput) string { return skyrWalnuts }}
 	o := Options{
 		Token:        testToken,
-		Vars:         &VariablesHTTP{Base: srv.URL, Key: "vkey", Client: loopbackClient()},
+		Vars:         vars,
 		FoodVar:      "Fuel e2e food log",
 		BodyVar:      "Body composition",
 		Model:        fm,

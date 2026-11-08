@@ -21,6 +21,13 @@ whisper_model  = "whisper-1"
 targets_file   = "~/.agentd/fuel-targets.json" # missing = built-in defaults
 staples_file   = "~/.agentd/fuel-staples.json" # shared with ~/clawd/scripts/food-log
 state_dir      = "~/.local/state/fueld"
+# H1 shadow store (spec 25). Deploy the supporting binary FIRST. Verify the
+# nightly complete backup and off-box copy before enabling shadow writes.
+# store_mode   = "off"                          # off (default) | shadow
+# store_path   = "~/.local/state/fueld/fuel.sqlite" # default: <state_dir>/fuel.sqlite
+# Set backup.env FUEL_STORE_PATH to the same absolute path (fuel-store-backup.md).
+# GET /fuel/admin/store-status requires the app bearer token.
+# Older binaries reject unknown keys. Remove BOTH store keys before rollback.
 strava_dir     = "~/warehouse/raw-sources/strava"
 test_mode      = false                         # true refuses food_log_var "Food log"
 
@@ -43,6 +50,7 @@ recalibrate_min_interval = "30s"                     # between job starts
 # The Fuel Telegram bot (spec 24): the fallback when the app has no connection.
 # One poller per bot token: never enable it on two instances at once.
 # telegram_enabled    = true
+# telegram_gauges     = true                        # macro chart replies and /gauges (default true)
 # telegram_token      = "env:FUEL_TELEGRAM_TOKEN"   # pass fueld/telegram-bot-token
 # telegram_allow_user = "7597951120"                # the ONE Telegram user id served
 # telegram_api        = "http://127.0.0.1:8799"      # test_mode only: a fake Bot API for an e2e run

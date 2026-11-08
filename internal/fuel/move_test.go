@@ -20,7 +20,7 @@ func drinkItem(name string, ml, kcal, alcohol float64) string {
 }
 
 func alcoholLog(day string, extra ...string) string {
-	items := []string{drinkItem("champagne", 300, 240, 28.4), drinkItem("white wine", 150, 120, 14.2), drinkItem("Negroni sbagliato", 120, 150, 15)}
+	items := []string{drinkItem("champagne", 300, 240, 30), drinkItem("white wine", 150, 120, 15), drinkItem("Negroni sbagliato", 120, 150, 15)}
 	items = append(items, extra...)
 	return fmt.Sprintf(`{"intent":"log","day":%s,"time":null,"items":[%s],"text":"","widgets":[]}`, day, strings.Join(items, ","))
 }
@@ -63,7 +63,7 @@ func TestLogForYesterdayExactSentence(t *testing.T) {
 			t.Fatalf("row on %v at %v", row["_record_date"], row["eaten_at"])
 		}
 	}
-	if resp.Snapshot.Date != "2026-09-30" || intake(resp.Snapshot, "alcohol_g").Consumed != 57.6 {
+	if resp.Snapshot.Date != "2026-09-30" || intake(resp.Snapshot, "alcohol_g").Consumed != 60 {
 		t.Fatalf("snapshot %s alcohol %v", resp.Snapshot.Date, intake(resp.Snapshot, "alcohol_g").Consumed)
 	}
 	if resp.Blocks[0].Text != "Logged for Wed 30 Sep: champagne, white wine and Negroni sbagliato." {
@@ -79,7 +79,7 @@ func TestLogForYesterdayExactSentence(t *testing.T) {
 	}
 	// The week total counts it once (Wed and Thu are the same ISO week).
 	today := decode[Snapshot](t, h.do("GET", "/fuel/snapshot", nil, ""))
-	if intake(today, "alcohol_g").Consumed != 0 || intake(today, "alcohol_g_week").Consumed != 57.6 {
+	if intake(today, "alcohol_g").Consumed != 0 || intake(today, "alcohol_g_week").Consumed != 60 {
 		t.Fatalf("today alcohol %v week %v", intake(today, "alcohol_g").Consumed, intake(today, "alcohol_g_week").Consumed)
 	}
 }
@@ -255,7 +255,7 @@ func TestHalfDoneMoveRecoversAfterACrash(t *testing.T) {
 		h.clk.Add(2 * time.Minute)
 		tdS := decode[Snapshot](t, h.do("GET", "/fuel/snapshot", nil, ""))
 		ydS := decode[Snapshot](t, h.do("GET", "/fuel/snapshot?date=2026-09-30", nil, ""))
-		if macro(tdS, "kcal").Consumed != 510 || macro(ydS, "kcal").Consumed != 0 || intake(tdS, "alcohol_g_week").Consumed != 57.6 {
+		if macro(tdS, "kcal").Consumed != 510 || macro(ydS, "kcal").Consumed != 0 || intake(tdS, "alcohol_g_week").Consumed != 60 {
 			t.Fatalf("storeFirst=%v transition: today %v yesterday %v week %v", storeFirst, macro(tdS, "kcal").Consumed, macro(ydS, "kcal").Consumed, intake(tdS, "alcohol_g_week").Consumed)
 		}
 		if len(h.day("").Items) != 3 || len(h.day("?date=2026-09-30").Items) != 0 {
@@ -354,7 +354,7 @@ func TestAlcoholGuidanceInThePrompt(t *testing.T) {
 func TestMoveCompensationSurvivesACrashAfterTheFailedUndo(t *testing.T) {
 	h := newHarness(t)
 	h.model.fn = func(ModelInput) string {
-		return fmt.Sprintf(`{"intent":"log","day":null,"time":null,"items":[%s],"text":"","widgets":[]}`, drinkItem("champagne", 300, 240, 28.4))
+		return fmt.Sprintf(`{"intent":"log","day":null,"time":null,"items":[%s],"text":"","widgets":[]}`, drinkItem("champagne", 300, 240, 30))
 	}
 	h.logText("m0000007-0001", "champagne")
 	h.clk.Add(time.Minute)
@@ -402,7 +402,7 @@ func TestMoveCompensationSurvivesACrashAfterTheFailedUndo(t *testing.T) {
 func TestMoveUndoIsNeverFailedByTheDeadline(t *testing.T) {
 	h := newHarness(t)
 	h.model.fn = func(ModelInput) string {
-		return fmt.Sprintf(`{"intent":"log","day":null,"time":null,"items":[%s],"text":"","widgets":[]}`, drinkItem("champagne", 300, 240, 28.4))
+		return fmt.Sprintf(`{"intent":"log","day":null,"time":null,"items":[%s],"text":"","widgets":[]}`, drinkItem("champagne", 300, 240, 30))
 	}
 	h.logText("m0000008-0001", "champagne")
 	h.clk.Add(time.Minute)
@@ -440,7 +440,7 @@ func TestMoveUndoIsNeverFailedByTheDeadline(t *testing.T) {
 func TestMoveDestinationIsPendingUntilSettled(t *testing.T) {
 	h := newHarness(t)
 	h.model.fn = func(ModelInput) string {
-		return fmt.Sprintf(`{"intent":"log","day":null,"time":null,"items":[%s],"text":"","widgets":[]}`, drinkItem("champagne", 300, 240, 28.4))
+		return fmt.Sprintf(`{"intent":"log","day":null,"time":null,"items":[%s],"text":"","widgets":[]}`, drinkItem("champagne", 300, 240, 30))
 	}
 	h.logText("m0000009-0001", "champagne")
 	h.clk.Add(time.Minute)
@@ -471,7 +471,7 @@ func TestMoveNamesConstrainIDs(t *testing.T) {
 	water := drinkItem("water", 500, 0, 0)
 	water = strings.Replace(water, `"alcohol_g":0`, `"alcohol_g":null`, 1)
 	h.model.fn = func(ModelInput) string {
-		return fmt.Sprintf(`{"intent":"log","day":null,"time":null,"items":[%s,%s],"text":"","widgets":[]}`, drinkItem("champagne", 300, 240, 28.4), water)
+		return fmt.Sprintf(`{"intent":"log","day":null,"time":null,"items":[%s,%s],"text":"","widgets":[]}`, drinkItem("champagne", 300, 240, 30), water)
 	}
 	l := decode[LogResponse](t, h.logText("m0000010-0001", "champagne and water"))
 	h.clk.Add(time.Minute)
@@ -532,7 +532,7 @@ func TestResolveDayClockRules(t *testing.T) {
 
 func champagneToday(h *harness, cid string) LogResponse {
 	h.model.fn = func(ModelInput) string {
-		return fmt.Sprintf(`{"intent":"log","day":null,"time":null,"items":[%s],"text":"","widgets":[]}`, drinkItem("champagne", 300, 240, 28.4))
+		return fmt.Sprintf(`{"intent":"log","day":null,"time":null,"items":[%s],"text":"","widgets":[]}`, drinkItem("champagne", 300, 240, 30))
 	}
 	return decode[LogResponse](h.t, h.logText(cid, "champagne"))
 }
@@ -611,7 +611,7 @@ func TestStoredButUnacknowledgedUndoSwitchesBothSidesAtOnce(t *testing.T) {
 	h.clk.Add(2 * time.Minute)
 	td := decode[Snapshot](t, h.do("GET", "/fuel/snapshot", nil, ""))
 	yd := decode[Snapshot](t, h.do("GET", "/fuel/snapshot?date=2026-09-30", nil, ""))
-	if macro(td, "kcal").Consumed+macro(yd, "kcal").Consumed != 240 || intake(td, "alcohol_g_week").Consumed != 28.4 {
+	if macro(td, "kcal").Consumed+macro(yd, "kcal").Consumed != 240 || intake(td, "alcohol_g_week").Consumed != 30 {
 		t.Fatalf("today %v yesterday %v week %v: not exactly one side", macro(td, "kcal").Consumed, macro(yd, "kcal").Consumed, intake(td, "alcohol_g_week").Consumed)
 	}
 	if len(h.day("").Items)+len(h.day("?date=2026-09-30").Items) != 1 {
@@ -641,7 +641,7 @@ func TestCorrectionsOfAHiddenDestinationByValueIDDoNotCount(t *testing.T) {
 		}
 	}
 	// The food-log fixes the (hidden) destination by its VALUE id.
-	h.vars.add("var-food", "2026-09-30", map[string]any{"item": "correction: champagne", "kcal": -120.0, "protein_g": 0.0, "carbs_g": -1.0, "fat_g": 0.0, "sat_fat_g": 0.0, "fiber_g": 0.0, "volume_ml": -150.0, "alcohol_g": -14.2, "source": "agentd", "reason": "fix", "corrects": destValue, "share_after": 0.5, "op_id": "op_fix_ext"})
+	h.vars.add("var-food", "2026-09-30", map[string]any{"item": "correction: champagne", "kcal": -120.0, "protein_g": 0.0, "carbs_g": -1.0, "fat_g": 0.0, "sat_fat_g": 0.0, "fiber_g": 0.0, "volume_ml": -150.0, "alcohol_g": -15, "source": "agentd", "reason": "fix", "corrects": destValue, "share_after": 0.5, "op_id": "op_fix_ext"})
 	h.clk.Add(2 * time.Minute)
 	yd := decode[Snapshot](t, h.do("GET", "/fuel/snapshot?date=2026-09-30", nil, ""))
 	if macro(yd, "kcal").Consumed != 0 || intake(yd, "alcohol_g").Consumed != 0 {
@@ -837,7 +837,7 @@ func TestUnnamedLastMovesTheNewestEntryNotTodaysItems(t *testing.T) {
 	h.logText("m3000002-0001", "coffee")
 	h.clk.Add(time.Minute)
 	h.model.fn = func(ModelInput) string {
-		return fmt.Sprintf(`{"intent":"log","day":"yesterday","time":null,"items":[%s],"text":"","widgets":[]}`, drinkItem("wine", 150, 120, 14.2))
+		return fmt.Sprintf(`{"intent":"log","day":"yesterday","time":null,"items":[%s],"text":"","widgets":[]}`, drinkItem("wine", 150, 120, 15))
 	}
 	h.logText("m3000002-0002", "wine yesterday")
 	h.clk.Add(time.Minute)
@@ -862,7 +862,7 @@ func TestUnnamedLastNeverFallsBackToOlderItems(t *testing.T) {
 	h.logText("m4000001-0001", "coffee")
 	h.clk.Add(time.Minute)
 	h.model.fn = func(ModelInput) string {
-		return fmt.Sprintf(`{"intent":"log","day":null,"time":null,"items":[%s],"text":"","widgets":[]}`, drinkItem("wine", 150, 120, 14.2))
+		return fmt.Sprintf(`{"intent":"log","day":null,"time":null,"items":[%s],"text":"","widgets":[]}`, drinkItem("wine", 150, 120, 15))
 	}
 	h.logText("m4000001-0002", "wine")
 	h.clk.Add(time.Minute)

@@ -125,7 +125,7 @@ func agentScope(r *http.Request) *apiError {
 	switch r.Method {
 	case http.MethodGet:
 		switch p {
-		case "/fuel/day", "/fuel/week", "/fuel/snapshot", "/fuel/recent", "/fuel/feed":
+		case "/fuel/day", "/fuel/week", "/fuel/snapshot", "/fuel/gauges.png", "/fuel/recent", "/fuel/feed":
 			return nil
 		}
 	case http.MethodPost:

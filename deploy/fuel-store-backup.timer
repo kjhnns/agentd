@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly Fuel store snapshot at 03:20
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+Persistent=true
+AccuracySec=1min
+Unit=fuel-store-backup.service
+
+[Install]
+WantedBy=timers.target

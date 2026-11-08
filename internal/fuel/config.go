@@ -43,6 +43,8 @@ type DaemonConfig struct {
 	TargetsFile  string
 	StaplesFile  string
 	StateDir     string
+	StorePath    string
+	StoreMode    string
 	StravaDir    string
 	TestMode     bool
 
@@ -77,6 +79,7 @@ type DaemonConfig struct {
 
 	// The Fuel Telegram bot (spec 24).
 	TelegramEnabled   bool
+	TelegramGauges    bool   // send macro charts, default true
 	TelegramToken     string // literal or "env:VAR": the bot token
 	TelegramAllowUser string // the ONE Telegram user id served, digits
 	TelegramAPI       string // the Bot API base; another value only with test_mode (an e2e fake)
@@ -98,7 +101,10 @@ func DefaultDaemonConfig() DaemonConfig {
 		TargetsFile:   "~/.agentd/fuel-targets.json",
 		StaplesFile:   "~/.agentd/fuel-staples.json",
 		StateDir:      "~/.local/state/fueld",
+		StoreMode:     "off",
 		StravaDir:     "~/warehouse/raw-sources/strava",
+
+		TelegramGauges: true,
 
 		RecalibrateAgentdURL: "http://127.0.0.1:8798",
 		LogBudget:            "90s",
@@ -167,7 +173,7 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 		raw := stripTOMLComment(strings.TrimSpace(line[eq+1:]))
 		if b := map[string]*bool{"test_mode": &c.TestMode, "recalibrate_enabled": &c.RecalibrateEnabled,
 			"web_enabled": &c.WebEnabled, "web_insecure_test_cookie": &c.WebInsecureTestCookie,
-			"telegram_enabled": &c.TelegramEnabled}[key]; b != nil {
+			"telegram_enabled": &c.TelegramEnabled, "telegram_gauges": &c.TelegramGauges}[key]; b != nil {
 			v, err := strconv.ParseBool(raw)
 			if err != nil {
 				return c, fmt.Errorf("line %d: %s expects true or false", n, key)
@@ -188,6 +194,7 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 			"log_budget": &c.LogBudget, "model_timeout": &c.ModelTimeout,
 			"whisper_model": &c.WhisperModel,
 			"targets_file":  &c.TargetsFile, "staples_file": &c.StaplesFile,
+			"store_path": &c.StorePath, "store_mode": &c.StoreMode,
 			"state_dir": &c.StateDir, "strava_dir": &c.StravaDir,
 			"recalibrate_agentd_url": &c.RecalibrateAgentdURL, "recalibrate_agentd_token": &c.RecalibrateAgentdToken,
 			"recalibrate_timeout": &c.RecalibrateTimeout, "recalibrate_min_interval": &c.RecalibrateMinInterval,
@@ -207,6 +214,12 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 	}
 	if err := sc.Err(); err != nil {
 		return c, err
+	}
+	if c.StoreMode != "off" && c.StoreMode != "shadow" {
+		return c, errors.New("store_mode must be off or shadow")
+	}
+	if c.StorePath == "" {
+		c.StorePath = filepath.Join(c.StateDir, "fuel.sqlite")
 	}
 	if c.Listen == "" {
 		return c, errors.New("listen is empty")

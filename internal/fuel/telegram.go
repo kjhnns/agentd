@@ -18,6 +18,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"net/url"
 	"os"
 	"os/exec"
@@ -94,16 +95,17 @@ func (s *Service) recentTelegram(at time.Time, win time.Duration, loc *time.Loca
 
 // TelegramOptions configures the bot.
 type TelegramOptions struct {
-	Token     string       // the bot token
-	AllowUser int64        // the ONE Telegram user id that is served
-	API       string       // "https://api.telegram.org" unless a test sets it
-	AppToken  string       // the app bearer for the in-process /fuel/log
-	Handler   http.Handler // the fueld handler (svc.Handler())
-	StateDir  string       // telegram-offset lives here
-	Client    *http.Client // long-poll client; its timeout must exceed PollSecs
-	PollSecs  int          // getUpdates timeout (50 unless a test sets it)
-	EntryWait time.Duration
-	Now       func() time.Time
+	DisableGauges bool         // default false: charts follow successful writes
+	Token         string       // the bot token
+	AllowUser     int64        // the ONE Telegram user id that is served
+	API           string       // "https://api.telegram.org" unless a test sets it
+	AppToken      string       // the app bearer for the in-process /fuel/log
+	Handler       http.Handler // the fueld handler (svc.Handler())
+	StateDir      string       // telegram-offset lives here
+	Client        *http.Client // long-poll client; its timeout must exceed PollSecs
+	PollSecs      int          // getUpdates timeout (50 unless a test sets it)
+	EntryWait     time.Duration
+	Now           func() time.Time
 	// RetryWait is the pause before a message that failed is tried again (30 s).
 	RetryWait time.Duration
 	// Ready reports that fueld serves requests; the bot polls only after it.
@@ -410,7 +412,7 @@ func (b *TelegramBot) allowed(m *tgMessage) bool {
 const tgHelp = "Fuel on Telegram, for when the app has no connection (a flight).\n\n" +
 	"Send what you ate or drank as text, a voice note or a photo. Ask \"how am I doing today?\" or any food question. " +
 	"Corrections work as in the app: \"no, it was 100 g\", \"remove the coffee\".\n\n" +
-	"Everything lands in the Fuel app too, marked via Telegram."
+	"Everything lands in the Fuel app too, marked via Telegram. Use /gauges for today's macro chart."
 
 // handle sends one message (or one album) to /fuel/log and replies. It
 // returns false when the message should be tried again later (a network
@@ -422,6 +424,20 @@ func (b *TelegramBot) handle(ctx context.Context, msgs []*tgMessage) bool {
 	text := strings.TrimSpace(first.Text)
 	if text == "/start" || text == "/help" {
 		return reply(tgHelp)
+	}
+	if text == "/gauges" || strings.HasPrefix(text, "/gauges@") {
+		if b.o.DisableGauges {
+			return reply("Macro charts are disabled (telegram_gauges = false).")
+		}
+		b.replies.Add(1)
+		go func() {
+			defer b.replies.Done()
+			if err := b.sendGauges(ctx, chat, first.MessageID, nil); err != nil {
+				log.Printf("fuel: telegram gauges: %v", err)
+				b.send(ctx, chat, first.MessageID, "I could not send the macro chart. Try /gauges again later.")
+			}
+		}()
+		return true
 	}
 	at := time.Unix(first.Date, 0)
 	if b.o.Now().Sub(at) > 47*time.Hour {
@@ -622,6 +638,126 @@ func (b *TelegramBot) finish(ctx context.Context, chat, msgID int64, code int, b
 		_ = json.Unmarshal(rec.Body.Bytes(), &r)
 	}
 	b.send(ctx, chat, msgID, renderTelegram(r.Blocks))
+	if r.Status == StatusDone && !b.o.DisableGauges && telegramHasAdded(r.Blocks) {
+		if err := b.sendGauges(ctx, chat, msgID, r.Blocks); err != nil {
+			// This is an optional reply, never a reason to retry a food log.
+			log.Printf("fuel: telegram gauges: %v", err)
+		}
+	}
+}
+
+// Questions have an empty added map. Log and correction widgets carry their
+// contribution, including zero-valued drinks and negative corrections.
+func telegramAdded(bl Block) map[string]*float64 {
+	if bl.Type != "widget" || bl.Widget != "macros_today" {
+		return nil
+	}
+	raw, err := json.Marshal(bl.Data)
+	if err != nil {
+		return nil
+	}
+	var data struct {
+		Added map[string]*float64 `json:"added"`
+	}
+	_ = json.Unmarshal(raw, &data)
+	return data.Added
+}
+
+func telegramHasAdded(blocks []Block) bool {
+	for _, bl := range blocks {
+		if len(telegramAdded(bl)) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *TelegramBot) sendGauges(ctx context.Context, chat, replyTo int64, blocks []Block) error {
+	sctx, cancel := context.WithTimeout(ctx, 40*time.Second)
+	defer cancel()
+	req := httptest.NewRequest("GET", "/fuel/snapshot", nil).WithContext(sctx)
+	req.RemoteAddr = "127.0.0.1:0"
+	req.Header.Set("Authorization", "Bearer "+b.o.AppToken)
+	rec := httptest.NewRecorder()
+	b.o.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		return fmt.Errorf("snapshot HTTP %d", rec.Code)
+	}
+	var snap Snapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
+		return errors.New("invalid snapshot")
+	}
+	var added map[string]*float64
+	for _, bl := range blocks {
+		if bl.Date == snap.Date {
+			if d := telegramAdded(bl); len(d) > 0 {
+				added = d
+				break
+			}
+		}
+	}
+	raw, err := RenderGauges(snap, added)
+	if err != nil {
+		return err
+	}
+	return b.sendPhoto(sctx, chat, replyTo, raw, telegramGaugeCaption(blocks, snap))
+}
+
+func telegramGaugeCaption(blocks []Block, snap Snapshot) string {
+	lead := "Today"
+	for _, bl := range blocks {
+		if bl.Type == "text" && strings.TrimSpace(bl.Text) != "" {
+			lead = clipRunes(strings.Join(strings.Fields(bl.Text), " "), 180)
+			break
+		}
+	}
+	for _, b := range gaugeBudgets(snap) {
+		if b.Key == "protein_g" {
+			return strings.TrimRight(lead, ". ") + ". " + gaugeValue(b) + " protein"
+		}
+	}
+	return lead
+}
+
+// sendPhoto makes one multipart attempt. The caller logs its error once; it
+// never retries a successful food write or exposes a token-bearing URL.
+func (b *TelegramBot) sendPhoto(ctx context.Context, chat, replyTo int64, raw []byte, caption string) error {
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	_ = mw.WriteField("chat_id", strconv.FormatInt(chat, 10))
+	_ = mw.WriteField("caption", caption)
+	if replyTo != 0 {
+		rp, _ := json.Marshal(map[string]any{"message_id": replyTo, "allow_sending_without_reply": true})
+		_ = mw.WriteField("reply_parameters", string(rp))
+	}
+	w, err := mw.CreatePart(textproto.MIMEHeader{
+		"Content-Disposition": {`form-data; name="photo"; filename="gauges.png"`},
+		"Content-Type":        {"image/png"},
+	})
+	if err != nil {
+		return errors.New("sendPhoto: multipart file")
+	}
+	_, _ = w.Write(raw)
+	_ = mw.Close()
+	req, err := http.NewRequestWithContext(ctx, "POST", b.o.API+"/bot"+b.o.Token+"/sendPhoto", &body)
+	if err != nil {
+		return errors.New("sendPhoto: bad request")
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := b.o.Client.Do(req)
+	if err != nil {
+		return fmt.Errorf("sendPhoto: %s", errClass(err))
+	}
+	defer resp.Body.Close()
+	var result tgResp
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result); err != nil {
+		return fmt.Errorf("sendPhoto: HTTP %d, bad body", resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusOK || !result.OK {
+		// Telegram's description is not needed here and could echo input.
+		return fmt.Errorf("sendPhoto: HTTP %d, API code %d", resp.StatusCode, result.ErrorCode)
+	}
+	return nil
 }
 
 // renderTelegram turns reply blocks into plain text: the text blocks, then one

@@ -1,0 +1,12 @@
+# systemd USER unit. Adjust paths with systemctl --user edit if needed.
+[Unit]
+Description=Verified online snapshot of the Fuel store
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/fueld/backup.env
+ExecStart=%h/.local/bin/fuel-store backup --db ${FUEL_STORE_PATH} --out %h/.local/state/fueld/backups --keep 14
+WorkingDirectory=%h
+UMask=0077
+NoNewPrivileges=yes
+TimeoutStartSec=15min

@@ -73,6 +73,7 @@ type recOp struct {
 
 // recordStore is the durable store of record operations.
 type recordStore struct {
+	shadow   func([]byte)
 	mu       sync.Mutex
 	path     string
 	ops      map[string]*recOp // by op id
@@ -122,6 +123,9 @@ func (rs *recordStore) put(op recOp) error {
 	}
 	if _, err := f.Write(append(b, '\n')); err != nil {
 		return err
+	}
+	if rs.shadow != nil {
+		rs.shadow(b)
 	}
 	if err := f.Sync(); err != nil {
 		return err
@@ -550,6 +554,9 @@ func (s *Service) postRecordOp(ctx context.Context, op recOp) recOp {
 		op.State = OpUncertain
 	}
 	op.LastTry = s.o.Now()
+	if s.shadow != nil {
+		s.shadow.submit("records", op)
+	}
 	if err := s.records.put(op); err != nil {
 		log.Printf("fuel: record op %s: could not journal the outcome", op.OpID)
 	}
