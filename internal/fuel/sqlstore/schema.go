@@ -122,6 +122,17 @@ INSERT INTO export_outbox(row_id,target,attempts,last_error,done_at) SELECT row_
 DROP TABLE export_outbox_h1;
 CREATE INDEX export_outbox_pending ON export_outbox(done_at);
 CREATE TRIGGER food_export_identity AFTER INSERT ON food_rows BEGIN INSERT INTO export_objects(id) VALUES(new.id) ON CONFLICT DO NOTHING; END;
+`, `
+-- Local writes must retain the BLOB type expected by legacy/shadow readers.
+UPDATE food_rows SET data=cast(data AS BLOB) WHERE typeof(data)='text';
+CREATE INDEX local_values_own_op ON local_values(op_id) WHERE own=1;
+ALTER TABLE export_outbox ADD COLUMN state TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE export_outbox ADD COLUMN uncertain_at TEXT;
+ALTER TABLE export_outbox ADD COLUMN empty_read_at TEXT;
+-- Old attempted writes may have committed without a visible reply. Start a
+-- fresh settle window on upgrade rather than treating them as safe to repeat.
+UPDATE export_outbox SET state='uncertain',uncertain_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+WHERE done_at IS NULL AND attempts>0 AND row_id IN (SELECT id FROM local_values);
 `}
 
 func (s *Store) migrate(ctx context.Context) error {

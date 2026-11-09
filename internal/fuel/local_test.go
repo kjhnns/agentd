@@ -58,7 +58,7 @@ func TestLocalOutageScriptedDayRestartAndCatchup(t *testing.T) {
 		t.Fatal(err)
 	}
 	st = localStats(t, h)
-	if st.Pending != 6 || st.ErrorCount != 6 || st.LastError == "" {
+	if st.Pending != 6 || st.ErrorCount != 2 || st.LastError == "" {
 		t.Fatalf("outage %+v", st)
 	}
 	if len(h.vars.rows("var-food")) != 0 {

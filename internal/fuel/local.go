@@ -334,10 +334,14 @@ func (l *localStore) importOnce(ctx context.Context, date string, now time.Time)
 			}
 			raw = string(b)
 		}
-		op, _ := v.Data["op_id"].(string)
+		data := v.Data
+		if data == nil {
+			_ = json.Unmarshal([]byte(raw), &data)
+		}
+		op, _ := data["op_id"].(string)
 		rows = append(rows, sqlstore.LocalValue{Variable: name, Date: v.RecordDate, At: v.CreatedAt, OpID: op, RemoteID: v.ID, Food: name == l.food, Raw: raw})
 	}
-	if err = l.db.ImportLocal(ctx, rows, date, now); err != nil {
+	if err = l.db.ImportLocal(ctx, rows, date, now, l.export); err != nil {
 		return err
 	}
 	b, err := json.Marshal(list)
@@ -356,10 +360,20 @@ func (l *localStore) exportOnce(ctx context.Context, now time.Time) error {
 	if err != nil || len(entries) == 0 {
 		return err
 	}
-	list, listErr := l.remote.ListVariables(ctx)
+	list, readErr := l.remote.ListVariables(ctx)
+	var vals []Value
+	if readErr == nil {
+		// Operation ids can collide on another date or target too. Inspect the
+		// complete reconciliation result, not just the first matching row.
+		vals, readErr = l.remote.All(ctx)
+	}
+	completed := map[string]bool{}
 	for _, e := range entries {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if e.DependsOn != "" && !completed[e.DependsOn] {
+			continue
 		}
 		if err = l.db.BeginLocalExport(ctx, e, now); err != nil {
 			return err
@@ -374,29 +388,64 @@ func (l *localStore) exportOnce(ctx context.Context, now time.Time) error {
 				target = v.ID
 			}
 		}
-		err = listErr
+		err = readErr
 		if err == nil && target == "" {
 			err = errors.New("export variable unresolved")
 		}
 		var id string
+		conflict := false
 		if err == nil {
-			// Read before EVERY attempt, including the first after migration/restart.
-			var vals []Value
-			vals, err = l.remote.ByDate(ctx, e.Date)
-			if err == nil {
-				for _, v := range vals {
-					if v.VariableID == target && v.Data["op_id"] == e.OpID {
-						id = v.ID
-						break
-					}
+			for _, v := range vals {
+				data := v.Data
+				if data == nil {
+					_ = json.Unmarshal([]byte(v.Raw), &data)
+				}
+				if e.OpID == "" || data["op_id"] != e.OpID {
+					continue
+				}
+				raw, marshalErr := json.Marshal(data)
+				remote := sqlstore.LocalValue{Variable: e.Variable, Date: v.RecordDate, Raw: string(raw)}
+				if marshalErr != nil || v.VariableID != target || !sqlstore.LocalPayloadEqual(e.LocalValue, remote) {
+					conflict = true
+					break
+				}
+				if id == "" {
+					id = v.ID
 				}
 			}
 		}
+		if conflict {
+			if err = l.db.ConflictLocalExport(ctx, e.ID); err != nil {
+				return err
+			}
+			continue
+		}
 		if err == nil && id == "" {
+			var retry bool
+			retry, err = l.db.LocalExportMayRetry(ctx, e, now)
+			if err == nil && !retry {
+				continue
+			}
 			var data map[string]any
-			err = json.Unmarshal([]byte(e.Raw), &data)
 			if err == nil {
+				err = json.Unmarshal([]byte(e.Raw), &data)
+			}
+			if err == nil {
+				// Persist before POST, including retries. A restart must retain
+				// the original uncertainty time and empty-read evidence.
+				if err = l.db.UncertainLocalExport(ctx, e.ID, now); err != nil {
+					return err
+				}
 				id, err = l.remote.Post(ctx, target, data, e.Date)
+				if err == nil && id != "" {
+					vals = append(vals, Value{ID: id, VariableID: target, RecordDate: e.Date, Data: data})
+				}
+				var rejected *PostError
+				if errors.As(err, &rejected) {
+					if saveErr := l.db.RejectLocalExport(context.WithoutCancel(ctx), e.ID); saveErr != nil {
+						return saveErr
+					}
+				}
 			}
 		}
 		if err == nil && id == "" {
@@ -409,7 +458,9 @@ func (l *localStore) exportOnce(ctx context.Context, now time.Time) error {
 			if saveErr := l.db.FailLocalExport(context.WithoutCancel(ctx), e.ID, errClass(err)); saveErr != nil {
 				return saveErr
 			}
+			continue
 		}
+		completed[e.ID] = true
 	}
 	return nil
 }
@@ -440,10 +491,14 @@ func (s *Service) localLoop(ctx context.Context) {
 	window := time.NewTicker(10 * time.Minute)
 	offset := 2
 	defer window.Stop()
-	export := time.NewTicker(time.Second)
+	var exportTick <-chan time.Time
+	if s.local.export {
+		exporter := time.NewTicker(time.Second)
+		defer exporter.Stop()
+		exportTick = exporter.C
+	}
 	defer day.Stop()
 	defer full.Stop()
-	defer export.Stop()
 	// Full import is background only, after Ready. It also reconciles historical deletions.
 	s.localSync(ctx, "")
 	for {
@@ -463,7 +518,7 @@ func (s *Service) localLoop(ctx context.Context) {
 			}
 		case <-full.C:
 			s.localSync(ctx, "")
-		case <-export.C:
+		case <-exportTick:
 			c, cancel := context.WithTimeout(ctx, 30*time.Second)
 			err := s.local.exportOnce(c, s.o.Now())
 			cancel()
@@ -489,12 +544,12 @@ func ExportLocalLegacy(ctx context.Context, path, dir string) error {
 	if initialized != "true" {
 		return errors.New("not an initialized local store")
 	}
-	st, err := db.LocalStatus(ctx, time.Now())
+	pending, err := db.PendingExports(ctx)
 	if err != nil {
 		return err
 	}
-	if st.Pending != 0 {
-		return fmt.Errorf("rollback requires drained exporter: %d pending", st.Pending)
+	if len(pending) != 0 {
+		return fmt.Errorf("rollback requires drained exporter: %d pending", len(pending))
 	}
 	vals, err := db.LocalValues(ctx, "")
 	if err != nil {

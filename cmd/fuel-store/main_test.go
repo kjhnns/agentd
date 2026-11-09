@@ -447,3 +447,73 @@ func TestBackupUnitUsesConfiguredStorePath(t *testing.T) {
 		})
 	}
 }
+
+func TestExportLegacyLocalBacklogAndOlderSchema(t *testing.T) {
+	for _, oldSchema := range []bool{false, true} {
+		t.Run(fmt.Sprint(oldSchema), func(t *testing.T) {
+			ctx := context.Background()
+			path, dir := filepath.Join(t.TempDir(), "local.db"), t.TempDir()
+			s, err := sqlstore.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			at := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+			v := sqlstore.LocalValue{ID: "op_local", OpID: "op_local", Variable: "Food", Date: "2026-10-01", At: at, Own: true, Food: true, Raw: `{"op_id":"op_local","item_id":"item","item":"apple","kcal":100}`}
+			event := sqlstore.LocalEvent{Stream: "journal", Data: json.RawMessage(`{"t":"txn","at":"2026-10-01T12:00:00Z","ops":[{"op_id":"op_local","entry_id":"entry","item_id":"item","date":"2026-10-01","created_at":"2026-10-01T12:00:00Z","state":"done","value_id":"op_local","data":{"op_id":"op_local","item_id":"item","item":"apple","kcal":100}}]}`)}
+			if err := s.CommitLocal(ctx, []sqlstore.LocalEvent{event}, []sqlstore.LocalValue{v}, true); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.SetLocalMeta(ctx, "local_initialized", "true"); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"export-legacy", "--db", path, "--state-dir", dir}
+			for _, uncertain := range []bool{false, true} {
+				if uncertain {
+					if err := s.UncertainLocalExport(ctx, v.ID, at); err != nil {
+						t.Fatal(err)
+					}
+				}
+				code, _, diagnostic := command(t, args...)
+				if code == 0 || !strings.Contains(diagnostic, "1 pending") {
+					t.Fatalf("rollback accepted backlog: %d %s", code, diagnostic)
+				}
+			}
+			if err := s.AckLocalExport(ctx, v.ID, "remote-value", at); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if oldSchema {
+				// Recreate the v4 outbox shape. The rollback command is read-only
+				// and must work before a daemon has run the new migration.
+				db, err := sql.Open("sqlite", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				for _, query := range []string{"ALTER TABLE export_outbox DROP COLUMN state", "ALTER TABLE export_outbox DROP COLUMN uncertain_at", "ALTER TABLE export_outbox DROP COLUMN empty_read_at", "PRAGMA user_version=4"} {
+					if _, err := db.Exec(query); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if code, _, diagnostic := command(t, args...); code != 0 {
+				t.Fatalf("rollback failed: %d %s", code, diagnostic)
+			}
+			journal, err := os.ReadFile(filepath.Join(dir, "journal.jsonl"))
+			if err != nil || !bytes.Contains(journal, []byte(`"value_id":"remote-value"`)) || bytes.Contains(journal, []byte(`"value_id":"op_local"`)) {
+				t.Fatalf("rollback alias missing: %s %v", journal, err)
+			}
+			for _, name := range []string{"idem", "feed", "records"} {
+				if _, err := os.Stat(filepath.Join(dir, name+".jsonl")); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}

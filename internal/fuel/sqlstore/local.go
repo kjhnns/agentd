@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"sort"
 	"time"
 )
 
@@ -84,7 +86,7 @@ func (s *Store) CommitLocal(ctx context.Context, events []LocalEvent, values []L
 		}
 		if v.Food && v.Own {
 			// H1 inspection and comparison tools keep seeing the authoritative rows.
-			_, e = tx.ExecContext(ctx, `INSERT INTO food_rows(id,source,variables_value_id,op_id,record_date,created_at,data) VALUES(?,'fueld',?,?,?,?,?) ON CONFLICT DO NOTHING`, v.ID, nullable(v.RemoteID), nullable(v.OpID), v.Date, stamp(v.At), v.Raw)
+			_, e = tx.ExecContext(ctx, `INSERT INTO food_rows(id,source,variables_value_id,op_id,record_date,created_at,data) VALUES(?,'fueld',?,?,?,?,?) ON CONFLICT DO NOTHING`, v.ID, nullable(v.RemoteID), nullable(v.OpID), v.Date, stamp(v.At), []byte(v.Raw))
 			if e != nil {
 				return e
 			}
@@ -181,7 +183,17 @@ func (s *Store) SetLocalMeta(ctx context.Context, key, value string) error {
 // ImportLocal reconciles a successfully completed scan atomically. Tombstones
 // apply only to externally owned rows in its scope. Fueld payloads never change.
 // The cursor advances in the same transaction, including for an empty scan.
-func (s *Store) ImportLocal(ctx context.Context, values []LocalValue, date string, at time.Time) error {
+// When export is disabled, imports never reconcile export obligations.
+func (s *Store) ImportLocal(ctx context.Context, values []LocalValue, date string, at time.Time, reconcileExports bool) error {
+	// Sequences are permanent. Assign them in remote chronology, independently
+	// of API response order, for food, body composition and numeric inputs alike.
+	values = append([]LocalValue(nil), values...)
+	sort.SliceStable(values, func(i, j int) bool {
+		if !values[i].At.Equal(values[j].At) {
+			return values[i].At.Before(values[j].At)
+		}
+		return values[i].RemoteID < values[j].RemoteID
+	})
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -190,34 +202,24 @@ func (s *Store) ImportLocal(ctx context.Context, values []LocalValue, date strin
 	if _, err = tx.ExecContext(ctx, `UPDATE local_values SET deleted=1 WHERE own=0 AND (?='' OR record_date=?)`, date, date); err != nil {
 		return err
 	}
+	acks := map[string][]string{}
+	conflicts := map[string]bool{}
 	for _, v := range values {
 		if v.RemoteID == "" || v.Variable == "" || !validDate(v.Date) || v.At.IsZero() {
 			return errors.New("invalid imported value")
 		}
 		var id, raw, oldDate, oldVariable string
 		var own bool
-		err = tx.QueryRowContext(ctx, `SELECT id,own,raw,record_date,variable FROM local_values WHERE remote_id=? OR (own=1 AND variable=? AND op_id=? AND ?<>'') ORDER BY own DESC,seq LIMIT 1`, v.RemoteID, v.Variable, v.OpID, v.OpID).Scan(&id, &own, &raw, &oldDate, &oldVariable)
+		err = tx.QueryRowContext(ctx, `SELECT id,own,raw,record_date,variable FROM local_values WHERE remote_id=? OR (own=1 AND op_id=? AND ?<>'') ORDER BY own DESC,seq LIMIT 1`, v.RemoteID, v.OpID, v.OpID).Scan(&id, &own, &raw, &oldDate, &oldVariable)
 		if err == nil && own {
-			if oldDate != v.Date || oldVariable != v.Variable {
-				return ErrConflict
+			if !reconcileExports {
+				continue
 			}
-			// An echo may add remote presentation fields, but must retain our keys.
-			var local, remote map[string]any
-			if json.Unmarshal([]byte(raw), &local) != nil || json.Unmarshal([]byte(v.Raw), &remote) != nil {
-				return ErrConflict
-			}
-			for k, x := range local {
-				a, _ := json.Marshal(x)
-				b, _ := json.Marshal(remote[k])
-				if string(a) != string(b) {
-					return ErrConflict
-				}
-			}
-			if err = bindLocalAlias(ctx, tx, id, v.RemoteID); err != nil {
-				return err
-			}
-			if _, err = tx.ExecContext(ctx, `UPDATE export_outbox SET done_at=coalesce(done_at,?),last_error='' WHERE row_id=?`, stamp(at), id); err != nil {
-				return err
+			local := LocalValue{Variable: oldVariable, Date: oldDate, Raw: raw}
+			if !LocalPayloadEqual(local, v) {
+				conflicts[id] = true
+			} else {
+				acks[id] = append(acks[id], v.RemoteID)
 			}
 			continue
 		}
@@ -240,6 +242,33 @@ func (s *Store) ImportLocal(ctx context.Context, values []LocalValue, date strin
 			}
 		}
 	}
+	// Validate the entire batch before acknowledging any echo. A second row
+	// with the same deterministic op_id must not hide a conflicting payload.
+	for id := range conflicts {
+		if err = conflictLocalExport(ctx, tx, id); err != nil {
+			return err
+		}
+	}
+	for id, remotes := range acks {
+		if conflicts[id] {
+			continue
+		}
+		var state string
+		if err = tx.QueryRowContext(ctx, `SELECT state FROM export_outbox WHERE row_id=?`, id).Scan(&state); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if state == "conflict" {
+			continue
+		}
+		for _, remote := range remotes {
+			if err = bindLocalAlias(ctx, tx, id, remote); err != nil {
+				return err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE export_outbox SET done_at=coalesce(done_at,?),state='done',last_error='' WHERE row_id=? AND state<>'conflict'`, stamp(at), id); err != nil {
+			return err
+		}
+	}
 	// Remove imported food projections only after the complete scan succeeded.
 	if _, err = tx.ExecContext(ctx, `DELETE FROM food_rows WHERE source='variables_import' AND id IN (SELECT id FROM local_values WHERE deleted=1)`); err != nil {
 		return err
@@ -250,35 +279,166 @@ func (s *Store) ImportLocal(ctx context.Context, values []LocalValue, date strin
 	return tx.Commit()
 }
 
+// LocalPayloadEqual compares all semantic fields, including fields present on
+// only one side. The Variables presentation title does not affect reducers.
+func LocalPayloadEqual(local, remote LocalValue) bool {
+	if local.Variable != remote.Variable || local.Date != remote.Date {
+		return false
+	}
+	var a, b map[string]any
+	if json.Unmarshal([]byte(local.Raw), &a) != nil || json.Unmarshal([]byte(remote.Raw), &b) != nil || a == nil || b == nil {
+		return false
+	}
+	delete(a, "title")
+	delete(b, "title")
+	return reflect.DeepEqual(a, b)
+}
+
 type LocalExport struct {
 	LocalValue
-	Attempts int
-	Next     time.Time
+	Attempts    int
+	Next        time.Time
+	State       string
+	UncertainAt time.Time
+	EmptyReadAt time.Time
+	DependsOn   string
 }
 
 func (s *Store) LocalExports(ctx context.Context, now time.Time) ([]LocalExport, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT v.id,v.variable,v.record_date,v.raw,coalesce(v.op_id,''),e.attempts FROM export_outbox e JOIN local_values v ON v.id=e.row_id WHERE e.done_at IS NULL AND (e.next_at IS NULL OR e.next_at<=?) ORDER BY v.seq LIMIT 100`, stamp(now))
+	values, err := s.LocalValues(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	groups, err := localExportGroups(values)
+	if err != nil {
+		return nil, err
+	}
+	// Include sleeping predecessors when building dependencies. Filtering them
+	// in SQL would allow a later correction to overtake an earlier retry.
+	rows, err := s.db.QueryContext(ctx, `SELECT v.id,v.variable,v.record_date,v.raw,coalesce(v.op_id,''),e.attempts,e.state,coalesce(e.next_at,''),coalesce(e.uncertain_at,''),coalesce(e.empty_read_at,'') FROM export_outbox e JOIN local_values v ON v.id=e.row_id WHERE e.done_at IS NULL ORDER BY v.seq`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []LocalExport
+	last := map[string]string{}
+	selected := map[string]bool{}
 	for rows.Next() {
 		var e LocalExport
-		if err := rows.Scan(&e.ID, &e.Variable, &e.Date, &e.Raw, &e.OpID, &e.Attempts); err != nil {
+		var next, uncertain, empty string
+		if err := rows.Scan(&e.ID, &e.Variable, &e.Date, &e.Raw, &e.OpID, &e.Attempts, &e.State, &next, &uncertain, &empty); err != nil {
 			return nil, err
 		}
+		for _, field := range []struct {
+			raw string
+			dst *time.Time
+		}{{next, &e.Next}, {uncertain, &e.UncertainAt}, {empty, &e.EmptyReadAt}} {
+			if field.raw != "" {
+				*field.dst, err = time.Parse(time.RFC3339Nano, field.raw)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		group := groups[e.ID]
+		e.DependsOn = last[group]
+		last[group] = e.ID
+		if e.Next.After(now) || e.State == "conflict" || (e.DependsOn != "" && !selected[e.DependsOn]) || len(out) >= 100 {
+			continue
+		}
 		out = append(out, e)
+		selected[e.ID] = true
 	}
 	return out, rows.Err()
 }
 
-// BeginLocalExport persists uncertainty BEFORE network IO. A crash or lost reply
-// always leads to a reconciliation read, never a blind repeat of a POST.
+// Join item identities and aliases across corrections, moves and record voids.
+// Keep exported history in the graph so dependencies survive every retry and
+// restart, even after a move has acquired a new item id on another date.
+func localExportGroups(values []LocalValue) (map[string]string, error) {
+	parent := map[string]string{}
+	var root func(string) string
+	root = func(k string) string {
+		if parent[k] == "" {
+			parent[k] = k
+		}
+		if parent[k] != k {
+			parent[k] = root(parent[k])
+		}
+		return parent[k]
+	}
+	keys := map[string]string{}
+	for _, v := range values {
+		key := v.Variable + "\x00" + v.ID
+		keys[v.ID] = key
+		var data map[string]any
+		if v.Own || v.Food {
+			if err := json.Unmarshal([]byte(v.Raw), &data); err != nil {
+				return nil, err
+			}
+		}
+		ids := append([]string{v.RemoteID, v.OpID}, v.Aliases...)
+		for _, field := range []string{"item_id", "corrects", "moved_from", "record_id", "voids"} {
+			id, _ := data[field].(string)
+			ids = append(ids, id)
+		}
+		for _, id := range ids {
+			if id != "" {
+				parent[root(v.Variable+"\x00"+id)] = root(key)
+			}
+		}
+	}
+	for id, key := range keys {
+		keys[id] = root(key)
+	}
+	return keys, nil
+}
+
+// BeginLocalExport schedules reconciliation backoff. Only an actual POST sets
+// uncertainty, durably before network IO.
 func (s *Store) BeginLocalExport(ctx context.Context, e LocalExport, now time.Time) error {
 	delay := time.Minute << min(e.Attempts, 6)
 	_, err := s.db.ExecContext(ctx, `UPDATE export_outbox SET attempts=attempts+1,next_at=? WHERE row_id=? AND done_at IS NULL`, stamp(now.Add(delay)), e.ID)
 	return err
+}
+
+func (s *Store) UncertainLocalExport(ctx context.Context, id string, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE export_outbox SET state='uncertain',uncertain_at=?,empty_read_at=NULL WHERE row_id=? AND done_at IS NULL`, stamp(now), id)
+	return err
+}
+
+// An empty read is not an authoritative rejection. Require a settle window
+// and a second successful empty reconciliation before allowing another POST.
+func (s *Store) LocalExportMayRetry(ctx context.Context, e LocalExport, now time.Time) (bool, error) {
+	if e.State != "uncertain" {
+		return true, nil
+	}
+	if e.EmptyReadAt.IsZero() {
+		_, err := s.db.ExecContext(ctx, `UPDATE export_outbox SET empty_read_at=? WHERE row_id=? AND state='uncertain'`, stamp(now), e.ID)
+		return false, err
+	}
+	return !e.UncertainAt.IsZero() && !now.Before(e.UncertainAt.Add(10*time.Minute)) && now.After(e.EmptyReadAt), nil
+}
+
+func (s *Store) RejectLocalExport(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE export_outbox SET state='pending',uncertain_at=NULL,empty_read_at=NULL WHERE row_id=? AND done_at IS NULL`, id)
+	return err
+}
+
+func conflictLocalExport(ctx context.Context, tx *sql.Tx, id string) error {
+	_, err := tx.ExecContext(ctx, `UPDATE export_outbox SET state='conflict',done_at=NULL,last_error='payload conflict' WHERE row_id=?`, id)
+	return err
+}
+func (s *Store) ConflictLocalExport(ctx context.Context, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = conflictLocalExport(ctx, tx, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (s *Store) FailLocalExport(ctx context.Context, id, diagnostic string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -306,25 +466,57 @@ func (s *Store) AckLocalExport(ctx context.Context, id, remote string, at time.T
 	if err = bindLocalAlias(ctx, tx, id, remote); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE export_outbox SET done_at=?,last_error='' WHERE row_id=?`, stamp(at), id); err != nil {
+	res, err := tx.ExecContext(ctx, `UPDATE export_outbox SET done_at=?,state='done',last_error='' WHERE row_id=? AND state<>'conflict'`, stamp(at), id)
+	if err != nil {
 		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrConflict
 	}
 	return tx.Commit()
 }
 
 type LocalStatus struct {
-	LastImportError  string  `json:"last_import_error"`
-	Pending          int     `json:"pending"`
-	OldestPendingAge float64 `json:"oldest_pending_age_seconds"`
-	ErrorCount       int     `json:"error_count"`
-	LastError        string  `json:"last_error"`
-	LastImport       string  `json:"last_import"`
+	Conflicts        int      `json:"conflicts"`
+	ConflictIDs      []string `json:"conflict_ids"`
+	Uncertain        int      `json:"uncertain"`
+	LastImportError  string   `json:"last_import_error"`
+	Pending          int      `json:"pending"`
+	OldestPendingAge float64  `json:"oldest_pending_age_seconds"`
+	ErrorCount       int      `json:"error_count"`
+	LastError        string   `json:"last_error"`
+	LastImport       string   `json:"last_import"`
 }
 
 func (s *Store) LocalStatus(ctx context.Context, now time.Time) (LocalStatus, error) {
 	var st LocalStatus
 	var oldest sql.NullString
 	err := s.db.QueryRowContext(ctx, `SELECT count(*),min(v.created_at) FROM export_outbox e LEFT JOIN local_values v ON v.id=e.row_id WHERE e.done_at IS NULL`).Scan(&st.Pending, &oldest)
+	if err != nil {
+		return st, err
+	}
+	if err = s.db.QueryRowContext(ctx, `SELECT coalesce(sum(state='conflict'),0),coalesce(sum(state='uncertain'),0) FROM export_outbox WHERE done_at IS NULL`).Scan(&st.Conflicts, &st.Uncertain); err != nil {
+		return st, err
+	}
+	st.ConflictIDs = []string{}
+	conflicts, err := s.db.QueryContext(ctx, `SELECT row_id FROM export_outbox WHERE done_at IS NULL AND state='conflict' ORDER BY row_id LIMIT 5`)
+	if err != nil {
+		return st, err
+	}
+	for conflicts.Next() {
+		var id string
+		if err = conflicts.Scan(&id); err != nil {
+			conflicts.Close()
+			return st, err
+		}
+		st.ConflictIDs = append(st.ConflictIDs, id)
+	}
+	err = conflicts.Err()
+	conflicts.Close()
 	if err != nil {
 		return st, err
 	}
