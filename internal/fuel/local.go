@@ -318,10 +318,15 @@ func (l *localStore) importOnce(ctx context.Context, date string, now time.Time)
 		return err
 	}
 	var rows []sqlstore.LocalValue
+	unknown := 0
 	for _, v := range vals {
 		name := names[v.VariableID]
 		if name == "" {
-			return errors.New("import value has unknown variable")
+			// A value of a variable the list does not show (a deleted test
+			// variable, a json variable the list omits): skip it, never fail
+			// the whole import for it.
+			unknown++
+			continue
 		}
 		if !allowed[name] {
 			continue
@@ -340,6 +345,9 @@ func (l *localStore) importOnce(ctx context.Context, date string, now time.Time)
 		}
 		op, _ := data["op_id"].(string)
 		rows = append(rows, sqlstore.LocalValue{Variable: name, Date: v.RecordDate, At: v.CreatedAt, OpID: op, RemoteID: v.ID, Food: name == l.food, Raw: raw})
+	}
+	if unknown > 0 && date == "" {
+		log.Printf("fuel: local import: skipped %d values of variables not in the list (deleted variables)", unknown)
 	}
 	if err = l.db.ImportLocal(ctx, rows, date, now, l.export); err != nil {
 		return err

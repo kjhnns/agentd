@@ -557,3 +557,20 @@ func TestLocalBackgroundExporterDrains(t *testing.T) {
 		t.Fatal("background exporter lost rows")
 	}
 }
+
+// Values of a variable the list does not show (a deleted variable) must not
+// abort the full import (production 2026-11-09: 1343 orphaned values of 29
+// deleted test variables made every full import fail).
+func TestLocalImportSkipsValuesOfUnknownVariables(t *testing.T) {
+	h := newLocalHarness(t)
+	h.addAt("var-food", "2026-10-01", map[string]any{"op_id": "foreign-op", "item": "foreign apple", "kcal": 100, "protein_g": 1, "source": "agentd"})
+	h.vars.mu.Lock()
+	h.vars.vals = append(h.vars.vals, fakeValue{ID: "orphan", VariableID: "var-deleted", Data: "7", RecordDate: "2026-10-01", CreatedAt: h.clk.Now()})
+	h.vars.mu.Unlock()
+	if err := h.svc.local.importOnce(context.Background(), "", h.clk.Now()); err != nil {
+		t.Fatalf("full import failed on an orphaned value: %v", err)
+	}
+	if len(h.day("").Items) != 1 {
+		t.Fatal("the known food value was not imported")
+	}
+}
