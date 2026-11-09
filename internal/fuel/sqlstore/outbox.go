@@ -18,8 +18,8 @@ type ExportEntry struct {
 // PendingExports returns obligations in local row order. No network IO is done.
 func (s *Store) PendingExports(ctx context.Context) ([]ExportEntry, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT e.row_id, e.target, e.attempts, e.last_error
-        FROM export_outbox e JOIN food_rows f ON f.id = e.row_id
-        WHERE e.done_at IS NULL ORDER BY f.local_seq, e.target`)
+        FROM export_outbox e LEFT JOIN food_rows f ON f.id = e.row_id LEFT JOIN local_values v ON v.id=e.row_id
+        WHERE e.done_at IS NULL ORDER BY coalesce(v.seq,f.local_seq), e.target`)
 	if err != nil {
 		return nil, err
 	}

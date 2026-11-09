@@ -150,7 +150,7 @@ func build(cfg fuel.DaemonConfig) (*fuel.Service, error) {
 	switch {
 	case modelKey == "":
 		return nil, errors.New("model_key resolves to empty")
-	case varsKey == "":
+	case varsKey == "" && cfg.StoreMode != "local":
 		return nil, errors.New("variables_key resolves to empty")
 	}
 	recal := fuel.RecalOptions{Enabled: cfg.RecalibrateEnabled, KillFile: cfg.RecalibrateKillFile}
@@ -206,28 +206,29 @@ func build(cfg fuel.DaemonConfig) (*fuel.Service, error) {
 		chat = &fuel.OpenAI{Key: modelKey, Model: cm, Effort: cfg.ModelChatEffort, Client: &http.Client{Timeout: modelTimeout + 5*time.Second}}
 	}
 	return fuel.New(fuel.Options{
-		Recal:        recal,
-		Question:     question,
-		Chat:         chatOpts,
-		ChatModel:    chat,
-		Token:        fuel.ResolveSecret(cfg.Token),
-		Vars:         &fuel.VariablesHTTP{Base: cfg.VariablesURL, Key: varsKey, Client: &http.Client{Timeout: 30 * time.Second}},
-		FoodVar:      cfg.FoodLogVar,
-		BodyVar:      cfg.BodyVar,
-		BPVar:        cfg.BPVar,
-		SymptomVar:   cfg.SymptomVar,
-		Model:        &fuel.OpenAI{Key: modelKey, Model: cfg.Model, Effort: cfg.ModelEffort, Client: &http.Client{Timeout: modelTimeout + 5*time.Second}},
-		LogBudget:    logBudget,
-		ModelTimeout: modelTimeout,
-		ASR:          media.NewWhisper(modelKey, cfg.WhisperModel, ""),
-		TargetsFile:  cfg.TargetsFile,
-		StaplesFile:  cfg.StaplesFile,
-		StateDir:     cfg.StateDir,
-		StorePath:    cfg.StorePath,
-		StoreMode:    cfg.StoreMode,
-		StravaDir:    cfg.StravaDir,
-		TestMode:     cfg.TestMode,
-		Web:          fuel.WebOptions{Enabled: cfg.WebEnabled, PublicOrigin: cfg.PublicOrigin, InsecureTestCookie: cfg.WebInsecureTestCookie},
+		Recal:           recal,
+		Question:        question,
+		Chat:            chatOpts,
+		ChatModel:       chat,
+		Token:           fuel.ResolveSecret(cfg.Token),
+		Vars:            &fuel.VariablesHTTP{Base: cfg.VariablesURL, Key: varsKey, Client: &http.Client{Timeout: 30 * time.Second}},
+		FoodVar:         cfg.FoodLogVar,
+		BodyVar:         cfg.BodyVar,
+		BPVar:           cfg.BPVar,
+		SymptomVar:      cfg.SymptomVar,
+		Model:           &fuel.OpenAI{Key: modelKey, Model: cfg.Model, Effort: cfg.ModelEffort, Client: &http.Client{Timeout: modelTimeout + 5*time.Second}},
+		LogBudget:       logBudget,
+		ModelTimeout:    modelTimeout,
+		ASR:             media.NewWhisper(modelKey, cfg.WhisperModel, ""),
+		TargetsFile:     cfg.TargetsFile,
+		StaplesFile:     cfg.StaplesFile,
+		StateDir:        cfg.StateDir,
+		StorePath:       cfg.StorePath,
+		StoreMode:       cfg.StoreMode,
+		ExportVariables: &cfg.ExportVariables,
+		StravaDir:       cfg.StravaDir,
+		TestMode:        cfg.TestMode,
+		Web:             fuel.WebOptions{Enabled: cfg.WebEnabled, PublicOrigin: cfg.PublicOrigin, InsecureTestCookie: cfg.WebInsecureTestCookie},
 	})
 }
 

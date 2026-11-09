@@ -466,6 +466,20 @@ func (sh *shadowStore) writeFood(ctx context.Context, op Op) error {
 	return sh.db.PutShadowRow(ctx, sqlstore.Row{ID: op.ID, Source: sqlstore.SourceFueld, VariablesValueID: op.ValueID, OpID: op.WireID(), RecordDate: op.Date, CreatedAt: at, Data: data}, sh.target.Load().(string))
 }
 func (s *Service) handleStoreStatus(w http.ResponseWriter, r *http.Request) {
+	if s.local != nil {
+		st, err := s.local.db.LocalStatus(r.Context(), s.o.Now())
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"mode": "local", "available": false})
+			return
+		}
+		writeJSON(w, http.StatusOK, struct {
+			sqlstore.LocalStatus
+			Mode            string `json:"mode"`
+			Available       bool   `json:"available"`
+			ExportVariables bool   `json:"export_variables"`
+		}{st, "local", true, s.local.export})
+		return
+	}
 	st := shadowStatus{Mode: s.o.StoreMode, Status: sqlstore.Status{Counts: map[string]int64{}}}
 	if sh := s.shadow; sh != nil {
 		if cached := sh.status.Load(); cached != nil {

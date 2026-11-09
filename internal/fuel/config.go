@@ -37,16 +37,17 @@ type DaemonConfig struct {
 	ModelChatEffort string
 	// LogBudget is the whole POST /fuel/log after the body is read;
 	// ModelTimeout is one model call (Go durations).
-	LogBudget    string
-	ModelTimeout string
-	WhisperModel string
-	TargetsFile  string
-	StaplesFile  string
-	StateDir     string
-	StorePath    string
-	StoreMode    string
-	StravaDir    string
-	TestMode     bool
+	LogBudget       string
+	ModelTimeout    string
+	WhisperModel    string
+	TargetsFile     string
+	StaplesFile     string
+	StateDir        string
+	StorePath       string
+	StoreMode       string
+	ExportVariables bool
+	StravaDir       string
+	TestMode        bool
 
 	// Second-opinion recalibration of photo meals (spec section 16).
 	RecalibrateEnabled     bool
@@ -91,18 +92,19 @@ func DefaultConfigPath() string { return expandHome("~/.config/fueld/config.toml
 // DefaultDaemonConfig returns the built-in values.
 func DefaultDaemonConfig() DaemonConfig {
 	return DaemonConfig{
-		Listen:        "100.120.65.8:8796",
-		VariablesURL:  "https://app.logvariables.com/api/ext",
-		FoodLogVar:    "Food log",
-		BodyVar:       "Body composition",
-		ModelProvider: "openai",
-		Model:         "gpt-5.1",
-		WhisperModel:  "whisper-1",
-		TargetsFile:   "~/.agentd/fuel-targets.json",
-		StaplesFile:   "~/.agentd/fuel-staples.json",
-		StateDir:      "~/.local/state/fueld",
-		StoreMode:     "off",
-		StravaDir:     "~/warehouse/raw-sources/strava",
+		Listen:          "100.120.65.8:8796",
+		VariablesURL:    "https://app.logvariables.com/api/ext",
+		FoodLogVar:      "Food log",
+		BodyVar:         "Body composition",
+		ModelProvider:   "openai",
+		Model:           "gpt-5.1",
+		WhisperModel:    "whisper-1",
+		TargetsFile:     "~/.agentd/fuel-targets.json",
+		StaplesFile:     "~/.agentd/fuel-staples.json",
+		StateDir:        "~/.local/state/fueld",
+		StoreMode:       "off",
+		ExportVariables: true,
+		StravaDir:       "~/warehouse/raw-sources/strava",
 
 		TelegramGauges: true,
 
@@ -171,7 +173,7 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 		}
 		key := strings.TrimSpace(line[:eq])
 		raw := stripTOMLComment(strings.TrimSpace(line[eq+1:]))
-		if b := map[string]*bool{"test_mode": &c.TestMode, "recalibrate_enabled": &c.RecalibrateEnabled,
+		if b := map[string]*bool{"export_variables": &c.ExportVariables, "test_mode": &c.TestMode, "recalibrate_enabled": &c.RecalibrateEnabled,
 			"web_enabled": &c.WebEnabled, "web_insecure_test_cookie": &c.WebInsecureTestCookie,
 			"telegram_enabled": &c.TelegramEnabled, "telegram_gauges": &c.TelegramGauges}[key]; b != nil {
 			v, err := strconv.ParseBool(raw)
@@ -215,8 +217,8 @@ func ParseDaemonConfig(b []byte) (DaemonConfig, error) {
 	if err := sc.Err(); err != nil {
 		return c, err
 	}
-	if c.StoreMode != "off" && c.StoreMode != "shadow" {
-		return c, errors.New("store_mode must be off or shadow")
+	if c.StoreMode != "off" && c.StoreMode != "shadow" && c.StoreMode != "local" {
+		return c, errors.New("store_mode must be off, shadow or local")
 	}
 	if c.StorePath == "" {
 		c.StorePath = filepath.Join(c.StateDir, "fuel.sqlite")

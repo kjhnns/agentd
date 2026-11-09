@@ -915,7 +915,10 @@ func (s *Service) handleLog(w http.ResponseWriter, r *http.Request) {
 		entry.Agent = agentPending
 		questionTask = s.questionTask(foodText, preSnap, s.dayItems(date), s.questionHistory(now, targets.loc), now, targets.loc)
 	}
-	if err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: items, Ops: ops}); err != nil {
+	s.stateMu.Lock()
+	persistErr := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: items, Ops: ops})
+	s.stateMu.Unlock()
+	if err := persistErr; err != nil {
 		switch {
 		case errors.Is(err, ErrDeadline):
 			s.photos.remove(photoIDs)

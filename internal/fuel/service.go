@@ -31,18 +31,19 @@ type Options struct {
 	BodyVar string
 	// BPVar and SymptomVar name the record variables (spec 18.4); empty =
 	// that record type is not set up (503 variable_missing).
-	BPVar       string
-	SymptomVar  string
-	Model       Model
-	ASR         media.Transcriber
-	TargetsFile string
-	StaplesFile string
-	StateDir    string
-	StorePath   string
-	StoreMode   string
-	StravaDir   string
-	TestMode    bool
-	Now         func() time.Time
+	BPVar           string
+	SymptomVar      string
+	Model           Model
+	ASR             media.Transcriber
+	TargetsFile     string
+	StaplesFile     string
+	StateDir        string
+	StorePath       string
+	StoreMode       string
+	ExportVariables *bool // nil defaults to true
+	StravaDir       string
+	TestMode        bool
+	Now             func() time.Time
 
 	RecheckAfter   time.Duration // re-read an uncertain POST after (60 s)
 	FailAfter      time.Duration // an op not done after this is failed (24 h)
@@ -73,6 +74,7 @@ type Options struct {
 type Service struct {
 	o       Options
 	shadow  *shadowStore
+	local   *localStore
 	journal *Journal
 	idem    *Idem
 	feed    *Feed
@@ -151,8 +153,8 @@ type inflightReq struct {
 
 // Validate checks the static configuration (spec 1 and 2).
 func (o Options) Validate() error {
-	if o.StoreMode != "" && o.StoreMode != "off" && o.StoreMode != "shadow" {
-		return errors.New("fuel: store_mode must be off or shadow")
+	if o.StoreMode != "" && o.StoreMode != "off" && o.StoreMode != "shadow" && o.StoreMode != "local" {
+		return errors.New("fuel: store_mode must be off, shadow or local")
 	}
 	switch {
 	case o.Token == "":
@@ -247,15 +249,25 @@ func New(o Options) (*Service, error) {
 	if err := os.MkdirAll(o.StateDir, 0o700); err != nil {
 		return nil, err
 	}
-	j, err := OpenJournal(filepath.Join(o.StateDir, "journal.jsonl"))
+	var err error
+	j := newJournalState()
+	if o.StoreMode != "local" {
+		j, err = OpenJournal(filepath.Join(o.StateDir, "journal.jsonl"))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("fuel: journal: %w", err)
 	}
-	idem, err := OpenIdem(filepath.Join(o.StateDir, "idem.jsonl"), o.Now())
+	idem := &Idem{recs: map[string]*idemRec{}}
+	if o.StoreMode != "local" {
+		idem, err = OpenIdem(filepath.Join(o.StateDir, "idem.jsonl"), o.Now())
+	}
 	if err != nil {
 		return nil, fmt.Errorf("fuel: idem: %w", err)
 	}
-	feed, err := OpenFeed(filepath.Join(o.StateDir, "feed.jsonl"))
+	feed := &Feed{keys: map[string]bool{}}
+	if o.StoreMode != "local" {
+		feed, err = OpenFeed(filepath.Join(o.StateDir, "feed.jsonl"))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("fuel: feed: %w", err)
 	}
@@ -277,7 +289,11 @@ func New(o Options) (*Service, error) {
 		return nil, fmt.Errorf("fuel: recal: %w", err)
 	}
 	s.recal = rs
-	if s.records, err = openRecordStore(filepath.Join(o.StateDir, "records.jsonl")); err != nil {
+	s.records = &recordStore{ops: map[string]*recOp{}, byClient: map[string]string{}}
+	if o.StoreMode != "local" {
+		s.records, err = openRecordStore(filepath.Join(o.StateDir, "records.jsonl"))
+	}
+	if err != nil {
 		return nil, fmt.Errorf("fuel: records: %w", err)
 	}
 	if s.calib, err = openCalibStore(o.StateDir); err != nil {
@@ -302,6 +318,11 @@ func New(o Options) (*Service, error) {
 		s.coachSeen[ev.EntryID] = true
 		return nil
 	})
+	if o.StoreMode == "local" {
+		if err := s.initLocal(); err != nil {
+			return nil, err
+		}
+	}
 	s.loadTargets()
 	if o.StaplesFile != "" {
 		st, err := LoadStaples(o.StaplesFile)
@@ -439,6 +460,9 @@ func (s *Service) Close() {
 	if s.shadow != nil {
 		s.shadow.close()
 	}
+	if s.local != nil {
+		_ = s.local.db.Close()
+	}
 	_ = s.journal.Close()
 	_ = s.idem.Close()
 	_ = s.feed.Close()
@@ -566,6 +590,10 @@ func (s *Service) Start(ctx context.Context) {
 		s.calibBooted.Store(true)
 		s.loop(lctx)
 	}()
+	if s.local != nil {
+		s.workers.Add(1)
+		go func() { defer s.workers.Done(); s.localLoop(lctx) }()
+	}
 	if s.recalOn() {
 		s.recalResume()
 		s.workers.Add(1)
@@ -618,6 +646,12 @@ func (s *Service) today() string {
 }
 
 func (s *Service) hydrate(ctx context.Context) {
+	if s.local != nil {
+		if err := s.cache.RefreshDay(ctx, s.today()); err != nil {
+			log.Printf("fuel: hydrate SQLite: %v", err)
+		}
+		return
+	}
 	// Shadow starts with the full history batch before parallel day refreshes.
 	// The existing All read supplies it without an extra Variables request.
 	if s.shadow != nil {
@@ -781,6 +815,12 @@ func correctionRowData(it Item, m Macros, opID, rowItemID, reason string) map[st
 // the caller's txn already carried it (preJournaled), so a crash mid-POST can
 // neither exceed three attempts nor shorten their spacing.
 func (s *Service) postOp(ctx context.Context, op Op, preJournaled bool) string {
+	if s.local != nil {
+		if done, ok := s.journal.Op(op.ID); ok {
+			return done.State
+		}
+		return op.State
+	}
 	s.inflight.Store(op.ID, struct{}{})
 	defer s.inflight.Delete(op.ID)
 	attempts := op.Attempts
@@ -981,6 +1021,11 @@ func (s *Service) reconcileOnce(ctx context.Context) {
 	ready := s.cache != nil
 	s.mu.Unlock()
 	if !ready {
+		return
+	}
+	if s.local != nil {
+		s.coachCatchUp(ctx, s.o.Now())
+		s.materializeFeed(ctx, 2*s.o.LogBudget)
 		return
 	}
 	now := s.o.Now()
@@ -1739,7 +1784,7 @@ func (s *Service) ensureHistory(ctx context.Context, date string) bool {
 // freshen re-reads a day if its cache is older than 60 s (spec 5).
 // It reports whether the day is now fresh.
 func (s *Service) freshen(ctx context.Context, date string) bool {
-	if s.cache.Age(date) < 60*time.Second {
+	if s.local == nil && s.cache.Age(date) < 60*time.Second {
 		return true
 	}
 	if err := s.cache.RefreshDay(ctx, date); err != nil {

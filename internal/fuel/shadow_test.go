@@ -265,7 +265,7 @@ func TestShadowOffAndConfig(t *testing.T) {
 	if err != nil || c.StoreMode != "shadow" || c.StorePath != "/tmp/other.sqlite" {
 		t.Fatalf("config %+v %v", c, err)
 	}
-	for _, bad := range []string{"store_mode = \"hybrid\"", "store_mode = \"local\"", "store_mode = \"\"", "store_modes = \"shadow\""} {
+	for _, bad := range []string{"store_mode = \"hybrid\"", "store_mode = \"\"", "store_modes = \"shadow\""} {
 		if _, err := ParseDaemonConfig([]byte(bad)); err == nil {
 			t.Fatal("accepted", bad)
 		}

@@ -180,7 +180,7 @@ func (s *Service) findRow(rowKey string) (string, bool) {
 		d := dateAdd(today, -i)
 		rows, _, _ := s.cache.Rows(d)
 		for _, r := range rows {
-			if r.ID == id {
+			if valueHasID(r, id) {
 				return d, true
 			}
 		}

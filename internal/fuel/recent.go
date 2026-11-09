@@ -705,7 +705,10 @@ func (s *Service) handleRelog(w http.ResponseWriter, r *http.Request) {
 		Attempts: 1, LastTry: s.o.Now()}
 
 	tWrite := time.Now()
-	if err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: []Item{it}, Ops: []Op{op}}); err != nil {
+	s.stateMu.Lock()
+	persistErr := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: []Item{it}, Ops: []Op{op}})
+	s.stateMu.Unlock()
+	if err := persistErr; err != nil {
 		switch {
 		case err == ErrDeadline:
 			writeErr(w, errf(http.StatusGatewayTimeout, "timeout", true, "took too long; nothing was written, retry"))

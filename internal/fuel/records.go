@@ -73,6 +73,7 @@ type recOp struct {
 
 // recordStore is the durable store of record operations.
 type recordStore struct {
+	local    func(*recOp) error
 	shadow   func([]byte)
 	mu       sync.Mutex
 	path     string
@@ -112,6 +113,13 @@ func (rs *recordStore) apply(op recOp) {
 func (rs *recordStore) put(op recOp) error {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
+	if rs.local != nil {
+		if err := rs.local(&op); err != nil {
+			return err
+		}
+		rs.apply(op)
+		return nil
+	}
 	f, err := openAppend(rs.path)
 	if err != nil {
 		return err
@@ -532,6 +540,14 @@ func hashOf(parts ...any) string {
 // attempt, uncertain otherwise (never blindly re-posted: the reconciler
 // reads first).
 func (s *Service) postRecordOp(ctx context.Context, op recOp) recOp {
+	if s.local != nil {
+		done, ok := s.records.get(op.OpID)
+		if ok {
+			_ = s.cache.RefreshBody(ctx)
+			return done
+		}
+		return op
+	}
 	op.Attempts++
 	op.LastTry = s.o.Now()
 	if err := s.records.put(op); err != nil {

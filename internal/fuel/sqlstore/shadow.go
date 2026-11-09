@@ -85,7 +85,14 @@ func (s *Store) PutShadowRow(ctx context.Context, r Row, target string) error {
 // MirrorLegacy copies complete legacy envelopes. The legacy stores remain the
 // authority, including response replacement and record state transitions.
 // Journal keys come from JournalEventKey, shared with legacy imports.
+type legacyExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
 func (s *Store) MirrorLegacy(ctx context.Context, kind, key string, payload json.RawMessage) error {
+	return mirrorLegacy(ctx, s.db, kind, key, payload)
+}
+func mirrorLegacy(ctx context.Context, db legacyExecutor, kind, key string, payload json.RawMessage) error {
 	if !json.Valid(payload) {
 		return errors.New("sqlstore: invalid legacy JSON")
 	}
@@ -96,7 +103,7 @@ func (s *Store) MirrorLegacy(ctx context.Context, kind, key string, payload json
 		if key == "" {
 			return errors.New("sqlstore: missing journal event key")
 		}
-		_, err := s.db.ExecContext(ctx, `INSERT INTO journal(kind,at,entry_id,op_id,payload,event_key) VALUES(json_extract(?1,'$.t'),json_extract(?1,'$.at'),json_extract(?1,'$.entry.id'),json_extract(?1,'$.op_id'),?1,?2) ON CONFLICT(event_key) DO NOTHING`, p, key)
+		_, err := db.ExecContext(ctx, `INSERT INTO journal(kind,at,entry_id,op_id,payload,event_key) VALUES(json_extract(?1,'$.t'),json_extract(?1,'$.at'),json_extract(?1,'$.entry.id'),json_extract(?1,'$.op_id'),?1,?2) ON CONFLICT(event_key) DO NOTHING`, p, key)
 		return err
 	case "operation":
 		query = `INSERT INTO operations(op_id,entry_id,item_id,record_date,state,created_at,payload) VALUES(json_extract(?1,'$.op_id'),json_extract(?1,'$.entry_id'),json_extract(?1,'$.item_id'),json_extract(?1,'$.date'),json_extract(?1,'$.state'),json_extract(?1,'$.created_at'),?1) ON CONFLICT(op_id) DO UPDATE SET state=excluded.state,payload=excluded.payload`
@@ -109,12 +116,15 @@ func (s *Store) MirrorLegacy(ctx context.Context, kind, key string, payload json
 		if err := json.Unmarshal(payload, &r); err != nil {
 			return err
 		}
-		_, err := s.db.ExecContext(ctx, `INSERT INTO idem(client_id,hash,kind,at,expires_at,payload) VALUES(?,?,?,?,?,?) ON CONFLICT(client_id) DO UPDATE SET hash=excluded.hash,kind=excluded.kind,at=excluded.at,expires_at=excluded.expires_at,payload=excluded.payload`, r.ClientID, r.Hash, r.Kind, stamp(r.At), stamp(r.ExpiresAt), p)
+		if r.ExpiresAt.IsZero() {
+			r.ExpiresAt = r.At.Add(7 * 24 * time.Hour)
+		}
+		_, err := db.ExecContext(ctx, `INSERT INTO idem(client_id,hash,kind,at,expires_at,payload) VALUES(?,?,?,?,?,?) ON CONFLICT(client_id) DO UPDATE SET hash=excluded.hash,kind=excluded.kind,at=excluded.at,expires_at=excluded.expires_at,payload=excluded.payload`, r.ClientID, r.Hash, r.Kind, stamp(r.At), stamp(r.ExpiresAt), p)
 		return err
 	default:
 		return errors.New("sqlstore: unknown legacy kind")
 	}
-	_, err := s.db.ExecContext(ctx, query, p)
+	_, err := db.ExecContext(ctx, query, p)
 	return err
 }
 

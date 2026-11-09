@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
+	"github.com/kjhnns/agentd/internal/fuel"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -29,5 +32,25 @@ func TestHandlerServesOnlyFuelAndRecoversPanics(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/fuel/x", nil))
 	if rec.Code != 204 {
 		t.Fatal("not serving after a panic")
+	}
+}
+
+func TestBuildLocalWithoutVariablesCredential(t *testing.T) {
+	cfg := fuel.DefaultDaemonConfig()
+	cfg.StoreMode = "local"
+	cfg.StateDir = t.TempDir()
+	cfg.TargetsFile = filepath.Join(cfg.StateDir, "targets.json")
+	cfg.StaplesFile = filepath.Join(cfg.StateDir, "staples.json")
+	cfg.StravaDir = filepath.Join(cfg.StateDir, "strava")
+	cfg.Token = "local-test-token-0123456789"
+	cfg.ModelKey = "test-model-key"
+	cfg.VariablesKey = ""
+	svc, err := build(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	if err := svc.Resolve(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }

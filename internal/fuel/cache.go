@@ -71,6 +71,9 @@ func (c *Cache) daySlot(date string) chan struct{} {
 // rows missing from that read only if they were written less than 60 s ago
 // (eventual consistency). External edits and deletions win.
 func (c *Cache) RefreshDay(ctx context.Context, date string) error {
+	if _, local := c.vars.(*localStore); local {
+		return c.refreshLocal(ctx, date)
+	}
 	c.mu.Lock()
 	asked := c.gen[date]
 	c.mu.Unlock()
@@ -332,6 +335,9 @@ func (c *Cache) Age(date string) time.Duration {
 
 // RefreshBody replaces the Body composition history from one includeJson read.
 func (c *Cache) RefreshBody(ctx context.Context) error {
+	if _, local := c.vars.(*localStore); local {
+		return c.refreshLocal(ctx, "")
+	}
 	rctx, cancel := context.WithTimeout(ctx, c.bodyTO)
 	defer cancel()
 	vals, err := c.vars.All(rctx)
@@ -470,6 +476,9 @@ func dedupeRowsMap(rows []Value) ([]Value, map[string]string) {
 	dup := map[string]string{}
 	sorted := append([]Value(nil), rows...)
 	sort.SliceStable(sorted, func(a, b int) bool {
+		if sorted[a].localSeq > 0 && sorted[b].localSeq > 0 {
+			return sorted[a].localSeq < sorted[b].localSeq
+		}
 		if !sorted[a].CreatedAt.Equal(sorted[b].CreatedAt) {
 			return sorted[a].CreatedAt.Before(sorted[b].CreatedAt)
 		}
@@ -618,6 +627,9 @@ func groupRows(rows []Value) []*group {
 			alias[id] = key
 		}
 		alias[r.ID] = key
+		for _, id := range r.aliases {
+			alias[id] = key
+		}
 		g := get(key)
 		g.orig = r
 	}
@@ -638,7 +650,7 @@ func groupRows(rows []Value) []*group {
 		g := get(key)
 		g.c.add(r)
 		g.rows = append(g.rows, r)
-		if g.last.Data == nil || !r.CreatedAt.Before(g.last.CreatedAt) {
+		if g.last.Data == nil || (r.localSeq > 0 && g.last.localSeq > 0 && r.localSeq > g.last.localSeq) || (r.localSeq == 0 && !r.CreatedAt.Before(g.last.CreatedAt)) {
 			g.last = r
 		}
 	}
@@ -666,7 +678,7 @@ func itemGroup(rows []Value, itemID string) *group {
 		key = itemID // an external row key is the group key itself
 	}
 	for _, g := range groupRows(rows) {
-		if g.key == key {
+		if g.key == key || (strings.HasPrefix(itemID, "v:") && valueHasID(g.orig, strings.TrimPrefix(itemID, "v:"))) {
 			return g
 		}
 	}
@@ -681,4 +693,17 @@ func itemContrib(rows []Value, itemID string) (*contrib, Value, bool) {
 		return g.c, g.orig, g.c.rows > 0
 	}
 	return newContrib(), Value{}, false
+}
+
+// valueHasID accepts both the stable local identity and known Variables aliases.
+func valueHasID(v Value, id string) bool {
+	if v.ID == id {
+		return true
+	}
+	for _, a := range v.aliases {
+		if a == id {
+			return true
+		}
+	}
+	return false
 }

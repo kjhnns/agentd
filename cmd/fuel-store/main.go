@@ -29,11 +29,13 @@ func main() {
 
 func run(ctx context.Context, args []string, out, errOut io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(errOut, "usage: fuel-store {import|compare|backup|restore-check} [flags]")
+		fmt.Fprintln(errOut, "usage: fuel-store {import|compare|backup|restore-check|export-legacy} [flags]")
 		return 2
 	}
 	var err error
 	switch args[0] {
+	case "export-legacy":
+		err = exportLegacyCommand(ctx, args[1:], out, errOut)
 	case "import":
 		err = importCommand(ctx, args[1:], out, errOut)
 	case "compare":
@@ -403,5 +405,23 @@ func restoreCommand(ctx context.Context, args []string, out, errOut io.Writer) e
 	for _, name := range names {
 		fmt.Fprintf(out, "%s\t%d\n", name, counts[name])
 	}
+	return nil
+}
+
+func exportLegacyCommand(ctx context.Context, args []string, out, errOut io.Writer) error {
+	f := flag.NewFlagSet("export-legacy", flag.ContinueOnError)
+	f.SetOutput(errOut)
+	db := f.String("db", "", "authoritative SQLite database")
+	state := f.String("state-dir", "", "rollback state directory (fueld must be stopped)")
+	if err := f.Parse(args); err != nil {
+		return err
+	}
+	if *db == "" || *state == "" {
+		return errors.New("db and state-dir are required")
+	}
+	if err := fuel.ExportLocalLegacy(ctx, *db, *state); err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "Legacy replay files reconstructed. Keep writers stopped until rollback validation completes.")
 	return nil
 }

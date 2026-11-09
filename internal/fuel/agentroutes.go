@@ -202,7 +202,10 @@ func (s *Service) handleItems(w http.ResponseWriter, r *http.Request) {
 			Data: originalRowData(its[i], opID, ""), Macros: its[i].Orig, CreatedAt: now, State: OpPending, Attempts: 1, LastTry: s.o.Now()})
 	}
 	tWrite := time.Now()
-	if err := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: its, Ops: ops}); err != nil {
+	s.stateMu.Lock()
+	persistErr := s.journal.AppendCtx(ctx, journalRec{T: "txn", Entry: &entry, Items: its, Ops: ops})
+	s.stateMu.Unlock()
+	if err := persistErr; err != nil {
 		if err == ErrDeadline {
 			writeErr(w, errf(http.StatusGatewayTimeout, "timeout", true, "took too long; nothing was written, retry"))
 		} else {

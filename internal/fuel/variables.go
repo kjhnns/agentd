@@ -16,6 +16,8 @@ import (
 
 // Value is one Variables value as the ext API returns it.
 type Value struct {
+	localSeq   int64
+	aliases    []string
 	ID         string
 	VariableID string
 	RecordDate string

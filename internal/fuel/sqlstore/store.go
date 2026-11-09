@@ -1,4 +1,4 @@
-// Package sqlstore implements the H1 SQLite store without a dependency on fuel.
+// Package sqlstore implements Fuel SQLite persistence without a dependency on fuel.
 package sqlstore
 
 import (

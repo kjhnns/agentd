@@ -204,20 +204,22 @@ type journalRec struct {
 // Everything else (entry status, fraction state, idempotency) is derived from
 // it on startup replay.
 type Journal struct {
-	shadow    func(int64, []byte)
-	mu        sync.Mutex
-	f         *os.File
-	entries   map[string]*Entry
-	items     map[string]*Item
-	ops       map[string]*Op
-	itemOps   map[string][]string // original item id -> op ids in order
-	fractions map[string]FractionChoice
-	doneByDay map[string]int // date -> done ops (the revision)
-	idents    map[string]Identity
-	pairUndo  map[string]string    // a move's new-row op id -> its undo op id
-	syncFn    func(*os.File) error // (*os.File).Sync; tests inject failures
-	size      int64                // file size after the last good append
-	broken    error                // set when durability became uncertain; no more appends
+	publishLocal func(journalRec)
+	local        func(context.Context, *journalRec) error
+	shadow       func(int64, []byte)
+	mu           sync.Mutex
+	f            *os.File
+	entries      map[string]*Entry
+	items        map[string]*Item
+	ops          map[string]*Op
+	itemOps      map[string][]string // original item id -> op ids in order
+	fractions    map[string]FractionChoice
+	doneByDay    map[string]int // date -> done ops (the revision)
+	idents       map[string]Identity
+	pairUndo     map[string]string    // a move's new-row op id -> its undo op id
+	syncFn       func(*os.File) error // (*os.File).Sync; tests inject failures
+	size         int64                // file size after the last good append
+	broken       error                // set when durability became uncertain; no more appends
 }
 
 // Identity is a request identity (client_id) as the journal knows it: the
@@ -347,6 +349,9 @@ func (j *Journal) apply(r journalRec) {
 				continue
 			}
 			j.ops[op.ID] = &op
+			if op.State == OpDone {
+				j.doneByDay[op.Date]++
+			}
 			j.itemOps[op.ItemID] = append(j.itemOps[op.ItemID], op.ID)
 			if op.PairOp != "" {
 				j.pairUndo[op.PairOp] = op.ID
@@ -460,6 +465,16 @@ func (j *Journal) AppendCtx(ctx context.Context, r journalRec) error {
 	if r.At.IsZero() {
 		r.At = time.Now().UTC()
 	}
+	if j.local != nil {
+		if err := j.local(ctx, &r); err != nil {
+			return err
+		}
+		j.apply(r)
+		if j.publishLocal != nil {
+			j.publishLocal(r)
+		}
+		return nil
+	}
 	applied, err := j.write(r)
 	if applied {
 		j.apply(r)
@@ -475,7 +490,12 @@ func (j *Journal) Ident(clientID string) (Identity, bool) {
 	return id, ok
 }
 
-func (j *Journal) Close() error { return j.f.Close() }
+func (j *Journal) Close() error {
+	if j.f == nil {
+		return nil
+	}
+	return j.f.Close()
+}
 
 // ---- read helpers (take the lock) ----
 
@@ -678,6 +698,7 @@ const idemRetention = 7 * 24 * time.Hour
 
 // Idem is the idempotency store (spec section 6).
 type Idem struct {
+	local  func([]byte) error
 	shadow func([]byte)
 	putMu  sync.Mutex // serializes PutIfNoResponse
 	mu     sync.Mutex
@@ -750,6 +771,14 @@ func (s *Idem) Put(r idemRec) error {
 	if err != nil {
 		return err
 	}
+	if s.local != nil {
+		if err := s.local(b); err != nil {
+			return err
+		}
+		cp := r
+		s.recs[r.ClientID] = &cp
+		return nil
+	}
 	if _, err := s.f.Write(append(b, '\n')); err != nil {
 		return err
 	}
@@ -797,7 +826,12 @@ func (s *Idem) PutIfNoResponse(rec idemRec) (idemRec, bool) {
 	return rec, true
 }
 
-func (s *Idem) Close() error { return s.f.Close() }
+func (s *Idem) Close() error {
+	if s.f == nil {
+		return nil
+	}
+	return s.f.Close()
+}
 
 // ---- feed ----
 
@@ -829,6 +863,7 @@ type FeedItem struct {
 
 // Feed is the append-only conversation store.
 type Feed struct {
+	local  func([]byte) error
 	shadow func([]byte)
 	mu     sync.Mutex
 	f      *os.File
@@ -901,6 +936,14 @@ func (fd *Feed) Append(it FeedItem) (FeedItem, error) {
 	if err != nil {
 		return it, err
 	}
+	if fd.local != nil {
+		if err := fd.local(b); err != nil {
+			return it, err
+		}
+		fd.items = append(fd.items, it)
+		fd.index(it)
+		return it, nil
+	}
 	b = append(b, '\n')
 	if _, err := fd.f.Write(b); err != nil {
 		// Cut a partial line back so the next append starts clean.
@@ -970,7 +1013,12 @@ func (fd *Feed) HasNotice(opID string) bool {
 	return fd.keys["notice:"+opID]
 }
 
-func (fd *Feed) Close() error { return fd.f.Close() }
+func (fd *Feed) Close() error {
+	if fd.f == nil {
+		return nil
+	}
+	return fd.f.Close()
+}
 
 // appendJSONLine appends one JSON line to a file (coach events).
 func appendJSONLine(path string, v any) error {

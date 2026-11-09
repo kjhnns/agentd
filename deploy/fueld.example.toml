@@ -21,13 +21,17 @@ whisper_model  = "whisper-1"
 targets_file   = "~/.agentd/fuel-targets.json" # missing = built-in defaults
 staples_file   = "~/.agentd/fuel-staples.json" # shared with ~/clawd/scripts/food-log
 state_dir      = "~/.local/state/fueld"
-# H1 shadow store (spec 25). Deploy the supporting binary FIRST. Verify the
-# nightly complete backup and off-box copy before enabling shadow writes.
-# store_mode   = "off"                          # off (default) | shadow
+# SQLite store (spec 25). Deploy this binary in shadow mode first. Complete
+# the backup/restore gate, final parity check and legacy operation drain.
+# store_mode   = "local"                        # off (default) | shadow | local
+# export_variables = true                      # local: false disables outbound export (H4)
 # store_path   = "~/.local/state/fueld/fuel.sqlite" # default: <state_dir>/fuel.sqlite
+# Local startup and reads need no Variables connection. External body/strength
+# and foreign food rows import in the background. Check last_import before cutover.
 # Set backup.env FUEL_STORE_PATH to the same absolute path (fuel-store-backup.md).
-# GET /fuel/admin/store-status requires the app bearer token.
-# Older binaries reject unknown keys. Remove BOTH store keys before rollback.
+# GET /fuel/admin/store-status requires the app bearer token. Before rollback,
+# quiesce writers, require pending=0, stop fueld, and run fuel-store export-legacy.
+# See spec 25.4 for the complete local -> shadow rollback procedure.
 strava_dir     = "~/warehouse/raw-sources/strava"
 test_mode      = false                         # true refuses food_log_var "Food log"
 

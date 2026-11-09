@@ -147,7 +147,7 @@ func TestImportFullHistoryIdempotencyAndDryRun(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("import: %d %s %s", code, out, errOut)
 	}
-	want := map[string]int64{"food_rows": 1, "journal": 3, "operations": 1, "idem": 1, "feed": 2, "coach_events": 1, "records": 4, "export_outbox": 0, "legacy_import_lines": 8, "store_metadata": 0, "import_cursor": 0}
+	want := map[string]int64{"food_rows": 1, "journal": 3, "operations": 1, "idem": 1, "feed": 2, "coach_events": 1, "records": 4, "export_outbox": 0, "legacy_import_lines": 8, "store_metadata": 0, "import_cursor": 0, "local_events": 0, "local_values": 0, "local_aliases": 0, "export_objects": 1}
 	c := counts(t, db)
 	if len(c) != len(want) {
 		t.Fatalf("unexpected schema tables: %v", c)

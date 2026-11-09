@@ -107,6 +107,21 @@ CREATE TABLE coach_events (
     at TEXT NOT NULL,
     payload BLOB NOT NULL CHECK (json_valid(payload))
 );
+`, `
+CREATE TABLE local_events(seq INTEGER PRIMARY KEY AUTOINCREMENT, stream TEXT NOT NULL, payload BLOB NOT NULL CHECK(json_valid(payload)));
+CREATE INDEX local_events_stream ON local_events(stream,seq);
+CREATE TABLE local_values(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,variable TEXT NOT NULL,record_date TEXT NOT NULL,created_at TEXT NOT NULL,op_id TEXT,remote_id TEXT UNIQUE,own INTEGER NOT NULL,food INTEGER NOT NULL,raw TEXT NOT NULL,deleted INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE local_aliases(remote_id TEXT PRIMARY KEY NOT NULL, local_id TEXT NOT NULL REFERENCES local_values(id));
+CREATE INDEX local_values_date ON local_values(record_date,seq);
+CREATE INDEX local_values_op ON local_values(variable,op_id);
+CREATE TABLE export_objects(id TEXT PRIMARY KEY NOT NULL);
+INSERT INTO export_objects SELECT id FROM food_rows;
+ALTER TABLE export_outbox RENAME TO export_outbox_h1;
+CREATE TABLE export_outbox(row_id TEXT NOT NULL REFERENCES export_objects(id),target TEXT NOT NULL CHECK(target<>''),attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts>=0),last_error TEXT NOT NULL DEFAULT '',done_at TEXT,next_at TEXT,PRIMARY KEY(row_id,target));
+INSERT INTO export_outbox(row_id,target,attempts,last_error,done_at) SELECT row_id,target,attempts,last_error,done_at FROM export_outbox_h1;
+DROP TABLE export_outbox_h1;
+CREATE INDEX export_outbox_pending ON export_outbox(done_at);
+CREATE TRIGGER food_export_identity AFTER INSERT ON food_rows BEGIN INSERT INTO export_objects(id) VALUES(new.id) ON CONFLICT DO NOTHING; END;
 `}
 
 func (s *Store) migrate(ctx context.Context) error {
