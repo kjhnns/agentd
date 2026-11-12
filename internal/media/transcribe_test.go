@@ -55,7 +55,7 @@ func TestWhisperTranscribe(t *testing.T) {
 		`{"text":"the magic word is turquoise","language":"english","duration":3.9}`, got)
 	defer srv.Close()
 
-	w := NewWhisper("sk-test", "", "") // model defaults to whisper-1, lang auto
+	w := NewWhisper("sk-test", "whisper-1", "") // verbose_json path, lang auto
 	w.BaseURL = srv.URL
 
 	tr, err := w.Transcribe(context.Background(), writeAudioFixture(t))
@@ -114,5 +114,25 @@ func TestWhisperEmptyKey(t *testing.T) {
 	w := NewWhisper("", "", "")
 	if _, err := w.Transcribe(context.Background(), writeAudioFixture(t)); err == nil {
 		t.Fatal("expected error with empty API key")
+	}
+}
+
+func TestGPT4oTranscribeUsesJSON(t *testing.T) {
+	got := map[string]string{}
+	srv := newWhisperServer(t, 200, `{"text":"hallo welt"}`, got)
+	defer srv.Close()
+
+	w := NewWhisper("sk-test", "", "") // default gpt-4o-transcribe
+	w.BaseURL = srv.URL
+	tr, err := w.Transcribe(context.Background(), writeAudioFixture(t))
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	if got["model"] != "gpt-4o-transcribe" || got["response_format"] != "json" {
+		t.Errorf("fields = model %q format %q", got["model"], got["response_format"])
+	}
+	// The fixture is not real audio: ffprobe (if installed) fails, duration 0.
+	if tr.Text != "hallo welt" || tr.DurationS != 0 {
+		t.Errorf("transcript = %+v", tr)
 	}
 }

@@ -135,7 +135,7 @@ type Job struct {
 type Media struct {
 	Enabled      bool          // default true; false parks all media handling
 	WhisperKey   string        // OpenAI API key: literal or "env:VAR" (ResolveToken)
-	WhisperModel string        // default "whisper-1"
+	WhisperModel string        // default "gpt-4o-transcribe" (OPS-81)
 	WhisperLang  string        // optional ISO-639-1 hint; "" = auto-detect
 	MaxFileMB    int           // per-file cap in MB (default 20)
 	Retention    time.Duration // media files older than this are swept (default 168h)
@@ -147,7 +147,7 @@ type Media struct {
 func DefaultMedia() Media {
 	return Media{
 		Enabled:      true,
-		WhisperModel: "whisper-1",
+		WhisperModel: "gpt-4o-transcribe",
 		MaxFileMB:    20,
 		Retention:    168 * time.Hour,
 	}

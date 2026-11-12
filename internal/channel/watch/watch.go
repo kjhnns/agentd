@@ -508,6 +508,12 @@ func (a *Adapter) handleTranscribe(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if art.Unreliable != "" {
+		// OPS-81: a likely invented transcript must not land in the composer
+		// as if the user had said it.
+		writeErr(w, http.StatusBadGateway, "speech not understood ("+art.Unreliable+"), please try again")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"text": strings.TrimSpace(art.Transcript), "duration_s": art.DurationS})
 }
 
@@ -839,7 +845,13 @@ func (a *Adapter) handlePost(w http.ResponseWriter, r *http.Request) {
 		switch art.Kind {
 		case media.KindAudio:
 			msg.Kind = KindVoice
-			msg.Text = joinText(text, art.Transcript)
+			tr := art.Transcript
+			if art.Unreliable != "" {
+				// OPS-81: the stored row is shown on the wrist and replayed
+				// into later context, so it carries the warning too.
+				tr = "[transcript unreliable: " + art.Unreliable + "] " + tr
+			}
+			msg.Text = joinText(text, tr)
 		case media.KindImage:
 			msg.Text = joinText(text, "[photo]")
 		default:
@@ -1021,6 +1033,7 @@ func (a *Adapter) ingestPart(r *http.Request, hdr *multipart.FileHeader, sniffed
 		Source:    "watch",
 		ChatLabel: a.userID,
 		DurationS: dur,
+		KeepAudio: true, // OPS-81: a bad transcript of a watch note can be redone
 	})
 }
 

@@ -357,7 +357,7 @@ func TestParseMediaBlockDefaultsAndOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if !cfg.Media.Enabled || cfg.Media.WhisperModel != "whisper-1" ||
+	if !cfg.Media.Enabled || cfg.Media.WhisperModel != "gpt-4o-transcribe" ||
 		cfg.Media.MaxFileMB != 20 || cfg.Media.Retention != 168*time.Hour ||
 		cfg.Media.WhisperLang != "" || cfg.Media.Dir != "" {
 		t.Errorf("media defaults wrong: %+v", cfg.Media)

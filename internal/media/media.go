@@ -46,18 +46,21 @@ var (
 
 // Artifact is one ingested media item. For AUDIO the transcript IS the
 // artifact: after a successful transcription the audio file is deleted and
-// Path is empty; on transcription failure the file is kept (Path set) so
-// nothing is lost.
+// Path is empty, unless the request asked to keep it (KeepAudio) or the
+// transcript looks invented (Unreliable set); on transcription failure the
+// file is kept (Path set) so nothing is lost. A kept file is removed by the
+// retention sweeper like any other.
 type Artifact struct {
 	ID         string    `json:"id"`
 	Path       string    `json:"path"` // absolute path on disk ("" for transcribed audio: file deleted)
 	Kind       Kind      `json:"kind"` // image | audio | document
 	Mime       string    `json:"mime"`
-	Name       string    `json:"name"` // original filename
-	Size       int64     `json:"size"` // bytes ingested
+	Name       string    `json:"name"`                 // original filename
+	Size       int64     `json:"size"`                 // bytes ingested
 	DurationS  int       `json:"duration_s,omitempty"` // audio only
 	Transcript string    `json:"transcript,omitempty"` // audio only
 	Language   string    `json:"language,omitempty"`   // audio only (whisper-detected)
+	Unreliable string    `json:"unreliable,omitempty"` // audio only: why the transcript looks invented (OPS-81)
 	CreatedAt  time.Time `json:"created_at"`
 }
 
@@ -71,6 +74,7 @@ type Request struct {
 	Source    string // "telegram", "web", ... (becomes the storage subdir)
 	ChatLabel string // chat/user label, recorded in the run-log only
 	DurationS int    // optional known duration in seconds (audio)
+	KeepAudio bool   // keep the audio file after a good transcription (watch notes, OPS-81)
 }
 
 // Service owns media storage + processing. Zero-value fields get defaults via
@@ -235,6 +239,15 @@ func (s *Service) Ingest(ctx context.Context, req Request) (Artifact, error) {
 	art.Language = tr.Language
 	if art.DurationS == 0 {
 		art.DurationS = tr.DurationS
+	}
+	art.Unreliable = Unreliable(tr.Text, tr.Language, art.DurationS)
+	if art.Unreliable != "" {
+		s.record("unreliable", art, req, art.Unreliable)
+	}
+	if req.KeepAudio || art.Unreliable != "" {
+		// Kept so a doubtful transcript can be redone; the sweeper removes it.
+		s.record("transcribed", art, req, "")
+		return art, nil
 	}
 	// Success: the transcript is the artifact; delete the audio file.
 	if rmErr := os.Remove(path); rmErr != nil {

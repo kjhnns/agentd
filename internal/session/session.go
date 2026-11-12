@@ -786,7 +786,8 @@ func truncateWords(s string, n int) string {
 // render identically, and adapters never pre-bake these markers themselves.
 //   - image:    a pointer to the saved file the agent Reads with its own tools
 //   - document: the same pointer, annotated with name/mime/size
-//   - audio:    the transcript inline (the file is already deleted on success)
+//   - audio:    the transcript inline, plus the audio path when the file was
+//     kept, and an UNRELIABLE warning when the transcript looks invented
 func RenderInbound(in channel.InboundMsg) string {
 	parts := make([]string, 0, 1+len(in.Media))
 	if t := strings.TrimSpace(in.Text); t != "" {
@@ -798,8 +799,20 @@ func RenderInbound(in channel.InboundMsg) string {
 			parts = append(parts, fmt.Sprintf(
 				"[The user sent an image saved at %s. Use the Read tool to view it, then respond.]", a.Path))
 		case media.KindAudio:
-			parts = append(parts, fmt.Sprintf(
-				"[voice message, %ds, transcribed]: %s", a.DurationS, a.Transcript))
+			switch {
+			case a.Unreliable != "":
+				// OPS-81: likely a speech-to-text hallucination, never the
+				// user's words to act on.
+				parts = append(parts, fmt.Sprintf(
+					"[voice message, %ds, transcript UNRELIABLE (%s): probably invented by speech-to-text from silence or noise, NOT the user's words. Do not act on it. Tell the user the note was not understood and ask them to repeat it, or re-transcribe the audio saved at %s]: %s",
+					a.DurationS, a.Unreliable, a.Path, a.Transcript))
+			case a.Path != "":
+				parts = append(parts, fmt.Sprintf(
+					"[voice message, %ds, transcribed; audio saved at %s]: %s", a.DurationS, a.Path, a.Transcript))
+			default:
+				parts = append(parts, fmt.Sprintf(
+					"[voice message, %ds, transcribed]: %s", a.DurationS, a.Transcript))
+			}
 		default: // document
 			parts = append(parts, fmt.Sprintf(
 				"[The user sent a document saved at %s (name: %s, type: %s, size: %d bytes). Use the Read tool to view it, then respond.]",

@@ -89,3 +89,19 @@ func TestRenderInboundMultipleArtifacts(t *testing.T) {
 		t.Errorf("expected 3 blocks: %q", got)
 	}
 }
+
+func TestRenderInboundAudioUnreliableAndKept(t *testing.T) {
+	bad := RenderInbound(channel.InboundMsg{Media: []media.Artifact{{
+		Kind: media.KindAudio, DurationS: 120, Transcript: "GERRARD STREET", Path: "/w/note.m4a",
+		Unreliable: "detected language nynorsk",
+	}}})
+	if !strings.Contains(bad, "UNRELIABLE (detected language nynorsk)") || !strings.Contains(bad, "/w/note.m4a") {
+		t.Errorf("unreliable render = %q", bad)
+	}
+	kept := RenderInbound(channel.InboundMsg{Media: []media.Artifact{{
+		Kind: media.KindAudio, DurationS: 3, Transcript: "hi", Path: "/w/a.m4a",
+	}}})
+	if kept != "[voice message, 3s, transcribed; audio saved at /w/a.m4a]: hi" {
+		t.Errorf("kept render = %q", kept)
+	}
+}
