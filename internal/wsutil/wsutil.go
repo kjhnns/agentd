@@ -3,11 +3,8 @@
 // agentd stays a pure-stdlib single static binary (design 3.11) with no
 // gorilla/websocket to vendor.
 //
-// The existing api/ws.go is server-write-only (the /events one-way stream). The
-// web channel needs a client to also SEND typed input over the socket, so this
-// package adds masked client-frame reading and a small client Dial for tests and
-// tooling. Fragmentation is not supported (our messages are small single
-// frames); ping is answered with pong; close is surfaced as io.EOF.
+// Fragmentation is not supported. Ping is answered with pong; close is
+// surfaced as io.EOF. Incoming frames are limited to 1 MiB.
 package wsutil
 
 import (
@@ -22,7 +19,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 )
+
+const maxFrameSize = 1 << 20
 
 const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -37,9 +37,10 @@ const (
 // Conn is one WebSocket connection. Server-side conns write unmasked frames;
 // client-side conns (from Dial) mask their outgoing frames per the spec.
 type Conn struct {
-	conn   net.Conn
-	rw     *bufio.ReadWriter
-	client bool
+	conn    net.Conn
+	rw      *bufio.ReadWriter
+	client  bool
+	writeMu sync.Mutex
 }
 
 // Upgrade performs the server handshake and hijacks the connection.
@@ -149,6 +150,8 @@ func (c *Conn) WriteText(payload []byte) error {
 }
 
 func (c *Conn) writeFrame(opcode byte, payload []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	var header []byte
 	header = append(header, 0x80|opcode) // FIN + opcode
 	n := len(payload)
@@ -234,6 +237,10 @@ func (c *Conn) readFrame() (byte, []byte, error) {
 			return 0, nil, err
 		}
 		length = binary.BigEndian.Uint64(ext[:])
+	}
+	if length > maxFrameSize {
+		_ = c.conn.Close()
+		return 0, nil, fmt.Errorf("websocket frame exceeds %d bytes", maxFrameSize)
 	}
 	var mask [4]byte
 	if masked {

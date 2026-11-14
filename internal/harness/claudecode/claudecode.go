@@ -665,45 +665,6 @@ func userEnvelope(text string) []byte {
 	return b
 }
 
-// OneShot runs a single headless turn in classic `claude -p` mode and returns the
-// parsed normalized events. Used by the `smoke` subcommand only; the real session
-// path is the persistent Start/Send above.
-func OneShot(ctx context.Context, bin, prompt string, skipPermissions bool) ([]eventbus.Event, error) {
-	if bin == "" {
-		bin = "claude"
-	}
-	args := []string{"-p", "--output-format", "stream-json", "--verbose"}
-	if skipPermissions {
-		args = append(args, "--dangerously-skip-permissions")
-	}
-	args = append(args, prompt)
-
-	cmd := exec.CommandContext(ctx, bin, args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("claudecode: start %s: %w", bin, err)
-	}
-	var out []eventbus.Event
-	dedup := &resultDeduper{}
-	sc := bufio.NewScanner(stdout)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		evs, _ := ParseLine(line, "smoke")
-		out = append(out, dedup.Apply(evs)...)
-	}
-	if err := cmd.Wait(); err != nil {
-		return out, fmt.Errorf("claudecode: claude exited: %w", err)
-	}
-	return out, nil
-}
-
 // ---- stream-json parsing (the mapping table, design 3.2 adapter A) ----
 
 // streamMsg is the subset of claude's stream-json line schema we consume.

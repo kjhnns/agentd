@@ -18,6 +18,7 @@ import (
 	"github.com/kjhnns/agentd/internal/media"
 	"github.com/kjhnns/agentd/internal/scheduler"
 	"github.com/kjhnns/agentd/internal/session"
+	"github.com/kjhnns/agentd/internal/wsutil"
 )
 
 // TransportChecker reports whether the inbound transport (e.g. the Telegram
@@ -517,7 +518,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request, id string)
 		http.Error(w, "session not found", http.StatusNotFound)
 		return
 	}
-	ws, err := wsUpgrade(w, r)
+	ws, err := wsutil.Upgrade(w, r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -529,6 +530,14 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request, id string)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	go func() {
+		defer cancel()
+		for {
+			if _, err := ws.ReadText(); err != nil {
+				return
+			}
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():

@@ -179,7 +179,7 @@ func (p *printer) command(ctx context.Context, c *Client, id, line string) (quit
 		p.line("started " + got + " (restart chat to stream its events)")
 		return false, got
 	case "/reset":
-		if _, err := c.do(ctx, "POST", "/sessions/"+id+"/reset", strings.NewReader(`{"reason":"explicit (cli)"}`), "application/json"); err != nil {
+		if err := c.Reset(ctx, id); err != nil {
 			p.line("error: " + err.Error())
 			return false, ""
 		}
