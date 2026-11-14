@@ -3,7 +3,7 @@
 // messages.
 //
 // MODEL: a Job is a declaratively configured unit (config [[job]]): a trigger
-// (schedule | file | webhook; inbound messages are already a trigger via
+// (schedule; inbound messages are already a trigger via
 // session.RouteInbound), a target WORKSPACE, and a task PROMPT. A job RUN is
 // nothing special: agentd creates-or-reuses the warm session in the target
 // workspace and Sends the prompt as an ordinary turn. The harness does the work
@@ -73,7 +73,7 @@ type Job struct {
 type JobRun struct {
 	JobID     string    `json:"job"`
 	RunID     string    `json:"run_id"`
-	Trigger   string    `json:"trigger"` // schedule | manual | webhook | file
+	Trigger   string    `json:"trigger"` // schedule | manual
 	SchedTime time.Time `json:"sched_time,omitempty"`
 	Start     time.Time `json:"start"`
 	End       time.Time `json:"end,omitempty"`
@@ -104,7 +104,6 @@ const (
 	defaultTick         = time.Second
 	defaultTurnTimeout  = 15 * time.Minute
 	defaultCatchupGrace = 5 * time.Minute
-	defaultFilePoll     = 10 * time.Second
 	historyCap          = 50
 	runQueueCap         = 16
 	resultTruncate      = 500
@@ -116,13 +115,12 @@ type fireReq struct {
 	schedTime time.Time
 }
 
-// Scheduler owns the clock loop, the run queue + worker, trigger watchers, the
+// Scheduler owns the clock loop, the run queue + worker, the
 // durable state log, and the in-memory run history ring.
 type Scheduler struct {
 	runner    Runner
 	state     *runlog.Log // durable scheduler state (job_fire/job_skip/job_run/job_notify)
 	statePath string
-	mirror    *runlog.Log // optional: mirror records into the main run-log
 
 	// Tunables (set before Start).
 	Tick         time.Duration // schedule check cadence (default 1s)
@@ -143,12 +141,11 @@ type Scheduler struct {
 }
 
 // New builds a Scheduler over the given jobs, replaying statePath (if it
-// exists) to restore last-fire times and run history. mirror may be nil.
-func New(jobs []*Job, runner Runner, statePath string, mirror *runlog.Log) (*Scheduler, error) {
+// exists) to restore last-fire times and run history.
+func New(jobs []*Job, runner Runner, statePath string) (*Scheduler, error) {
 	s := &Scheduler{
 		runner:    runner,
 		statePath: statePath,
-		mirror:    mirror,
 		jobs:      make(map[string]*Job),
 		lastFire:  make(map[string]time.Time),
 		history:   make(map[string][]JobRun),
@@ -220,9 +217,6 @@ func (s *Scheduler) appendState(typ string, payload any) {
 			log.Printf("scheduler: state append %s: %v", typ, err)
 		}
 	}
-	if s.mirror != nil {
-		_ = s.mirror.Append(typ, payload)
-	}
 }
 
 func (s *Scheduler) tick() time.Duration {
@@ -246,8 +240,8 @@ func (s *Scheduler) catchupGrace() time.Duration {
 	return defaultCatchupGrace
 }
 
-// Start launches the clock loop, the single run worker, and one watcher per
-// file-trigger job. It returns immediately; everything stops when ctx ends.
+// Start launches the clock loop and the single run worker.
+// It returns immediately; everything stops when ctx ends.
 func (s *Scheduler) Start(ctx context.Context) {
 	now := time.Now()
 	s.mu.Lock()
@@ -264,12 +258,6 @@ func (s *Scheduler) Start(ctx context.Context) {
 
 	go s.loop(ctx)
 	go s.worker(ctx)
-	for _, name := range s.order {
-		j := s.jobs[name]
-		if j.Enabled && j.Trigger.Kind == TriggerFile {
-			go s.watchLoop(ctx, j)
-		}
-	}
 }
 
 func (s *Scheduler) loop(ctx context.Context) {
@@ -442,7 +430,7 @@ func notifyText(j *Job, run JobRun) string {
 	}
 }
 
-// RunNow fires a job immediately (manual/webhook/file trigger path). It does
+// RunNow fires a job immediately (manual trigger path). It does
 // NOT advance the schedule position, so a manual run never shifts a schedule.
 // Returns whether the run was queued (false = recorded as skipped).
 func (s *Scheduler) RunNow(name, trigger string) (queued bool, reason string, err error) {
@@ -454,14 +442,6 @@ func (s *Scheduler) RunNow(name, trigger string) (queued bool, reason string, er
 	}
 	q, r := s.fireLocked(j, trigger, time.Time{})
 	return q, r, nil
-}
-
-// Get returns a job by name.
-func (s *Scheduler) Get(name string) (*Job, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	j, ok := s.jobs[name]
-	return j, ok
 }
 
 // List snapshots every job with its next fire time and last run.
@@ -568,21 +548,10 @@ func FromConfig(cfgJobs []config.Job) ([]*Job, error) {
 				return nil, fmt.Errorf("job %q: %w", cj.Name, err)
 			}
 			j.Trigger = Trigger{Kind: TriggerSchedule, Spec: cj.Schedule, Schedule: sched, TZ: cj.TZ}
-		case "file":
-			if cj.Path == "" {
-				return nil, fmt.Errorf("job %q: file trigger needs a path", cj.Name)
-			}
-			poll := cj.Poll
-			if poll <= 0 {
-				poll = defaultFilePoll
-			}
-			j.Trigger = Trigger{Kind: TriggerFile, Spec: cj.Path, Path: cj.Path, Poll: poll}
-		case "webhook":
-			j.Trigger = Trigger{Kind: TriggerWebhook}
 		case "message":
 			return nil, fmt.Errorf("job %q: message triggers are the inbound channel path (session.RouteInbound), not a job", cj.Name)
 		default:
-			return nil, fmt.Errorf("job %q: unknown trigger kind %q (want schedule|file|webhook)", cj.Name, cj.Trigger)
+			return nil, fmt.Errorf("job %q: unknown trigger kind %q (want schedule)", cj.Name, cj.Trigger)
 		}
 		if cj.Prompt == "" {
 			return nil, fmt.Errorf("job %q: prompt is required", cj.Name)

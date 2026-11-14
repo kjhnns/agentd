@@ -5,14 +5,14 @@ Durable learnings go to that wiki page (dated), never into this file.
 
 ## What this is
 Go daemon (module github.com/kjhnns/agentd) that wraps CLI coding harnesses
-(Claude Code today) behind Telegram, WhatsApp, a local web UI and an HTTP API.
+(Claude Code today) behind Telegram, an Apple Watch channel, a local web UI and an HTTP API.
 Deploy target: Joe's Mac, LaunchDaemon com.joe_pa.agentd, runtime home
 ~/.agentd/, listening on 127.0.0.1:8788. This checkout is source only.
 
 ## Layout
 cmd/agentd/           the agentd binary (serve, run, chat, smoke, memory, init-workspace)
 cmd/fueld/            the Fuel service: /fuel/* only, own config + state (deploy/fueld.service)
-internal/             config, eventbus, runlog, harness/claudecode, channel/{telegram,web,whatsapp},
+internal/             config, eventbus, runlog, harness/claudecode, channel/{telegram,web,watch},
                       session, scheduler, notify, media, api, cli, workspace,
                       fuel (used by cmd/fueld only; docs/specs/2026-10-fuel-api.md)
 config.example.toml   the only config committed; the real config.toml is gitignored

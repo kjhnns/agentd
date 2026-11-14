@@ -11,10 +11,6 @@
 //     restricted, standard cron OR semantics apply.
 //     TIMEZONE: a job may set tz = "Europe/Zurich" (IANA name); the default is
 //     the server's LOCAL timezone. "@every" is timezone-independent.
-//   - file: a path watcher. Fires when anything under the watched path changes
-//     (poll-based mtime/size/count signature; no fsnotify dependency).
-//   - webhook: an authenticated local API endpoint (POST /hooks/:job) fires the
-//     job. Gated by the same API bearer as the rest of the API.
 //   - message: NOT a job trigger. Inbound channel messages already drive turns
 //     via session.RouteInbound; they are listed here only to complete the
 //     taxonomy. Configuring trigger = "message" is rejected.
@@ -32,19 +28,15 @@ type TriggerKind string
 
 const (
 	TriggerSchedule TriggerKind = "schedule"
-	TriggerFile     TriggerKind = "file"
-	TriggerWebhook  TriggerKind = "webhook"
 )
 
 // Trigger is a parsed job trigger.
 type Trigger struct {
 	Kind TriggerKind
-	Spec string // the raw schedule spec (schedule) or watched path (file)
+	Spec string // the raw schedule spec
 
-	Schedule Schedule      // parsed schedule (Kind == schedule)
-	Path     string        // watched path (Kind == file)
-	Poll     time.Duration // file poll interval (Kind == file; default 10s)
-	TZ       string        // IANA tz name for display; empty = server local
+	Schedule Schedule // parsed schedule (Kind == schedule)
+	TZ       string   // IANA tz name for display; empty = server local
 }
 
 // String renders the trigger for lists/logs.
@@ -55,10 +47,6 @@ func (t Trigger) String() string {
 			return fmt.Sprintf("schedule %q tz=%s", t.Spec, t.TZ)
 		}
 		return fmt.Sprintf("schedule %q", t.Spec)
-	case TriggerFile:
-		return fmt.Sprintf("file %q poll=%s", t.Path, t.Poll)
-	case TriggerWebhook:
-		return "webhook (POST /hooks/:job)"
 	}
 	return string(t.Kind)
 }

@@ -85,8 +85,7 @@ func (a *Adapter) WithMedia(svc *media.Service) *Adapter {
 	return a
 }
 
-func (a *Adapter) Name() string        { return "telegram" }
-func (a *Adapter) SupportsMedia() bool { return false } // send-media stubbed for now
+func (a *Adapter) Name() string { return "telegram" }
 
 func (a *Adapter) Inbound() <-chan channel.InboundMsg { return a.inbound }
 
@@ -493,10 +492,6 @@ func (a *Adapter) downloadFile(ctx context.Context, fileID string) (io.ReadClose
 
 // Send posts text via the Bot API sendMessage and returns the message id.
 func (a *Adapter) Send(ctx context.Context, m channel.OutboundMsg) (channel.SendReceipt, error) {
-	if len(m.Media) > 0 {
-		// Media path is intentionally stubbed in this scaffold.
-		return channel.SendReceipt{}, fmt.Errorf("telegram: media send not implemented (stub)")
-	}
 	fields := map[string]any{
 		"chat_id": m.ChatID,
 		"text":    m.Text,

@@ -44,7 +44,6 @@ type Workspace struct {
 	Root          string // dir holding workspaces; default ~/.agentd/workspaces
 	Default       string // workspace name used when a session names none; default "default"
 	GitAutocommit bool   // commit workspace changes after each completed turn (default true)
-	Remote        string // optional git remote for MANUAL opt-in push; never pushed automatically
 }
 
 // Session is the [session] table: the SESSION LIFECYCLE + CONTEXT-RESET tuning.
@@ -72,9 +71,7 @@ type Channel struct {
 	Kind    string   // "telegram", "web", ...
 	Token   string   // literal, or "env:VAR" (resolve with ResolveToken)
 	Allow   []string // chat-id allowlist, server-enforced
-	Policy  string   // e.g. "dm-only"
 	Enabled bool     // default true; enabled=false parks the channel
-	Path    string   // web channel: UI route (default "/ui")
 	Title   string   // web / watch channel: UI title
 	// ShareSession (watch channel) routes wrist messages into the Telegram
 	// chat's session instead of a session of its own: one brain, two surfaces.
@@ -85,32 +82,6 @@ type Channel struct {
 	// Reactions toggles emoji progress feedback on the user's own inbound
 	// message (telegram: setMessageReaction 👀 -> ⚡ -> 👍 / 😱). Default true.
 	Reactions bool
-	// whatsapp channel: the adapter drives the already-paired wacli session
-	// rather than opening a second WhatsApp connection, so it needs the binary
-	// and (optionally) a non-default store dir instead of a token.
-	Bin   string        // path to the wacli binary (default "wacli" on PATH)
-	Store string        // wacli store dir (default: wacli's own, ~/.wacli)
-	Poll  time.Duration // inbound poll interval (default 20s)
-	// Sync makes the channel refresh wacli's local DB itself. Off by default:
-	// wacli holds an EXCLUSIVE store lock, so enabling this REQUIRES that
-	// nothing else runs `wacli sync` (clawd's monitor-whatsapp job does).
-	Sync bool
-	// whatsapp access model, ported from Camila's Baileys channel: DMs and
-	// groups get INDEPENDENT policies, each "open" | "allowlist" | "locked"
-	// (default allowlist). Allow is the DM list and doubles as the owner set.
-	PolicyDM    string
-	PolicyGroup string
-	// AllowGroups are group JIDs the agent may read AND answer in.
-	AllowGroups []string
-	// ReadonlyGroups are group JIDs the agent reads but never speaks in.
-	// Membership here alone is enough to deliver; if a group is in both lists,
-	// read-only wins.
-	ReadonlyGroups []string
-	// ReadReceipts sends blue ticks on delivered messages. Default true.
-	ReadReceipts bool
-	// StaleAfter is how old wacli's newest stored message may get before the
-	// channel reports itself deaf rather than merely quiet. Default 3h.
-	StaleAfter time.Duration
 }
 
 // Job is one [[job]] entry: a declaratively configured proactive job for the
@@ -118,16 +89,14 @@ type Channel struct {
 // task prompt; a job run is an ordinary harness turn on the workspace's warm
 // session.
 type Job struct {
-	Name      string        // unique job name (also its id in the API/CLI)
-	Enabled   bool          // default true; enabled = false parks the job
-	Trigger   string        // "schedule" (default) | "file" | "webhook"
-	Schedule  string        // schedule spec: "@every 30m" | "@daily 07:00" | "M H DOM MON DOW"
-	TZ        string        // IANA tz for @daily/cron (default: server local time)
-	Workspace string        // target workspace ("" = the default workspace)
-	Prompt    string        // the task told to the harness
-	Notify    string        // "issues" (default) | "always" | "never"
-	Path      string        // watched path (trigger = "file")
-	Poll      time.Duration // file poll interval (default 10s)
+	Name      string // unique job name (also its id in the API/CLI)
+	Enabled   bool   // default true; enabled = false parks the job
+	Trigger   string // "schedule" (default)
+	Schedule  string // schedule spec: "@every 30m" | "@daily 07:00" | "M H DOM MON DOW"
+	TZ        string // IANA tz for @daily/cron (default: server local time)
+	Workspace string // target workspace ("" = the default workspace)
+	Prompt    string // the task told to the harness
+	Notify    string // "issues" (default) | "always" | "never"
 }
 
 // Media is the [media] table: the CORE multimodal media capability
@@ -233,7 +202,7 @@ func Parse(data []byte) (*Config, error) {
 				section = "harness"
 			case "channel":
 				// enabled + reactions both default true
-				cfg.Channel = append(cfg.Channel, Channel{Enabled: true, Reactions: true, ReadReceipts: true})
+				cfg.Channel = append(cfg.Channel, Channel{Enabled: true, Reactions: true})
 				curChannel = &cfg.Channel[len(cfg.Channel)-1]
 				curHarness = nil
 				curJob = nil
@@ -311,8 +280,6 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 			cfg.Workspace.Root = s
 		case "default":
 			cfg.Workspace.Default = s
-		case "remote":
-			cfg.Workspace.Remote = s
 		default:
 			return fmt.Errorf("unknown [workspace] key %q", key)
 		}
@@ -485,48 +452,6 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 			}
 			ch.Allow = arr
 			return nil
-		case "sync":
-			b, err := asBool(raw)
-			if err != nil {
-				return fmt.Errorf("sync: %w", err)
-			}
-			ch.Sync = b
-			return nil
-		case "read_receipts":
-			b, err := asBool(raw)
-			if err != nil {
-				return fmt.Errorf("read_receipts: %w", err)
-			}
-			ch.ReadReceipts = b
-			return nil
-		case "allow_groups":
-			arr, err := asStringArray(raw)
-			if err != nil {
-				return err
-			}
-			ch.AllowGroups = arr
-			return nil
-		case "readonly_groups":
-			arr, err := asStringArray(raw)
-			if err != nil {
-				return err
-			}
-			ch.ReadonlyGroups = arr
-			return nil
-		case "stale_after":
-			d, err := asDuration(raw)
-			if err != nil {
-				return fmt.Errorf("stale_after: %w", err)
-			}
-			ch.StaleAfter = d
-			return nil
-		case "poll":
-			d, err := asDuration(raw)
-			if err != nil {
-				return fmt.Errorf("poll: %w", err)
-			}
-			ch.Poll = d
-			return nil
 		}
 		s, err := asString(raw)
 		if err != nil {
@@ -534,23 +459,16 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 		}
 		switch key {
 		case "kind":
-			ch.Kind = s
+			switch s {
+			case "telegram", "web", "watch":
+				ch.Kind = s
+			default:
+				return fmt.Errorf("unknown channel kind %q (want telegram, web or watch)", s)
+			}
 		case "token":
 			ch.Token = s
-		case "policy":
-			ch.Policy = s
-		case "path":
-			ch.Path = s
 		case "title":
 			ch.Title = s
-		case "bin":
-			ch.Bin = s
-		case "store":
-			ch.Store = s
-		case "policy_dm":
-			ch.PolicyDM = s
-		case "policy_group":
-			ch.PolicyGroup = s
 		default:
 			return fmt.Errorf("unknown [[channel]] key %q", key)
 		}
@@ -562,13 +480,6 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 				return fmt.Errorf("enabled: %w", err)
 			}
 			j.Enabled = b
-			return nil
-		case "poll":
-			d, err := asDuration(raw)
-			if err != nil {
-				return fmt.Errorf("poll: %w", err)
-			}
-			j.Poll = d
 			return nil
 		}
 		s, err := asString(raw)
@@ -590,8 +501,6 @@ func assign(cfg *Config, section string, h *Harness, ch *Channel, j *Job, key, r
 			j.Prompt = s
 		case "notify":
 			j.Notify = s
-		case "path":
-			j.Path = s
 		default:
 			return fmt.Errorf("unknown [[job]] key %q", key)
 		}

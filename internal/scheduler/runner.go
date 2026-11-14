@@ -9,14 +9,12 @@ import (
 	"context"
 	"errors"
 
-	"github.com/kjhnns/agentd/internal/eventbus"
 	"github.com/kjhnns/agentd/internal/session"
 )
 
 // ManagerRunner is the production Runner over the Session Manager.
 type ManagerRunner struct {
 	Mgr   *session.Manager
-	Bus   *eventbus.Bus
 	Model string // default model for job-created sessions
 }
 

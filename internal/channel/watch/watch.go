@@ -126,15 +126,11 @@ func (a *Adapter) WithTitle(t string) *Adapter {
 // Store exposes the conversation store (tests, health).
 func (a *Adapter) Store() *Store { return a.store }
 
-// UserID is the session key the channel routes under (exported for wiring).
-func (a *Adapter) UserID() string { return a.userID }
-
 // ---- channel.Adapter ----
 
 func (a *Adapter) Name() string                       { return "watch" }
 func (a *Adapter) Start(ctx context.Context) error    { return nil }
 func (a *Adapter) Inbound() <-chan channel.InboundMsg { return a.inbound }
-func (a *Adapter) SupportsMedia() bool                { return false }
 
 // Send stores the turn's reply (or its failure notice) as an agent message
 // attributed to the user message that started the turn (OutboundMsg.InReplyTo).
@@ -1050,12 +1046,3 @@ func joinText(a, b string) string {
 
 var _ channel.Adapter = (*Adapter)(nil)
 var _ notify.Sink = (*Adapter)(nil)
-
-// String renders a message for logs (never the whole text).
-func (m Message) String() string {
-	t := m.Text
-	if len(t) > 40 {
-		t = t[:40] + "…"
-	}
-	return fmt.Sprintf("%s/%s#%d %q %s", m.Role, m.Kind, m.Seq, t, m.Status)
-}

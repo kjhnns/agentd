@@ -5,7 +5,7 @@
 //
 // It is the REFERENCE ChannelAdapter and the foundation the future wrist/phone
 // app is a client of: it implements the exact same channel.Adapter contract as
-// Telegram (Name/Start/Inbound/Send/SupportsMedia/Ack) AND the notify.Sink
+// Telegram (Name/Start/Inbound/Send/Ack) AND the notify.Sink
 // capability, so the core treats it uniformly. A message typed in the UI is
 // posted over the WS, emitted as an ordinary channel.InboundMsg, and driven
 // through the SAME session.RouteInbound path as a Telegram message would be
@@ -77,12 +77,8 @@ func New(bus *eventbus.Bus, title string) *Adapter {
 // ---- channel.Adapter ----
 
 func (a *Adapter) Name() string                             { return "web" }
-func (a *Adapter) SupportsMedia() bool                      { return false }
 func (a *Adapter) Inbound() <-chan channel.InboundMsg       { return a.inbound }
 func (a *Adapter) Ack(chatID, msgID, reaction string) error { return nil }
-
-// UserID is the session key the web channel routes under (exported for wiring).
-func (a *Adapter) UserID() string { return webUserID }
 
 // Start begins forwarding every bus event to connected clients. It returns
 // immediately; the forwarder stops when ctx is done. There is no long-poll or
@@ -211,42 +207,6 @@ func (a *Adapter) WSHandler() http.HandlerFunc {
 				}
 			}
 		}
-	}
-}
-
-// ConfirmHandler handles POST /confirm/:token from the UI's Approve/Deny
-// buttons. NOTE (stub): agentd does not yet EMIT confirm-gate tokens from the
-// harness (no needs_input event carries a token today), so this endpoint records
-// the decision and echoes it back to the UI as a notification, but there is no
-// pending gate to resolve yet. It is wired end to end on the UI+HTTP side so that
-// when the confirm-gate plumbing lands, only the resolution target changes.
-func (a *Adapter) ConfirmHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		token := strings.TrimPrefix(r.URL.Path, "/confirm/")
-		if token == "" {
-			http.Error(w, "missing token", http.StatusBadRequest)
-			return
-		}
-		var body struct {
-			Approve bool `json:"approve"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		decision := "denied"
-		if body.Approve {
-			decision = "approved"
-		}
-		a.Notify(notify.Notification{
-			Source: "confirm",
-			Level:  notify.LevelInfo,
-			Text:   "confirm " + token + " " + decision + " (no live gate to resolve yet: stub)",
-		})
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "recorded", "token": token, "approve": body.Approve})
 	}
 }
 

@@ -36,7 +36,6 @@ import (
 	"github.com/kjhnns/agentd/internal/channel/telegram"
 	"github.com/kjhnns/agentd/internal/channel/watch"
 	"github.com/kjhnns/agentd/internal/channel/web"
-	"github.com/kjhnns/agentd/internal/channel/whatsapp"
 	"github.com/kjhnns/agentd/internal/cli"
 	"github.com/kjhnns/agentd/internal/config"
 	"github.com/kjhnns/agentd/internal/eventbus"
@@ -569,13 +568,13 @@ func serve(args []string) {
 	// Scheduler: declarative [[job]] blocks become proactive triggered sessions
 	// (a job run = one ordinary turn on the target workspace's warm session).
 	// Durable state (last fires + run history) lives in scheduler.jsonl next to
-	// the run-log; records are mirrored into the main run-log too.
+	// the run-log.
 	jobDefs, err := scheduler.FromConfig(cfg.Job)
 	if err != nil {
 		log.Fatalf("jobs config: %v", err)
 	}
-	runner := &scheduler.ManagerRunner{Mgr: mgr, Bus: bus, Model: model}
-	sched, err := scheduler.New(jobDefs, runner, filepath.Join(cfg.Server.StateDir, "scheduler.jsonl"), rl)
+	runner := &scheduler.ManagerRunner{Mgr: mgr, Model: model}
+	sched, err := scheduler.New(jobDefs, runner, filepath.Join(cfg.Server.StateDir, "scheduler.jsonl"))
 	if err != nil {
 		log.Fatalf("scheduler: %v", err)
 	}
@@ -653,70 +652,7 @@ func serve(args []string) {
 			hub.Register(tg) // Telegram is a notify sink too (uniform hub)
 			log.Printf("agentd: telegram channel started (allow=%v, reactions=%v)", c.Allow, c.Reactions)
 
-			go func(ch *telegram.Adapter) {
-				for in := range ch.Inbound() {
-					in := in
-					go func() {
-						if err := mgr.RouteInbound(ctx, ch, in, sessionForChat, cwd, model); err != nil {
-							log.Printf("agentd: route inbound error: %v", err)
-						}
-					}()
-				}
-			}(tg)
-
-		case "whatsapp":
-			// Drives the ALREADY-PAIRED wacli session; no QR, no second
-			// WhatsApp connection. See internal/channel/whatsapp for why.
-			pdm, err := whatsapp.ParsePolicy(c.PolicyDM)
-			if err != nil {
-				log.Printf("agentd: whatsapp channel: %v; channel NOT started", err)
-				continue
-			}
-			pgrp, err := whatsapp.ParsePolicy(c.PolicyGroup)
-			if err != nil {
-				log.Printf("agentd: whatsapp channel: %v; channel NOT started", err)
-				continue
-			}
-			waCh := whatsapp.New(c.Bin, c.Allow).
-				WithReactions(c.Reactions).
-				WithReadReceipts(c.ReadReceipts).
-				WithStore(c.Store).
-				WithPoll(c.Poll).
-				WithOwnSync(c.Sync).
-				WithPolicies(pdm, pgrp).
-				WithAllowGroups(c.AllowGroups).
-				WithReadonlyGroups(c.ReadonlyGroups).
-				WithStaleAfter(c.StaleAfter)
-			// A channel that has gone deaf must be visible, not silently quiet.
-			waCh.WithOnUnhealthy(func(h whatsapp.Health) {
-				hub.Dispatch(notify.Notification{
-					Level:  notify.LevelIssue,
-					Source: "whatsapp",
-					Text:   "WhatsApp channel unhealthy: " + h.Reason,
-				})
-			})
-			if mediaSvc != nil {
-				waCh.WithMedia(mediaSvc)
-			}
-			if err := waCh.Start(ctx); err != nil {
-				log.Printf("agentd: whatsapp start failed: %v", err)
-				continue
-			}
-			transportUp.Store(true)
-			log.Printf("agentd: whatsapp channel started (allow=%v, groups=%v, readonly=%v, dm=%s, group=%s, reactions=%v, receipts=%v, sync=%v)",
-				c.Allow, c.AllowGroups, c.ReadonlyGroups, pdm, pgrp, c.Reactions, c.ReadReceipts, c.Sync)
-
-			sessionForWA := session.NewChatMap(session.LaneMain)
-			go func(ch *whatsapp.Adapter) {
-				for in := range ch.Inbound() {
-					in := in
-					go func() {
-						if err := mgr.RouteInbound(ctx, ch, in, sessionForWA, cwd, model); err != nil {
-							log.Printf("agentd: whatsapp route inbound error: %v", err)
-						}
-					}()
-				}
-			}(waCh)
+			go consumeInbound(ctx, tg, mgr, sessionForChat, cwd, model, "agentd: route inbound error: %v")
 
 		case "web":
 			webCh := web.New(bus, c.Title)
@@ -724,10 +660,9 @@ func serve(args []string) {
 				log.Printf("agentd: web start failed: %v", err)
 				continue
 			}
-			// Serve the UI + WS + confirm on the shared server (bearer-gated).
+			// Serve the UI + WS on the shared server (bearer-gated).
 			srv.Mount("/ui", webCh.UIHandler())
 			srv.Mount("/ws", webCh.WSHandler())
-			srv.Mount("/confirm/", webCh.ConfirmHandler())
 			srv.Mount("/", webCh.RootHandler())
 			hub.Register(webCh) // web is a notify sink: notifications push over its WS
 			transportUp.Store(true)
@@ -736,22 +671,13 @@ func serve(args []string) {
 			// Inbound: a message typed in the UI routes through the SAME
 			// RouteInbound path as any channel (one warm web session).
 			sessionForWeb := session.NewChatMap(session.LaneMain)
-			go func(ch *web.Adapter) {
-				for in := range ch.Inbound() {
-					in := in
-					go func() {
-						if err := mgr.RouteInbound(ctx, ch, in, sessionForWeb, cwd, model); err != nil {
-							log.Printf("agentd: web route inbound error: %v", err)
-						}
-					}()
-				}
-			}(webCh)
+			go consumeInbound(ctx, webCh, mgr, sessionForWeb, cwd, model, "agentd: web route inbound error: %v")
 
 		case "watch":
 			watchCfgs = append(watchCfgs, c)
 
 		default:
-			log.Printf("agentd: unknown channel kind %q; skipped", c.Kind)
+			log.Fatalf("agentd: unknown channel kind %q", c.Kind)
 		}
 	}
 
@@ -889,6 +815,18 @@ func serve(args []string) {
 	_ = httpSrv.Shutdown(shutdownCtx)
 	if pubSrv != nil {
 		_ = pubSrv.Shutdown(shutdownCtx)
+	}
+}
+
+// consumeInbound routes each message in its own goroutine.
+func consumeInbound(ctx context.Context, ch channel.Adapter, mgr *session.Manager, chats *session.ChatMap, cwd, model, errorFormat string) {
+	for in := range ch.Inbound() {
+		in := in
+		go func() {
+			if err := mgr.RouteInbound(ctx, ch, in, chats, cwd, model); err != nil {
+				log.Printf(errorFormat, err)
+			}
+		}()
 	}
 }
 

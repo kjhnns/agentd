@@ -126,13 +126,13 @@ func TestSchedulerNotifyReachesWebSink(t *testing.T) {
 	fr := &fakeRunner{result: "all clean", failOn: "broken"}
 
 	clean := &scheduler.Job{Name: "clean", Enabled: true, Prompt: "p",
-		Notify: scheduler.NotifyIssues, Trigger: scheduler.Trigger{Kind: scheduler.TriggerWebhook}}
+		Notify: scheduler.NotifyIssues, Trigger: scheduler.Trigger{Kind: scheduler.TriggerSchedule}}
 	always := &scheduler.Job{Name: "always", Enabled: true, Prompt: "p",
-		Notify: scheduler.NotifyAlways, Trigger: scheduler.Trigger{Kind: scheduler.TriggerWebhook}}
+		Notify: scheduler.NotifyAlways, Trigger: scheduler.Trigger{Kind: scheduler.TriggerSchedule}}
 	broken := &scheduler.Job{Name: "broken", Enabled: true, Prompt: "p",
-		Notify: scheduler.NotifyIssues, Trigger: scheduler.Trigger{Kind: scheduler.TriggerWebhook}}
+		Notify: scheduler.NotifyIssues, Trigger: scheduler.Trigger{Kind: scheduler.TriggerSchedule}}
 
-	sched, err := scheduler.New([]*scheduler.Job{clean, always, broken}, fr, statePath, nil)
+	sched, err := scheduler.New([]*scheduler.Job{clean, always, broken}, fr, statePath)
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)
 	}

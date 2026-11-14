@@ -138,7 +138,6 @@ type recordingChannel struct {
 func (c *recordingChannel) Name() string                       { return "watch" }
 func (c *recordingChannel) Start(context.Context) error        { return nil }
 func (c *recordingChannel) Inbound() <-chan channel.InboundMsg { return nil }
-func (c *recordingChannel) SupportsMedia() bool                { return false }
 func (c *recordingChannel) Ack(chatID, msgID, reaction string) error {
 	c.mu.Lock()
 	c.acks = append(c.acks, reaction)

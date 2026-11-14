@@ -14,7 +14,6 @@ state_dir  = "state"             # run-log + durable state live here
 root    = ""                     # dir holding workspaces; empty = ~/.agentd/workspaces
 default = ""                     # workspace when a session names none; empty = "default"
 git_autocommit = true            # commit workspace changes after each completed turn
-# remote = ""                    # optional git remote for MANUAL opt-in push; agentd never auto-pushes
 
 # Session lifecycle + context reset. agentd keeps ONE warm session per workspace
 # and never compacts; instead it owns a controlled RESET (checkpoint-flush ->
@@ -105,7 +104,6 @@ kind    = "telegram"
 enabled = true                   # default true; set false to park the channel
 token   = "env:TG_BOT_TOKEN"     # export TG_BOT_TOKEN before starting
 allow   = ["123456789"]         # chat-id allowlist, server-enforced
-policy  = "dm-only"
 # Emoji progress feedback on YOUR OWN message, so a turn is legible at a glance:
 #   👀 received (server has it)  ->  ⚡ working (a session picked it up)
 #   ->  👍 done (reply sent)  |  😱 error (turn failed/timed out)  |  🤔 waiting on you
@@ -115,72 +113,11 @@ policy  = "dm-only"
 # never fatal to the turn. Default true; set false for no reactions at all.
 reactions = true
 
-# The WHATSAPP channel. It does NOT open its own WhatsApp connection and needs
-# NO QR pairing: it drives the already-paired `wacli` session (whatsmeow, store
-# at ~/.wacli). A second whatsmeow client on the same device credentials is a
-# TAKEOVER, not a second reader (WhatsApp answers connectionReplaced/440 and the
-# two clients knock each other offline), so reusing the one session is the only
-# safe option. There is no token: auth IS the existing wacli store.
-#
-# LOCK CONSTRAINT: wacli guards that session with an EXCLUSIVE store lock, so
-# only one wacli invocation runs at a time. That is why inbound is a cursor poll
-# of wacli's local DB (a lock-free READ) and not `wacli sync --follow`, which
-# would hold the lock and the connection forever and starve outbound sends.
-[[channel]]
-kind      = "whatsapp"
-enabled   = false                              # opt in deliberately: wide-open inbound surface
-bin       = "wacli"                            # 0.11.1+ required; pin an absolute path if PATH may hold an older copy
-# store   = "~/.wacli"                         # omit to use wacli's own default store dir
-
-# ACCESS. `allow` is the DM allowlist AND the owner set: only these peers can
-# make the agent act. LIST BOTH JID FORMS FOR EACH PERSON. A real @lid JID has
-# DIFFERENT DIGITS from the phone JID, so listing the phone number does NOT
-# cover the @lid, and WhatsApp routes some replies over @lid. Missing it means
-# your own replies are silently dropped. Find yours with:
-#   sqlite3 ~/.wacli/session.db 'select * from whatsmeow_lid_map'
-# The channel logs a startup WARNING for any entry with no @lid counterpart.
-# Two entries, ONE person: the phone JID and that same person's @lid, whose
-# digits are unrelated to the phone number. (Arrays must stay on one line: the
-# config parser is line-based.)
-allow     = [ "41791234567@s.whatsapp.net", "188884444777@lid" ]
-
-# DM and group policies are INDEPENDENT: open | allowlist | locked.
-# Locking groups does not close DMs, and vice versa.
-policy_dm    = "allowlist"
-policy_group = "allowlist"
-# Groups the agent may read AND answer in.
-allow_groups    = []
-# Groups the agent reads but NEVER speaks in. Membership here alone is enough
-# to deliver; if a group is in both lists, read-only wins.
-readonly_groups = []
-
-poll      = "20s"                              # inbound poll interval
-# sync=true makes this channel refresh wacli's local DB itself, which cuts
-# inbound latency to the poll interval. Only enable it when NOTHING ELSE runs
-# `wacli sync` on the same store: wacli takes an EXCLUSIVE store lock, so two
-# syncers fight over it and both lose. If some other job (a cron or launchd
-# `wacli sync --once`) already keeps the store fresh, leave this false and
-# inbound latency is bounded by that job's cadence instead. See the README
-# section "Operational note: the wacli store lock".
-sync      = false
-# Blue ticks on delivered messages (wacli chats mark-read, the equivalent of
-# Baileys readMessages). Suppressed in read-only chats and for group bystanders.
-read_receipts = true
-# How old wacli's newest stored message may get before the channel reports
-# itself DEAF rather than merely quiet. Whatever refreshes the store can die,
-# and a dead syncer looks exactly like a quiet chat unless something checks.
-stale_after = "3h"
-# Emoji progress feedback, same lifecycle chain as Telegram. WhatsApp allows one
-# reaction per message per sender and a new one REPLACES the previous, so the
-# chain reads as one changing marker. Unlike Telegram there is no fixed emoji
-# whitelist, so all five glyphs go through natively.
-reactions = true
-
 # The WEB channel: a self-contained local UI served by the SAME server (no 2nd
 # port) at /ui, and the reference ChannelAdapter the future wrist/phone app is a
 # client of. It shows the session list (status + context pressure), a live event
 # stream + input box for the active session, a notifications feed (scheduler job
-# notifications surface HERE via the notify hub), and confirm buttons. It is a
+# notifications surface HERE via the notify hub). It is a
 # notify sink too. AUTH: it reuses the api_bearer. In a browser, open
 # http://127.0.0.1:8787/ui?token=<api_bearer> ONCE; that sets a same-origin
 # httponly cookie which then authenticates the page, its JSON calls, and the WS.
@@ -189,7 +126,6 @@ reactions = true
 kind    = "web"
 enabled = true
 title   = "agentd"               # shown in the UI header/title
-path    = "/ui"                  # UI route (informational; the app is served at /ui)
 
 # Watch (wrist) channel: the async inbox/outbox behind the Apple Watch app.
 # POST /watch/messages (JSON text or a multipart voice file, transcribed on the
@@ -220,7 +156,7 @@ mirror        = true
 # any in-progress interactive turn in the same workspace; v1 additionally runs
 # at most ONE job turn at a time overall.
 #
-# Trigger kinds: "schedule" (default) | "file" | "webhook". Inbound messages
+# Jobs use the "schedule" trigger (default). Inbound messages
 # are already a trigger via the channel path and are NOT configured as jobs.
 # Schedule specs: "@every 30m" | "@daily 07:00" | basic cron "M H DOM MON DOW".
 # tz is an IANA name for @daily/cron; default is the server's local timezone.
@@ -244,15 +180,3 @@ schedule  = "@every 1h"          # trigger defaults to "schedule"
 prompt    = "Append the current date and time as one line to work/heartbeat.log, then note in context.md when the last heartbeat ran."
 notify    = "never"
 enabled   = false                # parked; fire manually with `agentd jobs run hourly-heartbeat`
-
-# [[job]]
-# name    = "inbox-drop"          # fire when files under a watched path change
-# trigger = "file"
-# path    = "/Users/me/Drop"
-# poll    = "10s"                  # poll interval (mtime/size/count signature)
-# prompt  = "A new file landed in the watched drop folder. Inspect it and file the result under work/."
-
-# [[job]]
-# name    = "deploy-check"        # fire via: POST /hooks/deploy-check (API bearer)
-# trigger = "webhook"
-# prompt  = "A deploy just finished. Verify the service health endpoints and summarize."

@@ -52,9 +52,8 @@ const (
 
 // OutboundMsg is a normalized outbound message.
 type OutboundMsg struct {
-	ChatID string   `json:"chat_id"`
-	Text   string   `json:"text"`
-	Media  []string `json:"media"`
+	ChatID string `json:"chat_id"`
+	Text   string `json:"text"`
 	// Silent asks the channel to deliver without alerting the user. It is set
 	// on the long half of a split reply so the wrist buzzes ONCE, for the
 	// summary that actually fits a notification. A channel that cannot do this
@@ -91,7 +90,6 @@ type Adapter interface {
 	Inbound() <-chan InboundMsg
 	// Send delivers an outbound message and returns a real id (evidence).
 	Send(ctx context.Context, m OutboundMsg) (SendReceipt, error)
-	SupportsMedia() bool
 	// Ack is optional read/typing/react feedback on an INBOUND message; a no-op
 	// is a valid implementation. It must never block or fail the caller's turn:
 	// implementations are best-effort and log their own failures.

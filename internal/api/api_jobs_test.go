@@ -25,10 +25,15 @@ func jobsServer(t *testing.T) *Server {
 	mgr := session.NewManager(nil, bus, nil)
 	s := New("tok", mgr, bus, func() bool { return true })
 
+	schedule, err := scheduler.ParseSchedule("@every 24h", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	hook := &scheduler.Job{Name: "deploy-hook", Enabled: true, Prompt: "verify deploy",
-		Trigger: scheduler.Trigger{Kind: scheduler.TriggerWebhook}}
+		Trigger: scheduler.Trigger{Kind: scheduler.TriggerSchedule, Spec: "@every 24h", Schedule: schedule}}
 	sched, err := scheduler.New([]*scheduler.Job{hook}, noopRunner{},
-		filepath.Join(t.TempDir(), "sched.jsonl"), nil)
+		filepath.Join(t.TempDir(), "sched.jsonl"))
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)
 	}
@@ -80,30 +85,5 @@ func TestJobsAPI(t *testing.T) {
 	}
 	if rec := doReq(s, http.MethodGet, "/jobs/deploy-hook/runs", "tok"); rec.Code != http.StatusOK {
 		t.Fatalf("GET /jobs/deploy-hook/runs = %d", rec.Code)
-	}
-}
-
-// TestWebhookTrigger: POST /hooks/:job fires a webhook-trigger job (bearer
-// gated); unknown jobs 404.
-func TestWebhookTrigger(t *testing.T) {
-	s := jobsServer(t)
-
-	if rec := doReq(s, http.MethodPost, "/hooks/deploy-hook", ""); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("hook without bearer = %d, want 401", rec.Code)
-	}
-	rec := doReq(s, http.MethodPost, "/hooks/deploy-hook", "tok")
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("POST /hooks/deploy-hook = %d: %s", rec.Code, rec.Body)
-	}
-	var body map[string]string
-	_ = json.Unmarshal(rec.Body.Bytes(), &body)
-	if body["status"] != "queued" {
-		t.Fatalf("hook response = %v", body)
-	}
-	if rec := doReq(s, http.MethodPost, "/hooks/nope", "tok"); rec.Code != http.StatusNotFound {
-		t.Fatalf("POST /hooks/nope = %d, want 404", rec.Code)
-	}
-	if rec := doReq(s, http.MethodGet, "/hooks/deploy-hook", "tok"); rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("GET /hooks/deploy-hook = %d, want 405", rec.Code)
 	}
 }

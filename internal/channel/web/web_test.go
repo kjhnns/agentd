@@ -92,7 +92,6 @@ func newStackWith(t *testing.T, ha harness.Adapter) (*httptest.Server, *web.Adap
 	srv := api.New("tok", mgr, bus, func() bool { return true })
 	srv.Mount("/ui", webCh.UIHandler())
 	srv.Mount("/ws", webCh.WSHandler())
-	srv.Mount("/confirm/", webCh.ConfirmHandler())
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 
@@ -420,11 +419,16 @@ func TestEndToEndSchedulerNotifyToWebClient(t *testing.T) {
 	mgr := session.NewManager(nil, bus, nil) // no sessions created in this path
 	hub := notify.NewHub()
 
-	// A notify=always webhook job so a clean run still surfaces.
+	schedule, err := scheduler.ParseSchedule("@every 24h", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A notify=always schedule job so a clean run still surfaces.
 	job := &scheduler.Job{Name: "demo", Enabled: true, Prompt: "p",
-		Notify: scheduler.NotifyAlways, Trigger: scheduler.Trigger{Kind: scheduler.TriggerWebhook}}
+		Notify: scheduler.NotifyAlways, Trigger: scheduler.Trigger{Kind: scheduler.TriggerSchedule, Spec: "@every 24h", Schedule: schedule}}
 	statePath := t.TempDir() + "/sched.jsonl"
-	sched, err := scheduler.New([]*scheduler.Job{job}, demoRunner{result: "workspace is healthy"}, statePath, nil)
+	sched, err := scheduler.New([]*scheduler.Job{job}, demoRunner{result: "workspace is healthy"}, statePath)
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)
 	}

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kjhnns/agentd/internal/config"
 	"github.com/kjhnns/agentd/internal/eventbus"
 	"github.com/kjhnns/agentd/internal/harness"
 	"github.com/kjhnns/agentd/internal/session"
@@ -73,7 +74,7 @@ func TestScheduleFiresProducesJobRun(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "sched.jsonl")
 	fr := &fakeRunner{result: "heartbeat appended"}
 	job := everyJob(t, "beat", "@every 100ms")
-	s, err := New([]*Job{job}, fr, statePath, nil)
+	s, err := New([]*Job{job}, fr, statePath)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -123,7 +124,7 @@ func TestDurabilityRestartNoDoubleFire(t *testing.T) {
 			Trigger: Trigger{Kind: TriggerSchedule, Spec: "@daily 07:00", Schedule: sched}}
 	}
 
-	s1, err := New([]*Job{mkJob()}, fr, statePath, nil)
+	s1, err := New([]*Job{mkJob()}, fr, statePath)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -142,7 +143,7 @@ func TestDurabilityRestartNoDoubleFire(t *testing.T) {
 	}
 
 	// RESTART: fresh scheduler over the same state file.
-	s2, err := New([]*Job{mkJob()}, fr, statePath, nil)
+	s2, err := New([]*Job{mkJob()}, fr, statePath)
 	if err != nil {
 		t.Fatalf("New (restart): %v", err)
 	}
@@ -178,7 +179,7 @@ func TestMissedOccurrencesSkippedWithLog(t *testing.T) {
 	job := &Job{Name: "triage", Enabled: true, Prompt: "triage",
 		Trigger: Trigger{Kind: TriggerSchedule, Spec: "@daily 07:00", Schedule: sched}}
 
-	s, err := New([]*Job{job}, fr, statePath, nil)
+	s, err := New([]*Job{job}, fr, statePath)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -199,7 +200,7 @@ func TestMissedOccurrencesSkippedWithLog(t *testing.T) {
 	s.Close()
 
 	// Restart: the skip record must have advanced the durable position too.
-	s2, err := New([]*Job{job}, fr, statePath, nil)
+	s2, err := New([]*Job{job}, fr, statePath)
 	if err != nil {
 		t.Fatalf("New (restart): %v", err)
 	}
@@ -221,11 +222,11 @@ func TestNotifyPolicyIssuesOnly(t *testing.T) {
 		}
 		return nil
 	}}
-	clean := &Job{Name: "clean", Enabled: true, Prompt: "p", Notify: NotifyIssues, Trigger: Trigger{Kind: TriggerWebhook}}
-	broken := &Job{Name: "broken", Enabled: true, Prompt: "p", Notify: NotifyIssues, Trigger: Trigger{Kind: TriggerWebhook}}
-	chatty := &Job{Name: "chatty", Enabled: true, Prompt: "p", Notify: NotifyAlways, Trigger: Trigger{Kind: TriggerWebhook}}
+	clean := &Job{Name: "clean", Enabled: true, Prompt: "p", Notify: NotifyIssues, Trigger: Trigger{Kind: TriggerSchedule, Spec: "@every 24h", Schedule: everySchedule{24 * time.Hour}}}
+	broken := &Job{Name: "broken", Enabled: true, Prompt: "p", Notify: NotifyIssues, Trigger: Trigger{Kind: TriggerSchedule, Spec: "@every 24h", Schedule: everySchedule{24 * time.Hour}}}
+	chatty := &Job{Name: "chatty", Enabled: true, Prompt: "p", Notify: NotifyAlways, Trigger: Trigger{Kind: TriggerSchedule, Spec: "@every 24h", Schedule: everySchedule{24 * time.Hour}}}
 
-	s, err := New([]*Job{clean, broken, chatty}, fr, statePath, nil)
+	s, err := New([]*Job{clean, broken, chatty}, fr, statePath)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -293,8 +294,8 @@ func TestOverlapSkip(t *testing.T) {
 		<-release
 		return nil
 	}}
-	job := &Job{Name: "slow", Enabled: true, Prompt: "p", Trigger: Trigger{Kind: TriggerWebhook}}
-	s, err := New([]*Job{job}, fr, statePath, nil)
+	job := &Job{Name: "slow", Enabled: true, Prompt: "p", Trigger: Trigger{Kind: TriggerSchedule, Spec: "@every 24h", Schedule: everySchedule{24 * time.Hour}}}
+	s, err := New([]*Job{job}, fr, statePath)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -332,41 +333,6 @@ func TestOverlapSkip(t *testing.T) {
 		}
 		return false
 	}, "first run finished ok")
-}
-
-// TestFileWatchTriggerFires: a file-trigger job fires when content under the
-// watched path changes (poll-based signature watcher).
-func TestFileWatchTriggerFires(t *testing.T) {
-	watched := t.TempDir()
-	statePath := filepath.Join(t.TempDir(), "sched.jsonl")
-	fr := &fakeRunner{result: "handled the drop"}
-	job := &Job{Name: "inbox", Enabled: true, Prompt: "process new files", Notify: NotifyNever,
-		Trigger: Trigger{Kind: TriggerFile, Spec: watched, Path: watched, Poll: 20 * time.Millisecond}}
-	s, err := New([]*Job{job}, fr, statePath, nil)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer s.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	s.Start(ctx)
-
-	time.Sleep(60 * time.Millisecond) // let the baseline scan land
-	if fr.callCount() != 0 {
-		t.Fatal("watcher fired on pre-existing state (baseline must not fire)")
-	}
-	if err := os.WriteFile(filepath.Join(watched, "drop.txt"), []byte("hello"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, 3*time.Second, func() bool {
-		runs, _ := s.Runs("inbox", 3)
-		for _, r := range runs {
-			if r.Trigger == "file" && r.Status == "ok" {
-				return true
-			}
-		}
-		return false
-	}, "a file-triggered ok run")
 }
 
 // ---- serialization against a REAL session.Manager ----
@@ -465,9 +431,9 @@ func TestJobSerializesBehindInteractiveTurn(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "sched.jsonl")
 	job := &Job{Name: "triage", Enabled: true, Workspace: "default",
 		Prompt: "JOB: run the triage checklist", Notify: NotifyNever,
-		Trigger: Trigger{Kind: TriggerWebhook}}
-	runner := &ManagerRunner{Mgr: mgr, Bus: bus}
-	s, err := New([]*Job{job}, runner, statePath, nil)
+		Trigger: Trigger{Kind: TriggerSchedule, Spec: "@every 24h", Schedule: everySchedule{24 * time.Hour}}}
+	runner := &ManagerRunner{Mgr: mgr}
+	s, err := New([]*Job{job}, runner, statePath)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -504,5 +470,16 @@ func TestJobSerializesBehindInteractiveTurn(t *testing.T) {
 	// workspace), it did not spawn a parallel one.
 	if n := len(mgr.List()); n != 1 {
 		t.Fatalf("job spawned a parallel session (%d sessions)", n)
+	}
+}
+
+func TestFromConfigRejectsRemovedTriggers(t *testing.T) {
+	for _, trigger := range []string{"file", "webhook"} {
+		for _, enabled := range []bool{true, false} {
+			_, err := FromConfig([]config.Job{{Name: "removed", Trigger: trigger, Enabled: enabled, Prompt: "run"}})
+			if err == nil || !strings.Contains(err.Error(), "unknown trigger kind \""+trigger+"\" (want schedule)") {
+				t.Errorf("trigger=%s enabled=%v: got %v, want unknown trigger kind", trigger, enabled, err)
+			}
+		}
 	}
 }

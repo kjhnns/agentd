@@ -2,11 +2,10 @@ package config
 
 import (
 	"testing"
-	"time"
 )
 
 // TestParseJobs: [[job]] blocks parse declaratively, with enabled defaulting
-// to true and poll parsing as a duration.
+// to true.
 func TestParseJobs(t *testing.T) {
 	cfg, err := Parse([]byte(`
 [server]
@@ -27,24 +26,12 @@ schedule = "@every 1h"
 prompt   = "Heartbeat."
 enabled  = false
 notify   = "never"
-
-[[job]]
-name    = "inbox-drop"
-trigger = "file"
-path    = "/tmp/inbox"
-poll    = "15s"
-prompt  = "Process the drop."
-
-[[job]]
-name    = "deploy-hook"
-trigger = "webhook"
-prompt  = "Verify the deploy."
 `))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if len(cfg.Job) != 4 {
-		t.Fatalf("parsed %d jobs, want 4", len(cfg.Job))
+	if len(cfg.Job) != 2 {
+		t.Fatalf("parsed %d jobs, want 2", len(cfg.Job))
 	}
 	j := cfg.Job[0]
 	if j.Name != "morning-triage" || j.Trigger != "schedule" || j.Schedule != "@daily 07:00" ||
@@ -59,12 +46,6 @@ prompt  = "Verify the deploy."
 	}
 	if cfg.Job[1].Trigger != "" || cfg.Job[1].Schedule != "@every 1h" {
 		t.Fatalf("job[1] = %+v", cfg.Job[1])
-	}
-	if cfg.Job[2].Path != "/tmp/inbox" || cfg.Job[2].Poll != 15*time.Second {
-		t.Fatalf("job[2] = %+v", cfg.Job[2])
-	}
-	if cfg.Job[3].Trigger != "webhook" {
-		t.Fatalf("job[3] = %+v", cfg.Job[3])
 	}
 }
 

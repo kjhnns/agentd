@@ -75,11 +75,3 @@ func TestSendMessage(t *testing.T) {
 		t.Errorf("request body missing text: %s", gotBody)
 	}
 }
-
-func TestSendMediaStubbed(t *testing.T) {
-	a := New("tok", []string{"111"})
-	_, err := a.Send(context.Background(), channel.OutboundMsg{ChatID: "111", Media: []string{"x.jpg"}})
-	if err == nil {
-		t.Fatal("expected media send to be a stub error")
-	}
-}
