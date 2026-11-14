@@ -90,7 +90,7 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, co
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		if isUnreachable(err) {
-			return nil, fmt.Errorf("%w at %s (is the launchd job com.joe_pa.agentd running?): %v", ErrUnreachable, c.Addr, err)
+			return nil, fmt.Errorf("%w at %s (is the agentd service running?): %v", ErrUnreachable, c.Addr, err)
 		}
 		if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
 			return nil, fmt.Errorf("%w: %v", ErrTimeout, err)
@@ -234,6 +234,12 @@ func (c *Client) Interrupt(ctx context.Context, id string) error {
 	return err
 }
 
+// Reset clears the session context while keeping its id.
+func (c *Client) Reset(ctx context.Context, id string) error {
+	_, err := c.do(ctx, http.MethodPost, "/sessions/"+url.PathEscape(id)+"/reset", strings.NewReader(`{"reason":"explicit (cli)"}`), "application/json")
+	return err
+}
+
 // Events opens the session's event WebSocket (GET /sessions/:id/events) and
 // streams normalized events until the connection closes or stop is called.
 // The bearer rides as a ?token= query param: a WebSocket handshake from a
@@ -280,7 +286,7 @@ func Endpoint(cfgPath string) (addr, token string, err error) {
 	addr = os.Getenv("AGENTD_ADDR")
 	token = os.Getenv("AGENTD_TOKEN")
 
-	path := configPath(cfgPath)
+	path := ConfigPath(cfgPath)
 	if path != "" {
 		cfg, cerr := config.Load(path)
 		if cerr != nil {
@@ -308,8 +314,8 @@ func Endpoint(cfgPath string) (addr, token string, err error) {
 	return addr, token, nil
 }
 
-// configPath applies the config discovery precedence.
-func configPath(explicit string) string {
+// ConfigPath applies the config discovery precedence.
+func ConfigPath(explicit string) string {
 	if explicit != "" {
 		return explicit
 	}

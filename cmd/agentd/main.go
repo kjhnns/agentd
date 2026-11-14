@@ -9,13 +9,10 @@
 //	agentd chat                            interactive REPL against the RUNNING daemon
 //	agentd run     "<prompt>"              one-shot turn for scripts (stdout + exit code)
 //	agentd sessions                        list the daemon's live sessions
-//	agentd smoke   -prompt "..."           one headless Claude Code turn, print
-//	                                        parsed normalized events (the vertical)
 package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -28,7 +25,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
-	"text/tabwriter"
 	"time"
 
 	"github.com/kjhnns/agentd/internal/api"
@@ -58,31 +54,26 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		serve(os.Args[2:])
-	case "smoke":
-		smoke(os.Args[2:])
 	case "chat":
 		os.Exit(cli.Chat(os.Args[2:], os.Stdout, os.Stderr, os.Stdin))
 	case "run":
 		os.Exit(cli.Run(os.Args[2:], os.Stdout, os.Stderr, os.Stdin))
 	case "sessions":
 		os.Exit(cli.Sessions(os.Args[2:], os.Stdout, os.Stderr))
-	case "demo-chat":
-		demoChat(os.Args[2:])
 	case "init-workspace":
 		initWorkspace(os.Args[2:])
 	case "memory":
 		memoryCmd(os.Args[2:])
 	case "jobs":
-		jobsCmd(os.Args[2:])
+		os.Exit(cli.Jobs(os.Args[2:], os.Stdout, os.Stderr))
 	case "-h", "--help", "help":
-		fmt.Println("usage: agentd [serve|chat|run|sessions|smoke|init-workspace|memory|jobs] [flags]")
+		fmt.Println("usage: agentd [serve|chat|run|sessions|init-workspace|memory|jobs] [flags]")
 		fmt.Println("  chat                               interactive REPL against the RUNNING daemon")
 		fmt.Println("  run \"<prompt>\"                     one-shot turn for scripts (answer on stdout)")
 		fmt.Println("  sessions                           list the daemon's live sessions")
 		fmt.Println("  init-workspace [name]              scaffold a workspace (default ~/.agentd/workspaces/<name>)")
 		fmt.Println("  memory index|links|add|get [...]   maintain a workspace's memory wiki")
 		fmt.Println("  jobs list|run <name>|runs <name>   inspect and fire scheduler jobs (talks to the running daemon)")
-		fmt.Println("  demo-chat                          offline 2-turn continuity demo (spawns its OWN claude)")
 	default:
 		serve(os.Args[1:])
 	}
@@ -117,25 +108,14 @@ func initWorkspace(args []string) {
 // resolveWorkspaceTarget fills an empty -root / -workspace from a config.toml
 // ([workspace] root/default) so `agentd memory ...` works bare on a configured
 // machine. Config path precedence: explicit cfgPath flag, $AGENTD_CONFIG, then
-// ~/.agentd/config.toml if it exists. Explicit flags always win; if nothing
+// ~/.agentd/config.toml, then ./config.toml. Explicit flags always win; if nothing
 // resolves, the empty values fall through to workspace.NewStore's defaults
 // (~/.agentd/workspaces, "default").
 func resolveWorkspaceTarget(root, name, cfgPath string) (string, string) {
 	if root != "" && name != "" {
 		return root, name
 	}
-	path := cfgPath
-	if path == "" {
-		path = os.Getenv("AGENTD_CONFIG")
-	}
-	if path == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			p := filepath.Join(home, ".agentd", "config.toml")
-			if _, err := os.Stat(p); err == nil {
-				path = p
-			}
-		}
-	}
+	path := cli.ConfigPath(cfgPath)
 	if path == "" {
 		return root, name
 	}
@@ -242,200 +222,6 @@ func memoryCmd(args []string) {
 	default:
 		log.Fatalf("memory: unknown subcommand %q (want index|links|add|get)", sub)
 	}
-}
-
-// jobsCmd is the local ops surface for the scheduler: it talks to the RUNNING
-// daemon's API (bind + bearer from config.toml), so lists reflect live state.
-//
-//	agentd jobs list          jobs + next fire + last run status
-//	agentd jobs run <name>    fire a job now (manual trigger)
-//	agentd jobs runs <name>   recent run history for a job
-func jobsCmd(args []string) {
-	if len(args) < 1 {
-		log.Fatal("usage: agentd jobs <list|run NAME|runs NAME> [-config config.toml]")
-	}
-	sub := args[0]
-	fs := flag.NewFlagSet("jobs "+sub, flag.ExitOnError)
-	cfgPath := fs.String("config", "config.toml", "path to config.toml (for bind + bearer)")
-	_ = fs.Parse(args[1:])
-
-	cfg, err := config.Load(*cfgPath)
-	if err != nil {
-		log.Fatalf("jobs: config: %v", err)
-	}
-	base := "http://" + cfg.Server.Bind
-	call := func(method, path string) []byte {
-		req, err := http.NewRequest(method, base+path, nil)
-		if err != nil {
-			log.Fatalf("jobs: %v", err)
-		}
-		if cfg.Server.APIBearer != "" {
-			req.Header.Set("Authorization", "Bearer "+cfg.Server.APIBearer)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			log.Fatalf("jobs: %v (is the daemon running on %s?)", err, cfg.Server.Bind)
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode >= 300 {
-			log.Fatalf("jobs: %s %s -> %s: %s", method, path, resp.Status, strings.TrimSpace(string(body)))
-		}
-		return body
-	}
-
-	switch sub {
-	case "list":
-		var jobs []scheduler.JobStatus
-		if err := json.Unmarshal(call(http.MethodGet, "/jobs"), &jobs); err != nil {
-			log.Fatalf("jobs list: %v", err)
-		}
-		if len(jobs) == 0 {
-			fmt.Println("no jobs configured (add [[job]] blocks to config.toml)")
-			return
-		}
-		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "NAME\tENABLED\tTRIGGER\tWORKSPACE\tNOTIFY\tNEXT FIRE\tLAST RUN")
-		for _, j := range jobs {
-			next := "-"
-			if j.NextFire != nil {
-				next = j.NextFire.Local().Format("2006-01-02 15:04:05")
-			}
-			last := "-"
-			if j.LastRun != nil {
-				last = fmt.Sprintf("%s %s (%s)", j.LastRun.Status, j.LastRun.Start.Local().Format("01-02 15:04"), j.LastRun.Trigger)
-			}
-			ws := j.Workspace
-			if ws == "" {
-				ws = "(default)"
-			}
-			fmt.Fprintf(w, "%s\t%v\t%s\t%s\t%s\t%s\t%s\n", j.Name, j.Enabled, j.Trigger, ws, j.Notify, next, last)
-		}
-		_ = w.Flush()
-	case "run":
-		name := fs.Arg(0)
-		if name == "" {
-			log.Fatal("usage: agentd jobs run NAME")
-		}
-		fmt.Println(strings.TrimSpace(string(call(http.MethodPost, "/jobs/"+name+"/run"))))
-	case "runs":
-		name := fs.Arg(0)
-		if name == "" {
-			log.Fatal("usage: agentd jobs runs NAME")
-		}
-		var runs []scheduler.JobRun
-		if err := json.Unmarshal(call(http.MethodGet, "/jobs/"+name+"/runs"), &runs); err != nil {
-			log.Fatalf("jobs runs: %v", err)
-		}
-		if len(runs) == 0 {
-			fmt.Println("no runs recorded")
-			return
-		}
-		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "RUN\tTRIGGER\tSTART\tDURATION\tSTATUS\tRESULT/ERROR")
-		for _, r := range runs {
-			dur := "-"
-			if !r.End.IsZero() {
-				dur = r.End.Sub(r.Start).Round(time.Millisecond).String()
-			}
-			msg := r.Result
-			if r.Error != "" {
-				msg = r.Error
-			}
-			if len(msg) > 80 {
-				msg = msg[:80] + "..."
-			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", r.RunID, r.Trigger, r.Start.Local().Format("01-02 15:04:05"), dur, r.Status, msg)
-		}
-		_ = w.Flush()
-	default:
-		log.Fatalf("jobs: unknown subcommand %q (want list|run|runs)", sub)
-	}
-}
-
-// smoke proves the Claude Code stream-json mapping with ONE classic `claude -p`
-// headless turn (one-shot) and prints the normalized events as JSON.
-func smoke(args []string) {
-	fs := flag.NewFlagSet("smoke", flag.ExitOnError)
-	prompt := fs.String("prompt", "Reply with exactly the word PONG and nothing else", "prompt to send")
-	bin := fs.String("claude", "claude", "claude binary")
-	skip := fs.Bool("skip-permissions", true, "pass --dangerously-skip-permissions")
-	_ = fs.Parse(args)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
-	defer cancel()
-
-	evs, err := claudecode.OneShot(ctx, *bin, *prompt, *skip)
-	if err != nil {
-		log.Fatalf("smoke: %v", err)
-	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(evs)
-}
-
-// demoChat demos a real 2-turn PERSISTENT exchange on ONE claude process,
-// proving continuity: turn 1 sets a codeword, turn 2 asks for it back. It is a
-// harness-level DEMO that spawns its own claude and talks to no daemon; the
-// interactive client is `agentd chat` (internal/cli). It used to own the "chat"
-// name, which made the obvious command the one thing that was not a service
-// client.
-func demoChat(args []string) {
-	fs := flag.NewFlagSet("demo-chat", flag.ExitOnError)
-	bin := fs.String("claude", "claude", "claude binary")
-	skip := fs.Bool("skip-permissions", true, "pass --dangerously-skip-permissions")
-	_ = fs.Parse(args)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
-	defer cancel()
-
-	a := claudecode.New(*bin)
-	h, err := a.Start(ctx, harness.SessionConfig{
-		SessionID: "chat-demo", Cwd: os.TempDir(), SkipPermissions: *skip,
-	})
-	if err != nil {
-		log.Fatalf("demo-chat start: %v", err)
-	}
-	defer a.Teardown(h)
-
-	// Collect result events off the persistent stream. The adapter blanks a
-	// result text that duplicates the turn's final output event, so fall back
-	// to the last output text for the printed reply.
-	results := make(chan string, 4)
-	go func() {
-		var lastOutput string
-		for e := range a.Events(h) {
-			switch e.Kind {
-			case eventbus.KindOutput:
-				lastOutput = e.Text
-			case eventbus.KindResult:
-				r := e.Text
-				if r == "" {
-					r = lastOutput
-				}
-				results <- r
-				lastOutput = ""
-			}
-		}
-	}()
-
-	turns := []string{
-		"Remember the codeword is HELIOTROPE. Reply with just OK.",
-		"What is the codeword? Reply with just the word.",
-	}
-	for i, t := range turns {
-		fmt.Printf("turn %d >>> %s\n", i+1, t)
-		if err := a.Send(ctx, h, harness.Input{Text: t}); err != nil {
-			log.Fatalf("demo-chat turn %d: %v", i+1, err)
-		}
-		select {
-		case r := <-results:
-			fmt.Printf("turn %d <<< %s\n", i+1, r)
-		case <-time.After(120 * time.Second):
-			log.Fatalf("demo-chat turn %d: no result", i+1)
-		}
-	}
-	fmt.Println("(both turns ran on the SAME process; turn 2 recalling the codeword proves continuity)")
 }
 
 func serve(args []string) {
