@@ -30,16 +30,20 @@
 package workspace
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"unicode/utf8"
 )
 
 // Workspace is one agent home directory rooted at Root.
 type Workspace struct {
-	Name string // directory basename, e.g. "default"
-	Root string // absolute path of the workspace root
+	Name    string // directory basename, e.g. "default"
+	Root    string // absolute path of the workspace root
+	gitRepo atomic.Bool
 }
 
 // Path helpers. All content lives under Root.
@@ -163,10 +167,11 @@ const maxSectionBytes = 32 * 1024
 
 // ComposeSystemPrompt builds the injected system prompt for a session started
 // in this workspace: root instructions + memory INDEX + current handoff. It is
-// passed to the harness via SessionConfig.SystemPrompt (--append-system-prompt
+// passed to the harness via SessionConfig.SystemPrompt (--append-system-prompt-file
 // for Claude Code). Memory PAGES are deliberately not included; the agent opens
-// them on demand (see package comment).
-func (w *Workspace) ComposeSystemPrompt() (string, error) {
+// them on demand (see package comment). The optional root filename identifies
+// instructions the harness loads natively.
+func (w *Workspace) ComposeSystemPrompt(nativeRootFile ...string) (string, error) {
 	instr, err := readSection(w.AgentsMD())
 	if err != nil {
 		return "", fmt.Errorf("workspace %s: %w", w.Name, err)
@@ -185,8 +190,21 @@ func (w *Workspace) ComposeSystemPrompt() (string, error) {
 	fmt.Fprintf(&b, "# Workspace: %s\n\n", w.Name)
 	b.WriteString("Your persistent home directory is the current working directory. ")
 	b.WriteString("Instructions live in instructions/, long-term memory in memory/pages/ (indexed below), the session handoff in context.md.\n\n")
-	b.WriteString("## Instructions (instructions/AGENTS.md)\n\n")
-	b.WriteString(instr)
+	native := ""
+	if len(nativeRootFile) > 0 && nativeRootFile[0] != "" {
+		rootFile := filepath.Join(w.Root, nativeRootFile[0])
+		resolved, rerr := filepath.EvalSymlinks(rootFile)
+		target, terr := filepath.EvalSymlinks(w.AgentsMD())
+		if rerr == nil && terr == nil && resolved == target {
+			native = nativeRootFile[0]
+		}
+	}
+	if native != "" {
+		fmt.Fprintf(&b, "Agent instructions are loaded from %s.", native)
+	} else {
+		b.WriteString("## Instructions (instructions/AGENTS.md)\n\n")
+		b.WriteString(instr)
+	}
 	b.WriteString("\n\n## Memory index (memory/INDEX.md)\n\n")
 	b.WriteString("Only this index is injected, not the pages. Read memory/pages/<slug>.md for any entry that looks relevant to the task at hand.\n\n")
 	b.WriteString(index)
@@ -201,11 +219,34 @@ func readSection(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	truncated := len(data) > maxSectionBytes
+	if truncated {
+		cut := sectionBoundary(data)
+		if cut == 0 {
+			// One line longer than the budget: cut at a rune boundary.
+			cut = maxSectionBytes
+			for cut > 0 && !utf8.RuneStart(data[cut]) {
+				cut--
+			}
+		}
+		data = data[:cut]
+	}
 	s := strings.TrimSpace(string(data))
-	if len(s) > maxSectionBytes {
-		s = s[:maxSectionBytes] + "\n[truncated: section exceeds injection budget]"
+	if filepath.Base(path) == "context.md" {
+		archives, _ := filepath.Glob(filepath.Join(filepath.Dir(path), "context-archive", "*.md"))
+		if truncated || len(archives) > 0 {
+			s += "\n[truncated: older handoffs are in context-archive/]"
+		}
+	} else if truncated {
+		s += "\n[truncated: section exceeds injection budget]"
 	}
 	return s, nil
+}
+
+// sectionBoundary keeps complete lines within the injection budget.
+func sectionBoundary(data []byte) int {
+	limit := min(len(data), maxSectionBytes)
+	return bytes.LastIndexByte(data[:limit], '\n') + 1
 }
 
 // ---- Store: named workspaces under one root dir ----

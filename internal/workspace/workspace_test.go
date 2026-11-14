@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // TestInitLoadRoundtrip: Init scaffolds a usable workspace; Load validates it.
@@ -123,5 +124,86 @@ func TestStoreEnsureAndResolve(t *testing.T) {
 	}
 	if w, err := st.Ensure(""); err != nil || w.Name != "default" {
 		t.Fatalf("Ensure default: %v (name=%q)", err, w.Name)
+	}
+}
+
+func TestComposeSystemPromptNativeInstructions(t *testing.T) {
+	for _, tc := range []struct {
+		name, native, target string
+		omit                 bool
+	}{
+		{"claude", "CLAUDE.md", "instructions/AGENTS.md", true},
+		{"codex", "AGENTS.md", "instructions/AGENTS.md", true},
+		{"unknown", "", "", false},
+		{"missing", "CLAUDE.md", "", false},
+		{"regular", "CLAUDE.md", "regular", false},
+		{"other-link", "CLAUDE.md", "context.md", false},
+		{"broken-link", "CLAUDE.md", "missing.md", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := Init(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(w.AgentsMD(), []byte("UNIQUE-CONSTITUTION"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if tc.native != "" {
+				path := filepath.Join(w.Root, tc.native)
+				os.Remove(path)
+				if tc.target == "regular" {
+					err = os.WriteFile(path, []byte("different content"), 0o644)
+				} else if tc.target != "" {
+					err = os.Symlink(tc.target, path)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := w.ComposeSystemPrompt(tc.native)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(got, "UNIQUE-CONSTITUTION") == tc.omit {
+				t.Fatalf("unexpected constitution injection: %s", got)
+			}
+			if tc.omit && !strings.Contains(got, "Agent instructions are loaded from "+tc.native+".") {
+				t.Fatal(got)
+			}
+			for _, want := range []string{"Memory index", "Context handoff"} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("missing %s", want)
+				}
+			}
+		})
+	}
+}
+
+func TestReadSectionLineBoundary(t *testing.T) {
+	for _, prefix := range []string{"first line\n", strings.Repeat("x", maxSectionBytes-1) + "\n"} {
+		path := filepath.Join(t.TempDir(), "section.md")
+		data := prefix + strings.Repeat("界", maxSectionBytes)
+		if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got, err := readSection(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !utf8.ValidString(got) || strings.Contains(got, "界") || !strings.HasPrefix(got, strings.TrimSpace(prefix)+"\n[truncated:") {
+			t.Fatalf("invalid truncation: %q", got[:min(len(got), 80)])
+		}
+	}
+	// One line longer than the budget: cut at a rune boundary, never empty.
+	path := filepath.Join(t.TempDir(), "section.md")
+	if err := os.WriteFile(path, []byte(strings.Repeat("界", maxSectionBytes)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readSection(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !utf8.ValidString(got) || !strings.HasPrefix(got, "界") || len(got) > maxSectionBytes+80 || !strings.Contains(got, "[truncated:") {
+		t.Fatalf("invalid long-line truncation: %d bytes", len(got))
 	}
 }

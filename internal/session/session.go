@@ -51,6 +51,7 @@ type Session struct {
 	mu           sync.Mutex
 	status       harness.Status
 	running      bool
+	removed      bool
 	turns        int       // turns on the CURRENT handle (reset back to 0 on reset)
 	handleStart  time.Time // when the current handle was started (for max_wallclock)
 	lastActivity time.Time // last turn boundary (for idle GC)
@@ -124,6 +125,9 @@ type Manager struct {
 	// opens memory/pages/<slug>.md on demand with its file tools). When nil,
 	// sessions fall back to the caller-provided cwd with no injection.
 	Workspaces *workspace.Store
+
+	// NativeInstructionsFile is the root instruction file the harness loads itself.
+	NativeInstructionsFile string
 
 	// Reply shapes how an answer is delivered (see ReplyPolicy).
 	Reply ReplyPolicy
@@ -289,7 +293,7 @@ func (m *Manager) CreateInLane(ctx context.Context, lane Lane, workspaceName, cw
 			return nil, fmt.Errorf("session: workspace %q: %w", workspaceName, err)
 		}
 		cwd = ws.Cwd()
-		systemPrompt, err = ws.ComposeSystemPrompt()
+		systemPrompt, err = ws.ComposeSystemPrompt(m.NativeInstructionsFile)
 		if err != nil {
 			return nil, fmt.Errorf("session: compose injection for workspace %q: %w", ws.Name, err)
 		}
@@ -583,7 +587,10 @@ func (m *Manager) Interrupt(id string) error {
 	if m.log != nil {
 		_ = m.log.Append("interrupt", map[string]string{"session": id})
 	}
-	return s.adapter.Interrupt(s.handle)
+	s.mu.Lock()
+	handle := s.handle
+	s.mu.Unlock()
+	return s.adapter.Interrupt(handle)
 }
 
 // Teardown stops and removes a session.
@@ -592,7 +599,11 @@ func (m *Manager) Teardown(id string) error {
 	if !ok {
 		return fmt.Errorf("session %s not found", id)
 	}
-	err := s.adapter.Teardown(s.handle)
+	s.mu.Lock()
+	s.removed = true
+	handle := s.handle
+	s.mu.Unlock()
+	err := s.adapter.Teardown(handle)
 	m.mu.Lock()
 	delete(m.sessions, id)
 	m.mu.Unlock()

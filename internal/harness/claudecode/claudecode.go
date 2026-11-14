@@ -4,7 +4,7 @@
 // Start spawns ONE long-lived process per agentd session:
 //
 //	claude -p --input-format stream-json --output-format stream-json --verbose \
-//	       [--dangerously-skip-permissions] [--model M] [--append-system-prompt S]
+//	       [--dangerously-skip-permissions] [--model M] [--append-system-prompt-file PATH]
 //
 // The process STAYS ALIVE for the session lifetime. Send writes a user-message
 // JSON envelope to the process stdin (never closing it), so every turn runs on
@@ -54,7 +54,7 @@ var modelWindows = map[string]int{
 type Adapter struct {
 	bin           string // path/name of the claude binary
 	contextWindow int    // default context window for real pressure (0 => DefaultContextWindow)
-	promptDir     string // when set, the system prompt goes through a 0600 file here, not argv
+	promptDir     string // system prompts go through private files here
 }
 
 // New returns an adapter using the given binary name (default "claude").
@@ -65,26 +65,57 @@ func New(bin string) *Adapter {
 	return &Adapter{bin: bin, contextWindow: DefaultContextWindow}
 }
 
-// WithPromptDir makes Start write SessionConfig.SystemPrompt to a private file
-// in dir and pass --append-system-prompt-file. Argv is readable by every local
-// user through /proc, and the composed prompt can carry conversation history
-// after a reset, so an instance that holds private content sets this.
+// daemonStart bounds stale prompt cleanup to files from earlier daemon runs.
+var daemonStart = time.Now()
+
+// WithPromptDir selects the private prompt directory and removes stale files.
 func (a *Adapter) WithPromptDir(dir string) *Adapter {
 	a.promptDir = dir
+	entries, err := os.ReadDir(dir)
+	if err != nil && !os.IsNotExist(err) {
+		log.Printf("claudecode: read stale prompts: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".prompt") {
+			continue
+		}
+		info, err := entry.Info()
+		if err == nil && info.ModTime().Before(daemonStart) {
+			if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
+				log.Printf("claudecode: remove stale prompt %s: %v", entry.Name(), err)
+			}
+		}
+	}
 	return a
 }
 
-// writePromptFile stores the prompt for one session, owner-only.
+// writePromptFile stores a unique prompt for one process start, owner-only.
 func writePromptFile(dir, sessionID, prompt string) (string, error) {
+	if dir == "" {
+		return "", fmt.Errorf("prompt directory is required")
+	}
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, filepath.Base(sessionID)+".prompt")
-	if err := os.WriteFile(path, []byte(prompt), 0o600); err != nil {
+	if err := os.Chmod(dir, 0o700); err != nil {
 		return "", err
 	}
-	// WriteFile keeps the mode of an existing file.
-	if err := os.Chmod(path, 0o600); err != nil {
+	f, err := os.CreateTemp(dir, filepath.Base(sessionID)+"-*.prompt")
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	if _, err := f.WriteString(prompt); err != nil {
+		f.Close()
+		os.Remove(path)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path)
 		return "", err
 	}
 	return path, nil
@@ -169,14 +200,20 @@ func (a *Adapter) Start(ctx context.Context, cfg harness.SessionConfig) (harness
 		return nil, fmt.Errorf("claudecode: SessionConfig.SessionID required")
 	}
 	promptFile := ""
-	if a.promptDir != "" && cfg.SystemPrompt != "" {
+	if cfg.SystemPrompt != "" {
 		p, err := writePromptFile(a.promptDir, cfg.SessionID, cfg.SystemPrompt)
 		if err != nil {
-			// No argv fallback: the caller asked for the prompt to stay out of argv.
+			// Fail closed when the private prompt file cannot be written.
 			return nil, fmt.Errorf("claudecode: prompt file: %w", err)
 		}
 		promptFile = p
 	}
+	started := false
+	defer func() {
+		if !started && promptFile != "" {
+			os.Remove(promptFile)
+		}
+	}()
 	args := buildArgs(cfg, promptFile)
 
 	procCtx, cancel := context.WithCancel(context.Background())
@@ -216,6 +253,7 @@ func (a *Adapter) Start(ctx context.Context, cfg harness.SessionConfig) (harness
 		proxyBudget:   harness.DefaultProxyBudget(),
 		startedAt:     time.Now(),
 	}
+	started = true
 	go h.readLoop()
 	if promptFile != "" {
 		go func() {
@@ -229,8 +267,7 @@ func (a *Adapter) Start(ctx context.Context, cfg harness.SessionConfig) (harness
 // buildArgs assembles the CLI arguments for a persistent streaming session.
 // SessionConfig.SystemPrompt (the workspace injection composed by the Session
 // Manager: instructions + memory index + handoff) maps to
-// --append-system-prompt, the server-owned context hook (design 3.5). With a
-// promptFile the prompt is read from that file and never appears in argv.
+// --append-system-prompt-file. The prompt never appears in argv.
 func buildArgs(cfg harness.SessionConfig, promptFile string) []string {
 	args := []string{"-p",
 		"--input-format", "stream-json",
@@ -256,8 +293,6 @@ func buildArgs(cfg harness.SessionConfig, promptFile string) []string {
 	}
 	if promptFile != "" {
 		args = append(args, "--append-system-prompt-file", promptFile)
-	} else if cfg.SystemPrompt != "" {
-		args = append(args, "--append-system-prompt", cfg.SystemPrompt)
 	}
 	return args
 }

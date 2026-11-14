@@ -1,7 +1,10 @@
 package workspace
 
 import (
+	"bytes"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -75,10 +78,11 @@ func TestAutoCommitGracefulWithoutRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	// Strip version control off the workspace.
+	// Strip version control and load a new value with no cached repo result.
 	if err := os.RemoveAll(filepath.Join(root, ".git")); err != nil {
 		t.Fatal(err)
 	}
+	w = &Workspace{Name: w.Name, Root: w.Root}
 	if sha, err := w.AutoCommit("turn x"); err != nil || sha != "" {
 		t.Errorf("AutoCommit on non-repo: sha=%q err=%v (want silent no-op)", sha, err)
 	}
@@ -88,5 +92,151 @@ func TestSummarizeChanges(t *testing.T) {
 	got := summarizeChanges([]string{"memory/pages/beta.md", "memory/INDEX.md", "context.md", "memory/pages/alpha.md"})
 	if !strings.Contains(got, "memory: alpha, beta") || !strings.Contains(got, "context.md") {
 		t.Errorf("summarizeChanges = %q", got)
+	}
+}
+
+func TestAutoCommitSkipsNestedEmptyRepo(t *testing.T) {
+	w, err := Init(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(w.WorkDir(), "dir with spaces", "empty repo")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nw := &Workspace{Root: nested}
+	if _, err := nw.git("init"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(w.ContextMD(), []byte("updated handoff"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sha, err := w.AutoCommit("turn")
+	if err != nil || sha == "" {
+		t.Fatalf("sha=%q err=%v", sha, err)
+	}
+	out, err := w.git("show", "HEAD:context.md")
+	if err != nil || out != "updated handoff" {
+		t.Fatalf("committed content=%q err=%v", out, err)
+	}
+	out, err = w.git("ls-files", "--stage", "work")
+	if err != nil || out != "" {
+		t.Fatalf("nested repo staged: %q, %v", out, err)
+	}
+	if sha, err := w.AutoCommit("only nested repo remains"); err != nil || sha != "" {
+		t.Fatalf("no-op sha=%q err=%v", sha, err)
+	}
+}
+
+func TestAutoCommitCachesRepoAndCommitsPartialAdd(t *testing.T) {
+	w, err := Init(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !w.IsGitRepo() {
+		t.Fatal("not a repo")
+	}
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	calls := filepath.Join(bin, "calls")
+	script := `#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    status|--is-inside-work-tree) echo "$arg" >> "$J2_GIT_CALLS" ;;
+    add) adding=1 ;;
+  esac
+done
+if [ "$adding" = 1 ] && [ "$J2_SKIP_ADD" = 1 ]; then
+  echo "error: unable to index file 'bad-path'" >&2
+  exit 1
+fi
+"$J2_REAL_GIT" "$@"
+result=$?
+if [ "$adding" = 1 ] && [ "$result" = 0 ]; then
+  echo "error: unable to index file 'bad-path'" >&2
+  exit 1
+fi
+exit "$result"
+`
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("J2_REAL_GIT", realGit)
+	t.Setenv("J2_GIT_CALLS", calls)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := os.WriteFile(w.ContextMD(), []byte("staged despite warning"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var warning bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&warning)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	sha, err := w.AutoCommit("partial")
+	if err != nil || sha == "" {
+		t.Fatalf("sha=%q err=%v", sha, err)
+	}
+	data, err := os.ReadFile(calls)
+	if err != nil || string(data) != "status\n" {
+		t.Fatalf("expected one status and cached repo check: %q %v", data, err)
+	}
+	if !strings.Contains(warning.String(), "staging warning") || !strings.Contains(warning.String(), "bad-path") {
+		t.Fatalf("missing warning: %s", warning.String())
+	}
+	out, err := w.git("show", "HEAD:context.md")
+	if err != nil || out != "staged despite warning" {
+		t.Fatalf("committed=%q err=%v", out, err)
+	}
+	t.Setenv("J2_SKIP_ADD", "1")
+	if err := os.WriteFile(w.ContextMD(), []byte("cannot stage"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if sha, err := w.AutoCommit("nothing staged"); sha != "" || err == nil || !strings.Contains(err.Error(), "bad-path") {
+		t.Fatalf("sha=%q err=%v", sha, err)
+	}
+}
+
+func TestAutoCommitKeepsRegisteredSubmodule(t *testing.T) {
+	w, err := Init(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := Init(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.git("-c", "protocol.file.allow=always", "submodule", "add", source.Root, "work/sub"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AutoCommit("register submodule"); err != nil {
+		t.Fatal(err)
+	}
+	sub := &Workspace{Root: filepath.Join(w.Root, "work", "sub")}
+	if err := os.WriteFile(filepath.Join(sub.Root, "new.txt"), []byte("new content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sub.GitCommitAll("submodule update"); err != nil {
+		t.Fatal(err)
+	}
+	if sha, err := w.AutoCommit("update submodule"); err != nil || sha == "" {
+		t.Fatalf("submodule commit=%q err=%v", sha, err)
+	}
+	if dirty, err := w.GitHasChanges(); err != nil || dirty {
+		t.Fatalf("submodule update not staged: dirty=%v err=%v", dirty, err)
+	}
+}
+
+func TestIsGitRepoDoesNotCacheNegative(t *testing.T) {
+	w := &Workspace{Root: t.TempDir()}
+	if w.IsGitRepo() {
+		t.Fatal("empty directory is a repo")
+	}
+	if _, err := w.git("init"); err != nil {
+		t.Fatal(err)
+	}
+	if !w.IsGitRepo() {
+		t.Fatal("negative result was cached")
 	}
 }

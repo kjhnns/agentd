@@ -15,7 +15,7 @@ import (
 // TestLiveWorkspaceInjection proves end to end that the workspace injection
 // takes effect: a workspace whose AGENTS.md carries "codename ORCHID" is homed
 // into a REAL claude session via Manager.Create (cwd = workspace root,
-// --append-system-prompt = composed injection), and the agent answers ORCHID.
+// --append-system-prompt-file = composed injection), and the agent answers ORCHID.
 //
 // Skipped unless AGENTD_LIVE_CLAUDE=1 (same gate as the continuity test).
 // AGENTD_CLAUDE_BIN overrides the claude binary path.
@@ -41,7 +41,7 @@ func TestLiveWorkspaceInjection(t *testing.T) {
 	_ = f.Close()
 
 	bus := eventbus.New()
-	mgr := NewManager(claudecode.New(bin), bus, nil)
+	mgr := NewManager(claudecode.New(bin).WithPromptDir(t.TempDir()), bus, nil)
 	mgr.Workspaces = store
 	mgr.SkipPermissions = true
 	mgr.GitAutoCommit = true

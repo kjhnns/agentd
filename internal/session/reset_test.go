@@ -207,6 +207,9 @@ func TestIdleTimeoutGCReclaims(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	if _, err := mgr.Send(ctx, s.ID, "a real turn"); err != nil {
+		t.Fatal(err)
+	}
 	// Age the session past the idle timeout.
 	s.mu.Lock()
 	s.lastActivity = time.Now().Add(-2 * time.Minute)
