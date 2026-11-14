@@ -45,7 +45,7 @@ func TestLiveLosslessResetNovember3(t *testing.T) {
 
 	store := workspace.NewStore(t.TempDir(), "default")
 	bus := eventbus.New()
-	mgr := NewManager(claudecode.New(bin), bus, nil)
+	mgr := NewManager(claudecode.New(bin).WithPromptDir(t.TempDir()), bus, nil)
 	mgr.Workspaces = store
 	mgr.SkipPermissions = true
 	mgr.GitAutoCommit = true

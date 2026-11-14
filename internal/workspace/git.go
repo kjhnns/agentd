@@ -22,8 +22,13 @@
 package workspace
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
+	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -49,8 +54,15 @@ func GitAvailable() bool {
 
 // IsGitRepo reports whether the workspace root is inside a git work tree.
 func (w *Workspace) IsGitRepo() bool {
+	if w.gitRepo.Load() {
+		return true
+	}
 	out, err := w.git("rev-parse", "--is-inside-work-tree")
-	return err == nil && strings.TrimSpace(out) == "true"
+	ok := err == nil && strings.TrimSpace(out) == "true"
+	if ok {
+		w.gitRepo.Store(true)
+	}
+	return ok
 }
 
 // gitignore keeps transient noise out of history while TRACKING everything
@@ -101,37 +113,91 @@ func (w *Workspace) GitHasChanges() (bool, error) {
 // ChangedPaths lists the paths git considers changed (staged, unstaged, or
 // untracked), used to generate commit messages.
 func (w *Workspace) ChangedPaths() ([]string, error) {
-	out, err := w.git("status", "--porcelain")
+	out, err := w.git("status", "--porcelain", "-z")
 	if err != nil {
 		return nil, err
 	}
-	var paths []string
-	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
-		if len(line) < 4 {
-			continue
-		}
-		p := strings.TrimSpace(line[3:])
-		// Renames show as "old -> new"; keep the new path.
-		if i := strings.Index(p, " -> "); i >= 0 {
-			p = p[i+4:]
-		}
-		paths = append(paths, strings.Trim(p, `"`))
-	}
+	paths, _ := statusPaths(out)
 	return paths, nil
 }
 
-// GitCommitAll stages everything and commits with msg, returning the short
-// commit hash. If nothing changed it returns "" with no error.
+// statusPaths decodes NUL-delimited paths, including spaces and newlines.
+func statusPaths(out string) (paths, untracked []string) {
+	entries := strings.Split(out, "\x00")
+	for i := 0; i < len(entries); i++ {
+		entry := entries[i]
+		if len(entry) < 4 {
+			continue
+		}
+		path := entry[3:]
+		paths = append(paths, path)
+		if entry[:2] == "??" {
+			untracked = append(untracked, path)
+		}
+		if strings.ContainsAny(entry[:2], "RC") {
+			i++ // The next entry is the rename/copy source.
+		}
+	}
+	return
+}
+
+// nestedRepos finds untracked repositories without descending into them.
+func (w *Workspace) nestedRepos(untracked []string) ([]string, error) {
+	var nested []string
+	for _, path := range untracked {
+		err := filepath.WalkDir(filepath.Join(w.Root, path), func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() {
+				return nil
+			}
+			if _, err := os.Lstat(filepath.Join(path, ".git")); err == nil {
+				rel, err := filepath.Rel(w.Root, path)
+				if err != nil {
+					return err
+				}
+				nested = append(nested, filepath.ToSlash(rel))
+				return filepath.SkipDir
+			} else if !os.IsNotExist(err) {
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return nested, nil
+}
+
+// GitCommitAll stages everything and commits with msg, returning the short hash.
 func (w *Workspace) GitCommitAll(msg string) (string, error) {
-	has, err := w.GitHasChanges()
+	out, err := w.git("status", "--porcelain", "-z")
+	if err != nil || out == "" {
+		return "", err
+	}
+	return w.commitStatus(msg, out)
+}
+
+func (w *Workspace) commitStatus(msg, status string) (string, error) {
+	_, untracked := statusPaths(status)
+	nested, err := w.nestedRepos(untracked)
 	if err != nil {
 		return "", err
 	}
-	if !has {
-		return "", nil
+	args := []string{"add", "-A", "--ignore-errors", "--", "."}
+	for _, path := range nested {
+		args = append(args, ":(top,exclude,literal)"+path)
 	}
-	if _, err := w.git("add", "-A"); err != nil {
-		return "", err
+	_, addErr := w.git(args...)
+	if _, err := w.git("diff", "--cached", "--quiet"); err == nil {
+		return "", addErr
+	} else {
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+			return "", err
+		}
 	}
 	if _, err := w.git("commit", "-m", msg); err != nil {
 		return "", err
@@ -140,27 +206,23 @@ func (w *Workspace) GitCommitAll(msg string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if addErr != nil {
+		log.Printf("workspace %s: committed %s with staging warning: %v", w.Name, strings.TrimSpace(out), addErr)
+	}
 	return strings.TrimSpace(out), nil
 }
 
-// AutoCommit is the end-of-turn hook: if the workspace is a repo with
-// changes, commit them all with a generated message "<prefix>: <summary of
-// changed paths>". Memory-page changes are called out by page slug so a
-// re-synthesis reads clearly in `git log`. Returns the short hash, or "" if
-// nothing was committed (no repo, no git, or no changes); errors are for the
-// caller to LOG, never to fail a session on.
+// AutoCommit commits changed workspace files and logs any partial staging failure.
 func (w *Workspace) AutoCommit(prefix string) (string, error) {
-	if !GitAvailable() || !w.IsGitRepo() {
+	if !w.IsGitRepo() {
 		return "", nil
 	}
-	paths, err := w.ChangedPaths()
-	if err != nil {
+	out, err := w.git("status", "--porcelain", "-z")
+	if err != nil || out == "" {
 		return "", err
 	}
-	if len(paths) == 0 {
-		return "", nil
-	}
-	return w.GitCommitAll(prefix + ": " + summarizeChanges(paths))
+	paths, _ := statusPaths(out)
+	return w.commitStatus(prefix+": "+summarizeChanges(paths), out)
 }
 
 // summarizeChanges builds a compact, informative commit subject from changed

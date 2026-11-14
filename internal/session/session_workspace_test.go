@@ -2,6 +2,8 @@ package session
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -232,5 +234,52 @@ func TestCreateFallsBackToDefaultModel(t *testing.T) {
 	}
 	if got := fa.started[1].Model; got != "explicit-model" {
 		t.Errorf("explicit model = %q, want it to win over the default", got)
+	}
+}
+
+func TestWorkspaceNativeInstructionsAcrossRestarts(t *testing.T) {
+	for _, native := range []string{"", "CLAUDE.md", "AGENTS.md"} {
+		t.Run(native, func(t *testing.T) {
+			fa := &fakeAdapter{}
+			mgr := NewManager(fa, eventbus.New(), nil)
+			mgr.Workspaces = workspace.NewStore(t.TempDir(), "default")
+			mgr.NativeInstructionsFile = native
+			ws, err := mgr.Workspaces.Ensure("")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if native == "AGENTS.md" {
+				if err := os.Symlink("instructions/AGENTS.md", filepath.Join(ws.Root, native)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s, err := mgr.Create(context.Background(), "", "", "", "native")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := mgr.Reset(context.Background(), s.ID, "native test"); err != nil {
+				t.Fatal(err)
+			}
+			fa.setStatus(harness.StatusDead)
+			mgr.gcSweep(context.Background())
+			configs := fa.startedConfigs()
+			if len(configs) != 3 {
+				t.Fatalf("starts=%d", len(configs))
+			}
+			for _, cfg := range configs {
+				if strings.Contains(cfg.SystemPrompt, "Agent instructions (workspace constitution)") != (native == "") {
+					t.Fatalf("wrong instruction injection for %q", native)
+				}
+				if native != "" && !strings.Contains(cfg.SystemPrompt, "Agent instructions are loaded from "+native+".") {
+					t.Fatal(cfg.SystemPrompt)
+				}
+				if !strings.Contains(cfg.SystemPrompt, "Memory index") || !strings.Contains(cfg.SystemPrompt, "Context handoff") {
+					t.Fatal(cfg.SystemPrompt)
+				}
+			}
+			if err := mgr.Teardown(s.ID); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

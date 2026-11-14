@@ -95,6 +95,9 @@ func (m *Manager) resetLocked(ctx context.Context, s *Session, reason string) er
 	if flushErr != nil {
 		log.Printf("session %s: checkpoint-flush incomplete (%v); proceeding to teardown+fresh", s.ID, flushErr)
 	}
+	if flushOK {
+		m.rotateContext(s)
+	}
 	checkpointCommit := ""
 	if m.GitAutoCommit && s.ws != nil {
 		if sha, cerr := s.ws.AutoCommit("checkpoint (reset: " + reason + ")"); cerr != nil {
@@ -112,7 +115,7 @@ func (m *Manager) resetLocked(ctx context.Context, s *Session, reason string) er
 	systemPrompt := ""
 	if s.ws != nil {
 		cwd = s.ws.Cwd()
-		sp, perr := s.ws.ComposeSystemPrompt()
+		sp, perr := s.ws.ComposeSystemPrompt(m.NativeInstructionsFile)
 		if perr != nil {
 			return fmt.Errorf("session %s: recompose injection on reset: %w", s.ID, perr)
 		}
@@ -141,6 +144,10 @@ func (m *Manager) resetLocked(ctx context.Context, s *Session, reason string) er
 
 	now := time.Now().UTC()
 	gen := m.installHandle(s, h, now)
+	if gen == 0 {
+		_ = s.adapter.Teardown(h)
+		return ErrSessionGone
+	}
 	go m.pump(s, h, gen)
 
 	if m.log != nil {
@@ -277,6 +284,10 @@ func (m *Manager) replaceProcessLocked(ctx context.Context, s *Session, reason s
 // the session's locks.
 func (m *Manager) replaceProcess(ctx context.Context, s *Session, reason string, recap bool) error {
 	s.mu.Lock()
+	if s.removed {
+		s.mu.Unlock()
+		return ErrSessionGone
+	}
 	old := s.handle
 	s.mu.Unlock()
 	_ = s.adapter.Teardown(old)
@@ -285,7 +296,7 @@ func (m *Manager) replaceProcess(ctx context.Context, s *Session, reason string,
 	systemPrompt := ""
 	if s.ws != nil {
 		cwd = s.ws.Cwd()
-		if sp, err := s.ws.ComposeSystemPrompt(); err == nil {
+		if sp, err := s.ws.ComposeSystemPrompt(m.NativeInstructionsFile); err == nil {
 			systemPrompt = sp
 		}
 	}
@@ -311,6 +322,10 @@ func (m *Manager) replaceProcess(ctx context.Context, s *Session, reason string,
 	}
 	now := time.Now().UTC()
 	gen := m.installHandle(s, h, now)
+	if gen == 0 {
+		_ = s.adapter.Teardown(h)
+		return ErrSessionGone
+	}
 	go m.pump(s, h, gen)
 	if m.log != nil {
 		_ = m.log.Append("session_recover", map[string]any{"session": s.ID, "reason": reason, "generation": gen, "ts": now})
@@ -319,10 +334,13 @@ func (m *Manager) replaceProcess(ctx context.Context, s *Session, reason string,
 }
 
 // installHandle makes h the session's live process and advances the process
-// generation. It returns the new generation for the handle's pump.
+// generation. It returns zero if removal raced the start, otherwise the pump generation.
 func (m *Manager) installHandle(s *Session, h harness.Handle, now time.Time) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.removed {
+		return 0
+	}
 	s.handle = h
 	s.gen++
 	// curTurn stays: a turn that replaces its own process (abandoned or
@@ -340,9 +358,16 @@ func (m *Manager) installHandle(s *Session, h harness.Handle, now time.Time) uin
 func (m *Manager) reclaimIdle(ctx context.Context, s *Session) {
 	s.mu.Lock()
 	handle := s.handle
+	flushSkipped := s.turns == 0
 	s.mu.Unlock()
 
-	flushErr := m.checkpointFlush(ctx, s, handle)
+	var flushErr error
+	if !flushSkipped {
+		flushErr = m.checkpointFlush(ctx, s, handle)
+		if flushErr == nil {
+			m.rotateContext(s)
+		}
+	}
 	if flushErr != nil {
 		log.Printf("session %s: idle checkpoint-flush incomplete (%v); reclaiming anyway", s.ID, flushErr)
 	}
@@ -367,10 +392,20 @@ func (m *Manager) reclaimIdle(ctx context.Context, s *Session) {
 		_ = m.log.Append("session_reclaim", map[string]any{
 			"session":           s.ID,
 			"reason":            "idle",
+			"flush_skipped":     flushSkipped,
 			"flush_ok":          flushErr == nil,
 			"checkpoint_commit": commit,
 			"ts":                time.Now().UTC(),
 		})
 	}
 	log.Printf("session %s: idle-reclaimed (flush_ok=%v, commit=%s)", s.ID, flushErr == nil, commit)
+}
+
+// rotateContext keeps the handoff bounded without failing session cleanup.
+func (m *Manager) rotateContext(s *Session) {
+	if s.ws != nil {
+		if err := s.ws.RotateContext(); err != nil {
+			log.Printf("session %s: context rotation failed: %v", s.ID, err)
+		}
+	}
 }

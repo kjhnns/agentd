@@ -468,6 +468,12 @@ func serve(args []string) {
 		log.Fatal(err)
 	}
 	mgr := session.NewManager(adapter, bus, rl)
+	switch adapter.Name() {
+	case "claude-code":
+		mgr.NativeInstructionsFile = "CLAUDE.md"
+	case "codex":
+		mgr.NativeInstructionsFile = "AGENTS.md"
+	}
 	mgr.DefaultModel = model
 	if len(cfg.Harness) > 0 {
 		mgr.DefaultCwd = cfg.Harness[0].Cwd
@@ -913,7 +919,11 @@ func configuredHarness(cfg *config.Config) (harness.Adapter, error) {
 	}
 	switch h.Kind {
 	case "", "claude-code":
-		return claudecode.New(h.Bin).WithContextWindow(cfg.Session.ContextWindow).WithPromptDir(h.PromptDir), nil
+		promptDir := h.PromptDir
+		if promptDir == "" {
+			promptDir = filepath.Join(cfg.Server.StateDir, "prompts")
+		}
+		return claudecode.New(h.Bin).WithContextWindow(cfg.Session.ContextWindow).WithPromptDir(promptDir), nil
 	case "codex":
 		if h.PromptDir != "" {
 			// The codex adapter passes developer_instructions in argv.
